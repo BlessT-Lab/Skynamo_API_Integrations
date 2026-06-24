@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(\\(Get-Content skynamo_geolocation.py -Raw\\) -replace '\"error\"', '\"notes\"' -replace 'error=error', 'notes=error' -replace 'error=approx_note', 'notes=approx_note' -replace 'error=\"Address could not be geocoded\"', 'notes=\"Address could not be geocoded\"' -replace '\\(?m\\)^\\(\\\\s+\\)\"status\": status, \"address_used\": address,$', '$1\"status\": status, \"address_used\": address,' | Set-Content skynamo_geolocation.py -Encoding utf8; python -m py_compile skynamo_geolocation.py; if \\($?\\) { Write-Output \"OK\" })"
+    ]
+  }
+}
