@@ -159,3 +159,7 @@ cython_debug/
 *.swp
 *.swo
 .DS_Store
+
+# Spreadsheets
+.csv
+.xlsx
