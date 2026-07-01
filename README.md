@@ -11,7 +11,8 @@ step so you approve results before anything is committed.
 ## 1. What it does (end to end)
 
 1. **Connect** to a Skynamo instance with an instance name + Skynamo API key.
-2. **Fetch** all customers (paginated).
+2. **Fetch** all customers (paginated). **Inactive customers are skipped** —
+   only customers with the top-level `active` flag set are processed.
 3. **Map** one or more custom fields as the address source (field names differ
    per instance, so the user chooses; selected fields are joined with commas).
 4. **Geocode** each address via the Google Maps Geocoding API.
@@ -104,6 +105,10 @@ The GUI can remember these between runs (the "Remember" checkbox):
   `Content-Type: application/json`
 - **List customers:** `GET /customers?page_number=N&page_size=200`
   (max page size 200). Response: `{ "data": [...], "page": { "total_item_count": N, ... } }`.
+  Each customer has a top-level boolean `active` (default `true`).
+  `SkynamoClient.fetch_all_customers(active_only=True)` filters out inactive
+  customers by default (pagination still counts raw rows, so termination is
+  unaffected). Pass `active_only=False` to include them.
 - **Update location:** `PATCH /customers` with an **array** of objects:
   ```json
   [{ "id": 123, "location": {
@@ -212,6 +217,8 @@ instance. Use the GUI's preview step to eyeball coordinates before writing.
 
 ## 11. Change log
 
+- **v2.0.1** — `fetch_all_customers` now skips inactive customers by default
+  (top-level `active` flag); `active_only=False` opts back in.
 - **v2.0.0** — Refactored the single script into the `skynamo_geo` package;
   added the CustomTkinter GUI with preview-then-commit, background threading,
   cancel, secure credential storage (keyring), settings persistence, and a

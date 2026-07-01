@@ -30,13 +30,18 @@ class SkynamoClient:
             return False, f"Unexpected response: HTTP {resp.status_code} - {resp.text[:200]}"
         return True, "Connected."
 
-    def fetch_all_customers(self, on_page=None):
+    def fetch_all_customers(self, on_page=None, active_only=True):
         """Paginate through /customers using the API's paging response.
 
         on_page(fetched_count, total_or_None) is called after each page so a
         front-end can show progress while loading.
+
+        When active_only is True (default), customers whose top-level `active`
+        flag is False are skipped and never returned. Pagination still uses the
+        raw page counts so termination is unaffected by filtering.
         """
         customers = []
+        raw_count = 0
         page_number = 1
         while True:
             resp = self.session.get(
@@ -46,16 +51,20 @@ class SkynamoClient:
             )
             resp.raise_for_status()
             body = resp.json()
-            data = body.get("data", [])
-            if not data:
+            page_items = body.get("data", [])
+            if not page_items:
                 break
-            customers.extend(data)
+            raw_count += len(page_items)
+            if active_only:
+                # `active` defaults to True in the API, so treat missing as active.
+                page_items = [c for c in page_items if c.get("active", True)]
+            customers.extend(page_items)
             total = (body.get("page") or {}).get("total_item_count")
             if on_page:
                 on_page(len(customers), total)
-            if total and len(customers) >= total:
+            if total and raw_count >= total:
                 break
-            if len(data) < PAGE_SIZE:
+            if len(body["data"]) < PAGE_SIZE:
                 break
             page_number += 1
         return customers
