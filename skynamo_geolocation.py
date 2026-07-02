@@ -5,7 +5,7 @@ Interactive console tool that:
   1. Connects to a Skynamo instance using an API key + instance name.
   2. Fetches all customers (paginated).
   3. Lets the user map one or more custom fields as the address source.
-  4. Geocodes addresses via the Google Maps Geocoding API.
+  4. Geocodes addresses via Google Maps or OpenStreetMap (user's choice).
   5. PATCHes latitude/longitude back to Skynamo, with an accuracy value
      derived from how precise the geocoder's match was.
   6. Prints a summary and saves a CSV report.
@@ -16,7 +16,8 @@ exact same engine, so behaviour stays identical across both.
 Requirements:
     pip install requests questionary
 
-You also need a Google Maps API key with the Geocoding API enabled.
+Google Maps needs an API key with the Geocoding API enabled; OpenStreetMap
+(Nominatim) is free and needs no key, but is slower (1 request/second).
 
 Usage:
     python skynamo_geolocation.py
@@ -42,7 +43,7 @@ from skynamo_geo.config import (
     STATUS_SKIPPED_HAS_COORDS, STATUS_GEOCODE_FAILED, STATUS_UPDATE_FAILED,
 )
 from skynamo_geo.customers import build_address, collect_custom_field_names
-from skynamo_geo.geocoder import GoogleGeocoder, GeocodeError
+from skynamo_geo.geocoder import create_geocoder, GeocodeError
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,22 @@ def ask_confirm(message, default=False):
     if not raw:
         return default
     return raw in ("y", "yes")
+
+
+def ask_select(message, choices):
+    """Return one item chosen from choices."""
+    if questionary:
+        answer = questionary.select(message, choices=choices).ask()
+        if answer is None:
+            sys.exit("Cancelled.")
+        return answer
+    print(f"\n{message}")
+    for i, choice in enumerate(choices, 1):
+        print(f"  {i}. {choice}")
+    while True:
+        raw = input(f"Enter a number (1-{len(choices)}): ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return choices[int(raw) - 1]
 
 
 def ask_checkbox(message, choices):
@@ -118,11 +135,21 @@ def main():
         sys.exit(f"ERROR: {message}")
     print(f"  {message}")
 
-    # --- Google Maps geocoding key + optional country bias ---
-    google_key = ask_text("Google Maps API key:", password=True)
-    while not google_key:
-        google_key = ask_text("API key cannot be empty. Google Maps API key:",
-                              password=True)
+    # --- Geocoding provider + optional country bias ---
+    provider_choice = ask_select(
+        "Geocoding provider:",
+        ["Google Maps (API key required, most accurate)",
+         "OpenStreetMap (free, no key, ~1 address/second)"])
+    provider = "google" if provider_choice.startswith("Google") else "osm"
+
+    google_key = None
+    if provider == "google":
+        google_key = ask_text("Google Maps API key:", password=True)
+        while not google_key:
+            google_key = ask_text(
+                "API key cannot be empty. Google Maps API key:",
+                password=True)
+
     country = ask_text(
         "Restrict geocoding to a country? Enter a 2-letter code "
         "(e.g. ZA, GB, US) or leave blank for no restriction:"
@@ -131,11 +158,11 @@ def main():
         print(f"  '{country}' is not a 2-letter code - ignoring country restriction.")
         country = ""
 
-    geocoder = GoogleGeocoder(google_key)
-    print("\nValidating Google Maps key...")
+    geocoder = create_geocoder(provider, google_key)
+    print("\nValidating geocoder...")
     try:
         geocoder.validate(country=country or None)
-        print("  Google Maps key OK.")
+        print("  Geocoder OK.")
     except GeocodeError as exc:
         sys.exit(f"ERROR: {exc}")
 
@@ -184,14 +211,16 @@ def main():
         tag = f" [{ev['status']}]"
         print(f"[{ev['index']}/{ev['total']}] {ev['name']}{tag}")
 
-    print(f"\nGeocoding {total} customers via Google Maps...\n")
+    provider_name = ("Google Maps" if provider == "google"
+                     else "OpenStreetMap")
+    print(f"\nGeocoding {total} customers via {provider_name}...\n")
     try:
         plans = engine.geocode_customers(
             geocoder, customers, address_fields,
             replace_existing=replace_existing, country=country or None,
             on_progress=on_geocode)
     except GeocodeError as exc:
-        sys.exit(f"\nERROR: {exc}\nAborting - fix the Google API key/quota and rerun.")
+        sys.exit(f"\nERROR: {exc}\nAborting - fix the provider issue and rerun.")
 
     def on_write(ev):
         print(f"  wrote [{ev['index']}/{ev['total']}] {ev['name']} -> {ev['status']}")
