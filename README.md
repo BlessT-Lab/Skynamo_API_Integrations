@@ -3,8 +3,9 @@
 A desktop + CLI tool that fills in customer **latitude/longitude** on a Skynamo
 instance by geocoding their address fields. It connects to the Skynamo public
 API, reads customers, builds an address string from user-mapped custom fields,
-geocodes each via Google Maps, and writes the coordinates back — with a preview
-step so you approve results before anything is committed.
+geocodes each via **Google Maps or OpenStreetMap** (user's choice), and writes
+the coordinates back — with a preview step so you approve results before
+anything is committed.
 
 ---
 
@@ -15,7 +16,8 @@ step so you approve results before anything is committed.
    only customers with the top-level `active` flag set are processed.
 3. **Map** one or more custom fields as the address source (field names differ
    per instance, so the user chooses; selected fields are joined with commas).
-4. **Geocode** each address via the Google Maps Geocoding API.
+4. **Geocode** each address via the chosen provider — Google Maps (API key,
+   most accurate) or OpenStreetMap/Nominatim (free, no key, ~1 address/second).
 5. **Preview** the results (coordinates, precision, confidence) — *no writes yet*.
 6. **Write** the approved rows back to Skynamo via `PATCH /customers`.
 7. **Report** a console/table summary + a CSV, including customers with no
@@ -41,6 +43,7 @@ GeoLocation_Script/
   requirements.txt          # runtime deps
   requirements-build.txt    # build-only deps (pyinstaller)
   test_engine.py            # engine smoke tests (mocked client + geocoder)
+  test_geocoder.py          # provider factory + OSM precision mapping (offline)
   test_gui_smoke.py         # builds the GUI widget tree without interaction
   skynamo_swagger.json      # downloaded Skynamo API spec (reference only)
   README.md                 # this file
@@ -59,10 +62,15 @@ identical and new front-ends (or a future web/scheduled runner) can reuse it.
 py -m pip install -r requirements.txt
 py gui.py
 ```
-Flow in the window: **Connect & Load Customers** → tick address field(s) →
+Flow in the window: pick a **geocoding provider** (Google Maps or
+OpenStreetMap — the Google key field is disabled when OSM is selected) →
+**Connect & Load Customers** → tick address field(s) →
 **Preview (geocode only)** → review/untick rows → **Write Selected to Skynamo**
 → **Save Report CSV**. A **Cancel** button stops a run; the work happens on a
 background thread so the window never freezes.
+
+The GUI uses a dark theme built on a `#1a1a1a` (rgb 26,26,26) background with
+card-style panels; the palette constants live at the top of `gui.py`.
 
 ### CLI
 ```
@@ -84,9 +92,13 @@ Produces `dist\SkynamoGeo.exe` (single, double-clickable, no console window).
 
 ## 4. Credentials & settings
 
-- **Google Maps API key** — needs the **Geocoding API** enabled in Google Cloud
-  (Console → APIs & Services → Geocoding API). Free $200/month credit (~40k
-  lookups), then ~$5 per 1,000.
+- **Google Maps API key** (only if the Google Maps provider is selected) —
+  needs the **Geocoding API** enabled in Google Cloud (Console → APIs &
+  Services → Geocoding API). Free $200/month credit (~40k lookups), then
+  ~$5 per 1,000.
+- **OpenStreetMap (Nominatim)** — no key or account needed. The public service
+  is rate-limited to ~1 request/second (the tool throttles itself) and street
+  coverage is weaker than Google in some regions.
 - **Skynamo API key** — Skynamo Insights → Settings → Integration Tokens →
   *Add access token*.
 
@@ -129,7 +141,7 @@ The full spec is saved in `skynamo_swagger.json` for reference.
 
 ## 6. Geocoding & accuracy logic
 
-Google returns a `location_type` precision per match, which we translate into the
+Both providers report how precise each match is, which we translate into the
 Skynamo `accuracy` value (metres) so downstream reports can trust precise pins
 and treat coarse ones as approximate:
 
@@ -140,12 +152,18 @@ and treat coarse ones as approximate:
 | `GEOMETRIC_CENTER`     | centre of a street/polyline     | 200          | **low**    |
 | `APPROXIMATE`          | town/suburb centroid            | 3000         | **low**    |
 
-- A **partial match** or a `GEOMETRIC_CENTER`/`APPROXIMATE` precision is treated
+| OSM precision (bucketed `addresstype`) | Meaning                | accuracy (m) | Confidence |
+|----------------------------------------|------------------------|--------------|------------|
+| `OSM_BUILDING`                          | building/house/amenity | 25           | high       |
+| `OSM_ROAD`                              | street-level match     | 200          | **low**    |
+| `OSM_AREA`                              | suburb/town centroid   | 3000         | **low**    |
+
+- A **partial match** (Google) or any of the **low** precisions above is treated
   as **low confidence**: written with `is_approximate=true`, a coarse accuracy,
   and surfaced in the report/table for manual review.
 - An optional **2-letter country code** (e.g. `ZA`) restricts geocoding to that
-  country (`components=country:XX` + `region`), which removes wrong-continent
-  matches for bare street names.
+  country (Google: `components=country:XX` + `region`; OSM: `countrycodes=xx`),
+  which removes wrong-continent matches for bare street names.
 - See `ACCURACY_BY_PRECISION` and `LOW_CONFIDENCE_PRECISIONS` in
   `skynamo_geo/config.py`. (Standing rule: always send an `accuracy` value;
   derive it from precision when available, otherwise default ≥1000.)
@@ -204,8 +222,10 @@ instance. Use the GUI's preview step to eyeball coordinates before writing.
 
 ## 10. Extending it (where to plug in)
 
-- **Another geocoder** (Nominatim fallback, Mapbox): subclass `Geocoder` in
-  `geocoder.py` and pass it to the engine — no engine/UI changes.
+- **Another geocoder** (e.g. Mapbox): subclass `Geocoder` in `geocoder.py`,
+  register it in `create_geocoder` + `GEOCODER_PROVIDERS` (config.py), and the
+  GUI/CLI pickers offer it automatically — no engine changes.
+  `GoogleGeocoder` and `NominatimGeocoder` (OpenStreetMap) exist today.
 - **Map preview** of pins before committing: a widget (e.g. `tkintermapview`) or
   Qt/web view consuming the existing `Plan` list.
 - **Batch PATCH**: the Skynamo endpoint already accepts an array; optimise inside
@@ -217,6 +237,14 @@ instance. Use the GUI's preview step to eyeball coordinates before writing.
 
 ## 11. Change log
 
+- **v2.1.0** (2026-07-02) — Added **OpenStreetMap (Nominatim)** as a second
+  geocoding provider, selectable in the GUI (segmented button; Google key field
+  disabled when OSM is chosen) and CLI (select prompt). Free, no API key,
+  self-throttled to 1 req/s per the Nominatim usage policy; OSM matches map to
+  `OSM_BUILDING`/`OSM_ROAD`/`OSM_AREA` accuracy tiers. Provider choice persists
+  in config. Restyled the GUI: dark theme on a `#1a1a1a` base, card panels,
+  accent-coloured step badges, modern buttons/entries, dark results table.
+  New offline `test_geocoder.py`.
 - **v2.0.1** — `fetch_all_customers` now skips inactive customers by default
   (top-level `active` flag); `active_only=False` opts back in.
 - **v2.0.0** — Refactored the single script into the `skynamo_geo` package;

@@ -23,24 +23,41 @@ from skynamo_geo.client import SkynamoClient
 from skynamo_geo.config import (
     STATUS_UPDATED, STATUS_UPDATED_LOW_CONF, STATUS_SKIPPED_HAS_COORDS,
     STATUS_SKIPPED_NO_ADDRESS, STATUS_GEOCODE_FAILED, STATUS_UPDATE_FAILED,
-    STATUS_PENDING,
+    STATUS_PENDING, GEOCODER_PROVIDERS, DEFAULT_PROVIDER,
 )
 from skynamo_geo.customers import build_address, collect_custom_field_names
-from skynamo_geo.geocoder import GoogleGeocoder, GeocodeError
+from skynamo_geo.geocoder import create_geocoder, GeocodeError
 
-ctk.set_appearance_mode("system")
+ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+# ----- Palette (base background is rgb(26,26,26)) -----
+BG = "#1a1a1a"            # window background
+CARD = "#232323"          # panel/card surfaces
+FIELD = "#2b2b2b"         # entry/input surfaces
+BORDER = "#3a3a3a"
+ACCENT = "#4f8cff"
+ACCENT_HOVER = "#3b74e0"
+GREEN = "#2ea36b"
+GREEN_HOVER = "#238053"
+RED = "#d64545"
+RED_HOVER = "#aa3535"
+TEXT = "#e8e8e8"
+TEXT_MUTED = "#9a9a9a"
 
 CHECK_ON = "☑"   # ballot box with check
 CHECK_OFF = "☐"  # empty ballot box
 
+PROVIDER_LABELS = list(GEOCODER_PROVIDERS.values())
+PROVIDER_BY_LABEL = {label: key for key, label in GEOCODER_PROVIDERS.items()}
+
 
 class App(ctk.CTk):
     def __init__(self):
-        super().__init__()
+        super().__init__(fg_color=BG)
         self.title("Skynamo Geolocation Updater")
-        self.geometry("1040x760")
-        self.minsize(900, 640)
+        self.geometry("1080x780")
+        self.minsize(940, 660)
 
         # Runtime state
         self.client = None
@@ -64,99 +81,143 @@ class App(ctk.CTk):
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        self._style_treeview()
+
+        # ----- Header -----
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.grid(row=0, column=0, padx=16, pady=(14, 4), sticky="ew")
+        ctk.CTkLabel(header, text="Skynamo Geolocation Updater",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     text_color=TEXT).pack(side="left")
+        ctk.CTkLabel(header,
+                     text="geocode customer addresses · preview · commit",
+                     font=ctk.CTkFont(size=12),
+                     text_color=TEXT_MUTED).pack(side="left", padx=(12, 0),
+                                                 pady=(4, 0))
 
         # ----- Top: connection + mapping side by side -----
-        top = ctk.CTkFrame(self)
-        top.grid(row=0, column=0, padx=12, pady=(12, 6), sticky="ew")
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.grid(row=1, column=0, padx=16, pady=(6, 6), sticky="ew")
         top.grid_columnconfigure(0, weight=1)
         top.grid_columnconfigure(1, weight=1)
 
         # Connection panel
-        conn = ctk.CTkFrame(top)
-        conn.grid(row=0, column=0, padx=(0, 6), pady=0, sticky="nsew")
-        ctk.CTkLabel(conn, text="1. Connection",
-                     font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, columnspan=2, padx=10, pady=(8, 4), sticky="w")
+        conn = self._card(top)
+        conn.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="nsew")
+        self._section_title(conn, "1", "Connection").grid(
+            row=0, column=0, columnspan=2, padx=14, pady=(12, 6), sticky="w")
 
         self.instance_entry = self._labeled_entry(conn, "Instance name", 1)
-        self.skynamo_entry = self._labeled_entry(conn, "Skynamo API key", 2, show="*")
-        self.google_entry = self._labeled_entry(conn, "Google Maps API key", 3, show="*")
+        self.skynamo_entry = self._labeled_entry(conn, "Skynamo API key", 2,
+                                                 show="*")
+
+        ctk.CTkLabel(conn, text="Geocoding provider", anchor="w",
+                     text_color=TEXT).grid(
+            row=3, column=0, padx=(14, 6), pady=4, sticky="w")
+        self.provider_seg = ctk.CTkSegmentedButton(
+            conn, values=PROVIDER_LABELS, command=self._on_provider_change,
+            fg_color=FIELD, selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER,
+            unselected_color=FIELD, unselected_hover_color=BORDER,
+            corner_radius=8, height=30)
+        self.provider_seg.set(GEOCODER_PROVIDERS[DEFAULT_PROVIDER])
+        self.provider_seg.grid(row=3, column=1, padx=(0, 14), pady=4,
+                               sticky="ew")
+
+        self.google_label = ctk.CTkLabel(conn, text="Google Maps API key",
+                                         anchor="w", text_color=TEXT)
+        self.google_label.grid(row=4, column=0, padx=(14, 6), pady=4,
+                               sticky="w")
+        self.google_entry = self._entry(conn, show="*")
+        self.google_entry.grid(row=4, column=1, padx=(0, 14), pady=4,
+                               sticky="ew")
+
         self.country_entry = self._labeled_entry(
-            conn, "Country (2-letter, optional)", 4)
+            conn, "Country (2-letter, optional)", 5)
 
         self.remember_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(conn, text="Remember credentials & settings",
-                        variable=self.remember_var).grid(
-            row=5, column=0, columnspan=2, padx=10, pady=4, sticky="w")
+                        variable=self.remember_var,
+                        checkbox_width=20, checkbox_height=20,
+                        corner_radius=5, border_color=BORDER,
+                        fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                        text_color=TEXT).grid(
+            row=6, column=0, columnspan=2, padx=14, pady=6, sticky="w")
 
-        self.connect_btn = ctk.CTkButton(
-            conn, text="Connect & Load Customers", command=self.on_connect)
-        self.connect_btn.grid(row=6, column=0, columnspan=2,
-                              padx=10, pady=(4, 10), sticky="ew")
+        self.connect_btn = self._button(
+            conn, "Connect & Load Customers", self.on_connect)
+        self.connect_btn.grid(row=7, column=0, columnspan=2,
+                              padx=14, pady=(6, 14), sticky="ew")
 
         # Mapping panel
-        mapping = ctk.CTkFrame(top)
-        mapping.grid(row=0, column=1, padx=(6, 0), pady=0, sticky="nsew")
+        mapping = self._card(top)
+        mapping.grid(row=0, column=1, padx=(8, 0), pady=0, sticky="nsew")
         mapping.grid_rowconfigure(1, weight=1)
         mapping.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(mapping, text="2. Map address field(s)",
-                     font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, padx=10, pady=(8, 4), sticky="w")
+        self._section_title(mapping, "2", "Map address field(s)").grid(
+            row=0, column=0, padx=14, pady=(12, 6), sticky="w")
 
-        self.fields_frame = ctk.CTkScrollableFrame(mapping, height=140)
-        self.fields_frame.grid(row=1, column=0, padx=10, pady=4, sticky="nsew")
+        self.fields_frame = ctk.CTkScrollableFrame(
+            mapping, height=150, fg_color=FIELD, corner_radius=10)
+        self.fields_frame.grid(row=1, column=0, padx=14, pady=4, sticky="nsew")
         self._fields_placeholder()
 
         self.sample_label = ctk.CTkLabel(
             mapping, text="Sample address: -", anchor="w",
-            wraplength=460, justify="left")
-        self.sample_label.grid(row=2, column=0, padx=10, pady=2, sticky="ew")
+            wraplength=460, justify="left", text_color=TEXT_MUTED)
+        self.sample_label.grid(row=2, column=0, padx=14, pady=2, sticky="ew")
 
         self.replace_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(mapping,
                         text="Replace coordinates that already exist",
-                        variable=self.replace_var).grid(
-            row=3, column=0, padx=10, pady=(2, 10), sticky="w")
+                        variable=self.replace_var,
+                        checkbox_width=20, checkbox_height=20,
+                        corner_radius=5, border_color=BORDER,
+                        fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                        text_color=TEXT).grid(
+            row=3, column=0, padx=14, pady=(4, 14), sticky="w")
 
         # ----- Middle: action bar -----
-        actions = ctk.CTkFrame(self)
-        actions.grid(row=1, column=0, padx=12, pady=6, sticky="ew")
-        self.preview_btn = ctk.CTkButton(
-            actions, text="Preview (geocode only)", command=self.on_preview,
+        actions = self._card(self)
+        actions.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
+        self.preview_btn = self._button(
+            actions, "Preview (geocode only)", self.on_preview,
             state="disabled")
-        self.preview_btn.pack(side="left", padx=6, pady=8)
-        self.write_btn = ctk.CTkButton(
-            actions, text="Write Selected to Skynamo", command=self.on_write,
-            state="disabled", fg_color="#2e7d32", hover_color="#1b5e20")
-        self.write_btn.pack(side="left", padx=6, pady=8)
-        self.cancel_btn = ctk.CTkButton(
-            actions, text="Cancel", command=self.on_cancel, state="disabled",
-            fg_color="#b71c1c", hover_color="#7f0000")
-        self.cancel_btn.pack(side="left", padx=6, pady=8)
-        self.save_btn = ctk.CTkButton(
-            actions, text="Save Report CSV", command=self.on_save_report,
-            state="disabled")
-        self.save_btn.pack(side="left", padx=6, pady=8)
+        self.preview_btn.pack(side="left", padx=(12, 6), pady=10)
+        self.write_btn = self._button(
+            actions, "Write Selected to Skynamo", self.on_write,
+            state="disabled", fg_color=GREEN, hover_color=GREEN_HOVER)
+        self.write_btn.pack(side="left", padx=6, pady=10)
+        self.cancel_btn = self._button(
+            actions, "Cancel", self.on_cancel, state="disabled",
+            fg_color=RED, hover_color=RED_HOVER, width=90)
+        self.cancel_btn.pack(side="left", padx=6, pady=10)
+        self.save_btn = self._button(
+            actions, "Save Report CSV", self.on_save_report,
+            state="disabled", fg_color=FIELD, hover_color=BORDER)
+        self.save_btn.pack(side="left", padx=6, pady=10)
 
-        self.select_all_btn = ctk.CTkButton(
-            actions, text="Select all", width=90,
-            command=lambda: self._set_all_includes(True), state="disabled")
-        self.select_all_btn.pack(side="right", padx=6, pady=8)
-        self.select_none_btn = ctk.CTkButton(
-            actions, text="Select none", width=90,
-            command=lambda: self._set_all_includes(False), state="disabled")
-        self.select_none_btn.pack(side="right", padx=6, pady=8)
+        self.select_all_btn = self._button(
+            actions, "Select all", lambda: self._set_all_includes(True),
+            state="disabled", width=96, fg_color=FIELD, hover_color=BORDER)
+        self.select_all_btn.pack(side="right", padx=(6, 12), pady=10)
+        self.select_none_btn = self._button(
+            actions, "Select none", lambda: self._set_all_includes(False),
+            state="disabled", width=96, fg_color=FIELD, hover_color=BORDER)
+        self.select_none_btn.pack(side="right", padx=6, pady=10)
 
         # ----- Results table -----
-        table_frame = ctk.CTkFrame(self)
-        table_frame.grid(row=2, column=0, padx=12, pady=6, sticky="nsew")
+        table_frame = self._card(self)
+        table_frame.grid(row=3, column=0, padx=16, pady=6, sticky="nsew")
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
 
         columns = ("include", "name", "address", "lat", "lng",
                    "precision", "status")
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        self.tree = ttk.Treeview(table_frame, columns=columns,
+                                 show="headings", style="Dark.Treeview")
         headings = {
             "include": ("Use", 50), "name": ("Customer", 200),
             "address": ("Address used", 280), "lat": ("Latitude", 90),
@@ -167,43 +228,122 @@ class App(ctk.CTk):
             self.tree.heading(col, text=text)
             anchor = "center" if col in ("include", "lat", "lng") else "w"
             self.tree.column(col, width=width, anchor=anchor)
-        self.tree.tag_configure("low", background="#fff3cd")
-        self.tree.tag_configure("skip", foreground="#888888")
-        self.tree.tag_configure("fail", background="#f8d7da")
-        self.tree.grid(row=0, column=0, sticky="nsew")
+        self.tree.tag_configure("low", background="#3a2f12",
+                                foreground="#f0c453")
+        self.tree.tag_configure("skip", foreground="#7a7a7a")
+        self.tree.tag_configure("fail", background="#3a1717",
+                                foreground="#f08c8c")
+        self.tree.grid(row=0, column=0, padx=(10, 0), pady=10, sticky="nsew")
         yscroll = ttk.Scrollbar(table_frame, orient="vertical",
-                                command=self.tree.yview)
+                                command=self.tree.yview,
+                                style="Dark.Vertical.TScrollbar")
         self.tree.configure(yscrollcommand=yscroll.set)
-        yscroll.grid(row=0, column=1, sticky="ns")
+        yscroll.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="ns")
         self.tree.bind("<Button-1>", self._on_tree_click)
 
         # ----- Bottom: progress + log + summary -----
-        bottom = ctk.CTkFrame(self)
-        bottom.grid(row=3, column=0, padx=12, pady=(6, 12), sticky="ew")
+        bottom = self._card(self)
+        bottom.grid(row=4, column=0, padx=16, pady=(6, 14), sticky="ew")
         bottom.grid_columnconfigure(0, weight=1)
 
-        self.progress = ctk.CTkProgressBar(bottom)
+        self.progress = ctk.CTkProgressBar(
+            bottom, progress_color=ACCENT, fg_color=FIELD, height=8,
+            corner_radius=4)
         self.progress.set(0)
-        self.progress.grid(row=0, column=0, padx=10, pady=(8, 4), sticky="ew")
-        self.status_label = ctk.CTkLabel(bottom, text="Ready.", anchor="w")
-        self.status_label.grid(row=1, column=0, padx=10, pady=2, sticky="ew")
-        self.log = ctk.CTkTextbox(bottom, height=120)
-        self.log.grid(row=2, column=0, padx=10, pady=(4, 10), sticky="ew")
+        self.progress.grid(row=0, column=0, padx=14, pady=(12, 4), sticky="ew")
+        self.status_label = ctk.CTkLabel(bottom, text="Ready.", anchor="w",
+                                         text_color=TEXT)
+        self.status_label.grid(row=1, column=0, padx=14, pady=2, sticky="ew")
+        self.log = ctk.CTkTextbox(
+            bottom, height=110, fg_color="#151515", text_color="#b8b8b8",
+            corner_radius=10, border_width=1, border_color=BORDER,
+            font=ctk.CTkFont(family="Consolas", size=12))
+        self.log.grid(row=2, column=0, padx=14, pady=(4, 14), sticky="ew")
+
+    # -- Styled widget helpers --------------------------------------------
+
+    def _card(self, parent):
+        return ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14,
+                            border_width=1, border_color="#2e2e2e")
+
+    def _section_title(self, parent, number, text):
+        frame = ctk.CTkFrame(parent, fg_color="transparent")
+        ctk.CTkLabel(frame, text=number, width=24, height=24,
+                     fg_color=ACCENT, corner_radius=12, text_color="#ffffff",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(
+            side="left")
+        ctk.CTkLabel(frame, text=text, text_color=TEXT,
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(
+            side="left", padx=(8, 0))
+        return frame
+
+    def _entry(self, parent, show=None):
+        return ctk.CTkEntry(parent, show=show, width=260, height=30,
+                            corner_radius=8, fg_color=FIELD,
+                            border_color=BORDER, border_width=1,
+                            text_color=TEXT)
+
+    def _button(self, parent, text, command, state="normal", width=None,
+                fg_color=ACCENT, hover_color=ACCENT_HOVER):
+        kwargs = {"width": width} if width else {}
+        return ctk.CTkButton(parent, text=text, command=command, state=state,
+                             height=34, corner_radius=8, fg_color=fg_color,
+                             hover_color=hover_color, text_color=TEXT,
+                             font=ctk.CTkFont(size=13, weight="bold"),
+                             **kwargs)
 
     def _labeled_entry(self, parent, label, row, show=None):
-        ctk.CTkLabel(parent, text=label, anchor="w").grid(
-            row=row, column=0, padx=(10, 4), pady=3, sticky="w")
-        entry = ctk.CTkEntry(parent, show=show, width=260)
-        entry.grid(row=row, column=1, padx=(0, 10), pady=3, sticky="ew")
+        ctk.CTkLabel(parent, text=label, anchor="w", text_color=TEXT).grid(
+            row=row, column=0, padx=(14, 6), pady=4, sticky="w")
+        entry = self._entry(parent, show=show)
+        entry.grid(row=row, column=1, padx=(0, 14), pady=4, sticky="ew")
         parent.grid_columnconfigure(1, weight=1)
         return entry
+
+    def _style_treeview(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("Dark.Treeview", background="#202020",
+                        fieldbackground="#202020", foreground=TEXT,
+                        borderwidth=0, rowheight=26,
+                        font=("Segoe UI", 10))
+        # Drop clam's light outer border - keep only the tree area.
+        style.layout("Dark.Treeview",
+                     [("Dark.Treeview.treearea", {"sticky": "nswe"})])
+        style.configure("Dark.Treeview.Heading", background=FIELD,
+                        foreground=TEXT, relief="flat", padding=(8, 6),
+                        borderwidth=0, font=("Segoe UI", 10, "bold"))
+        style.map("Dark.Treeview",
+                  background=[("selected", ACCENT)],
+                  foreground=[("selected", "#ffffff")])
+        style.map("Dark.Treeview.Heading",
+                  background=[("active", BORDER)])
+        style.configure("Dark.Vertical.TScrollbar", background=FIELD,
+                        troughcolor="#202020", borderwidth=0,
+                        arrowcolor=TEXT_MUTED)
+        style.map("Dark.Vertical.TScrollbar",
+                  background=[("active", BORDER)])
 
     def _fields_placeholder(self):
         for child in self.fields_frame.winfo_children():
             child.destroy()
         ctk.CTkLabel(self.fields_frame,
-                     text="Connect & load customers to list fields.").pack(
-            anchor="w", padx=6, pady=6)
+                     text="Connect & load customers to list fields.",
+                     text_color=TEXT_MUTED).pack(anchor="w", padx=8, pady=8)
+
+    # -- Provider selection ------------------------------------------------
+
+    def _provider_key(self):
+        return PROVIDER_BY_LABEL.get(self.provider_seg.get(),
+                                     DEFAULT_PROVIDER)
+
+    def _on_provider_change(self, _value=None):
+        if self._provider_key() == "google":
+            self.google_entry.configure(state="normal")
+            self.google_label.configure(text_color=TEXT)
+        else:
+            self.google_entry.configure(state="disabled")
+            self.google_label.configure(text_color=TEXT_MUTED)
 
     # -- Logging / status -------------------------------------------------
 
@@ -224,6 +364,9 @@ class App(ctk.CTk):
             self.country_entry.insert(0, cfg["country"])
         self.replace_var.set(bool(cfg.get("replace_existing", False)))
         self._saved_fields = cfg.get("address_fields", [])
+        provider = cfg.get("provider", DEFAULT_PROVIDER)
+        if provider in GEOCODER_PROVIDERS:
+            self.provider_seg.set(GEOCODER_PROVIDERS[provider])
         # Secrets
         google = settings.get_secret(settings.GOOGLE_KEY_NAME)
         if google:
@@ -233,6 +376,7 @@ class App(ctk.CTk):
                 settings.skynamo_key_name(cfg["instance_name"]))
             if sk:
                 self.skynamo_entry.insert(0, sk)
+        self._on_provider_change()
 
     def _persist_settings(self):
         if not self.remember_var.get():
@@ -244,6 +388,7 @@ class App(ctk.CTk):
             "country": self.country_entry.get().strip().upper(),
             "replace_existing": self.replace_var.get(),
             "address_fields": selected,
+            "provider": self._provider_key(),
         })
         settings.set_secret(settings.GOOGLE_KEY_NAME,
                             self.google_entry.get().strip())
@@ -310,16 +455,23 @@ class App(ctk.CTk):
     def on_connect(self):
         instance = self.instance_entry.get().strip()
         skynamo_key = self.skynamo_entry.get().strip()
+        provider = self._provider_key()
         google_key = self.google_entry.get().strip()
         country = self.country_entry.get().strip().upper()
-        if not (instance and skynamo_key and google_key):
-            self.set_status("Enter instance, Skynamo key and Google key first.")
+        if not (instance and skynamo_key):
+            self.set_status("Enter instance name and Skynamo key first.")
+            return
+        if provider == "google" and not google_key:
+            self.set_status("Enter a Google Maps API key, or switch the "
+                            "provider to OpenStreetMap.")
             return
         if country and len(country) != 2:
             self.set_status("Country must be a 2-letter code (e.g. ZA) or blank.")
             return
         self.country = country or None
-        self.log_line(f"Connecting to '{instance}'...")
+        provider_label = GEOCODER_PROVIDERS[provider]
+        self.log_line(f"Connecting to '{instance}' "
+                      f"(geocoder: {provider_label})...")
 
         def work():
             try:
@@ -329,10 +481,11 @@ class App(ctk.CTk):
                     self.queue.put(("error", message))
                     return
                 self.queue.put(("log", "Skynamo credentials OK."))
-                geocoder = GoogleGeocoder(google_key)
-                self.queue.put(("status", "Validating Google Maps key..."))
+                geocoder = create_geocoder(provider, google_key or None)
+                self.queue.put(("status",
+                                f"Validating {provider_label} geocoder..."))
                 geocoder.validate(country=self.country)
-                self.queue.put(("log", "Google Maps key OK."))
+                self.queue.put(("log", f"{provider_label} geocoder OK."))
                 self.queue.put(("status", "Fetching customers..."))
                 customers = client.fetch_all_customers(
                     on_page=lambda n, total: self.queue.put((
@@ -363,15 +516,19 @@ class App(ctk.CTk):
         names = collect_custom_field_names(self.customers)
         if not names:
             ctk.CTkLabel(self.fields_frame,
-                         text="No custom fields found on customers.").pack(
-                anchor="w", padx=6, pady=6)
+                         text="No custom fields found on customers.",
+                         text_color=TEXT_MUTED).pack(anchor="w", padx=8,
+                                                     pady=8)
             return
         saved = set(getattr(self, "_saved_fields", []) or [])
         for name in names:
             var = ctk.BooleanVar(value=name in saved)
             var.trace_add("write", lambda *_: self._update_sample())
-            ctk.CTkCheckBox(self.fields_frame, text=name, variable=var).pack(
-                anchor="w", padx=6, pady=2)
+            ctk.CTkCheckBox(self.fields_frame, text=name, variable=var,
+                            checkbox_width=18, checkbox_height=18,
+                            corner_radius=4, border_color=BORDER,
+                            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                            text_color=TEXT).pack(anchor="w", padx=8, pady=3)
             self.field_vars[name] = var
         self._update_sample()
 
