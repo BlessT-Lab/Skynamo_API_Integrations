@@ -138,7 +138,7 @@ class App(ctk.CTk):
             conn, "Country (2-letter, optional)", 5)
 
         self.remember_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(conn, text="Remember credentials & settings",
+        ctk.CTkCheckBox(conn, text="Remember settings (never API keys)",
                         variable=self.remember_var,
                         checkbox_width=20, checkbox_height=20,
                         corner_radius=5, border_color=BORDER,
@@ -367,15 +367,8 @@ class App(ctk.CTk):
         provider = cfg.get("provider", DEFAULT_PROVIDER)
         if provider in GEOCODER_PROVIDERS:
             self.provider_seg.set(GEOCODER_PROVIDERS[provider])
-        # Secrets
-        google = settings.get_secret(settings.GOOGLE_KEY_NAME)
-        if google:
-            self.google_entry.insert(0, google)
-        if cfg.get("instance_name"):
-            sk = settings.get_secret(
-                settings.skynamo_key_name(cfg["instance_name"]))
-            if sk:
-                self.skynamo_entry.insert(0, sk)
+        # API keys are never remembered; purge any an older version stored.
+        settings.purge_saved_credentials(cfg.get("instance_name"))
         self._on_provider_change()
 
     def _persist_settings(self):
@@ -390,10 +383,7 @@ class App(ctk.CTk):
             "address_fields": selected,
             "provider": self._provider_key(),
         })
-        settings.set_secret(settings.GOOGLE_KEY_NAME,
-                            self.google_entry.get().strip())
-        settings.set_secret(settings.skynamo_key_name(instance),
-                            self.skynamo_entry.get().strip())
+        # API keys are deliberately not persisted.
 
     # -- Worker plumbing --------------------------------------------------
 

@@ -46,8 +46,9 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
 - `skynamo_geo/config.py` — all constants (endpoints, `ACCURACY_BY_PRECISION`, `STATUS_*`,
   `REPORT_FIELDNAMES`). Changing statuses/columns/accuracy tiers happens here.
 - `skynamo_geo/customers.py` — address-field helpers; `has_coordinates` treats zero/`"0"`/null as missing.
-- `skynamo_geo/settings.py` — non-secret config in `%APPDATA%/SkynamoGeo/config.json`; API keys in the
-  OS keyring (never on disk).
+- `skynamo_geo/settings.py` — non-secret config in `%APPDATA%/SkynamoGeo/config.json`. API keys are
+  never persisted (re-entered each session); `purge_saved_credentials()` clears any keys older
+  versions stored in the OS keyring, called on GUI startup.
 
 ### GUI threading model (gui.py)
 Tkinter is not thread-safe. The engine runs on a `threading.Thread`; it pushes events onto a
