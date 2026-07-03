@@ -36,7 +36,7 @@ GeoLocation_Script/
     geocoder.py             # Geocoder base + GoogleGeocoder, GeocodeResult/Error
     customers.py            # address-field helpers (build/collect/has_coordinates)
     engine.py               # geocode_customers + write_locations + report (the core)
-    settings.py             # config JSON + keyring secrets
+    settings.py             # non-secret config JSON (no credentials stored)
   gui.py                    # CustomTkinter desktop app  (entry point for the .exe)
   skynamo_geolocation.py    # CLI front-end (thin wrapper over the engine)
   build.bat                 # PyInstaller -> dist/SkynamoGeo.exe
@@ -102,11 +102,12 @@ Produces `dist\SkynamoGeo.exe` (single, double-clickable, no console window).
 - **Skynamo API key** — Skynamo Insights → Settings → Integration Tokens →
   *Add access token*.
 
-The GUI can remember these between runs (the "Remember" checkbox):
-- **Secrets** (both API keys) are stored in the **Windows Credential Manager**
-  via the `keyring` library — never written to disk in plain text.
-- **Non-secret settings** (instance name, country, replace flag, selected
-  address fields) are saved to `%APPDATA%\SkynamoGeo\config.json`.
+**API keys are never stored.** You re-enter the Skynamo key (and Google key, if
+used) every time you launch the app. The GUI's **"Remember settings"** checkbox
+only persists **non-secret settings** (instance name, country, provider, replace
+flag, selected address fields) to `%APPDATA%\SkynamoGeo\config.json`. Any API
+keys that an earlier version saved to the Windows Credential Manager are purged
+on startup.
 
 ---
 
@@ -237,6 +238,10 @@ instance. Use the GUI's preview step to eyeball coordinates before writing.
 
 ## 11. Change log
 
+- **v2.1.1** (2026-07-03) — **API keys are no longer remembered.** The GUI never
+  stores the Skynamo or Google keys; the checkbox (now "Remember settings")
+  persists only non-secret settings. Any keys saved by an earlier version are
+  purged from the OS keyring on startup (`settings.purge_saved_credentials`).
 - **v2.1.0** (2026-07-02) — Added **OpenStreetMap (Nominatim)** as a second
   geocoding provider, selectable in the GUI (segmented button; Google key field
   disabled when OSM is chosen) and CLI (select prompt). Free, no API key,

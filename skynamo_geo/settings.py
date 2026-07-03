@@ -1,8 +1,9 @@
-"""Local persistence: non-secret config in JSON, secrets in the OS keyring.
+"""Local persistence for non-secret settings only.
 
 Config lives at %APPDATA%/SkynamoGeo/config.json (or ~/.skynamo_geo on
-non-Windows). Secrets (API keys) are stored in the OS credential store via
-keyring and are NEVER written to the JSON.
+non-Windows). API keys are deliberately NOT persisted anywhere - the user
+re-enters them each session. purge_saved_credentials() removes any keys that
+earlier versions of the app stored in the OS keyring.
 """
 
 import json
@@ -44,42 +45,30 @@ def save_config(config):
     return path
 
 
-# --- Secrets via keyring -------------------------------------------------
+# --- Credential cleanup --------------------------------------------------
+# API keys are intentionally NOT persisted. These names are kept only so we
+# can delete keys that older versions of the app stored in the OS keyring.
 
-def secrets_available():
-    return keyring is not None
-
-
-def get_secret(name):
-    """Fetch a stored secret by logical name, or None."""
-    if not keyring:
-        return None
-    try:
-        return keyring.get_password(KEYRING_SERVICE, name)
-    except Exception:
-        return None
-
-
-def set_secret(name, value):
-    """Store (or clear, if value is falsy) a secret by logical name."""
-    if not keyring:
-        return False
-    try:
-        if value:
-            keyring.set_password(KEYRING_SERVICE, name, value)
-        else:
-            try:
-                keyring.delete_password(KEYRING_SERVICE, name)
-            except Exception:
-                pass
-        return True
-    except Exception:
-        return False
+GOOGLE_KEY_NAME = "google"
 
 
 def skynamo_key_name(instance):
-    """Per-instance keyring name for the Skynamo API key."""
+    """Keyring name an older version used for the Skynamo API key."""
     return f"skynamo:{instance}" if instance else "skynamo"
 
 
-GOOGLE_KEY_NAME = "google"
+def purge_saved_credentials(instance=None):
+    """Delete any API keys a previous version stored in the OS keyring.
+
+    Safe to call every startup: missing entries and keyring errors are
+    ignored. Clears the Google key, the generic Skynamo key, and (if known)
+    the per-instance Skynamo key.
+    """
+    if not keyring:
+        return
+    names = {GOOGLE_KEY_NAME, skynamo_key_name(None), skynamo_key_name(instance)}
+    for name in names:
+        try:
+            keyring.delete_password(KEYRING_SERVICE, name)
+        except Exception:
+            pass
