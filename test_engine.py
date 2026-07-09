@@ -6,20 +6,31 @@ from skynamo_geo.geocoder import GeocodeResult
 from skynamo_geo.config import (
     STATUS_PENDING, STATUS_SKIPPED_HAS_COORDS, STATUS_SKIPPED_NO_ADDRESS,
     STATUS_GEOCODE_FAILED, STATUS_UPDATED, STATUS_UPDATED_LOW_CONF,
+    ROLE_STREET, ROLE_CITY, ROLE_POSTCODE,
 )
 
 
 class FakeGeocoder:
-    """Returns ROOFTOP for known streets, APPROXIMATE for 'Town', None else."""
-    def __init__(self):
-        self.calls = []
+    """Returns ROOFTOP for known streets, APPROXIMATE for 'Town', None else.
 
-    def geocode(self, address, country=None):
-        self.calls.append(address)
-        if "Main" in address:
-            return GeocodeResult(-33.9, 18.4, "ROOFTOP", "1 Main Rd", False)
-        if "Town" in address:
-            return GeocodeResult(-33.7, 19.0, "APPROXIMATE", "Town", False)
+    Reads the query's single-line text (accepts AddressQuery or str) and
+    records it so tests can assert what was actually sent.
+    """
+    def __init__(self, country_code="ZA", postcode=""):
+        self.calls = []
+        self.country_code = country_code
+        self.postcode = postcode
+
+    def geocode(self, query, country=None):
+        text = query if isinstance(query, str) else query.text
+        self.calls.append(text)
+        if "Main" in text:
+            return GeocodeResult(-33.9, 18.4, "ROOFTOP", "1 Main Rd", False,
+                                 country_code=self.country_code,
+                                 postcode=self.postcode)
+        if "Town" in text:
+            return GeocodeResult(-33.7, 19.0, "APPROXIMATE", "Town", False,
+                                 country_code=self.country_code)
         return None
 
 
@@ -40,6 +51,8 @@ def cust(cid, fields=None, loc=None):
     return c
 
 
+ROLES = [("Street", ROLE_STREET), ("City", ROLE_CITY)]
+
 customers = [
     cust(1, {"Street": "1 Main Rd", "City": "Cape Town"}),          # ROOFTOP precise
     cust(2, {"Street": "", "City": "Town"}),                        # APPROXIMATE low-conf
@@ -49,8 +62,7 @@ customers = [
 ]
 
 geo = FakeGeocoder()
-plans = engine.geocode_customers(geo, customers, ["Street", "City"],
-                                 replace_existing=False)
+plans = engine.geocode_customers(geo, customers, ROLES, replace_existing=False)
 
 by_id = {p.customer_id: p for p in plans}
 assert by_id[1].status == STATUS_PENDING and not by_id[1].low_confidence
@@ -90,8 +102,30 @@ stop_after = {"n": 0}
 def cancel():
     stop_after["n"] += 1
     return stop_after["n"] > 2
-plans2 = engine.geocode_customers(geo2, customers, ["Street", "City"],
-                                  should_cancel=cancel)
+plans2 = engine.geocode_customers(geo2, customers, ROLES, should_cancel=cancel)
 assert len(plans2) <= 3, len(plans2)
+
+# --- Result validation: a country mismatch flags an otherwise-precise match ---
+geo_wrong = FakeGeocoder(country_code="US")   # ROOFTOP but wrong country
+val_customers = [cust(10, {"Street": "1 Main Rd", "City": "Cape Town"})]
+val_plans = engine.geocode_customers(geo_wrong, val_customers, ROLES,
+                                     country="ZA")
+vp = val_plans[0]
+assert vp.status == STATUS_PENDING
+assert vp.low_confidence is True, "country mismatch should force low confidence"
+assert "country mismatch" in vp.notes
+
+# A matching country on a precise result stays high confidence
+geo_ok = FakeGeocoder(country_code="ZA")
+ok_plans = engine.geocode_customers(geo_ok, val_customers, ROLES, country="ZA")
+assert ok_plans[0].low_confidence is False
+
+# --- Postcode mismatch also flags (structured postcode vs matched postcode) ---
+geo_pc = FakeGeocoder(country_code="ZA", postcode="9999")
+pc_customers = [cust(11, {"Street": "1 Main Rd", "Zip": "8001"})]
+pc_roles = [("Street", ROLE_STREET), ("Zip", ROLE_POSTCODE)]
+pc_plans = engine.geocode_customers(geo_pc, pc_customers, pc_roles, country="ZA")
+assert pc_plans[0].low_confidence is True
+assert "postcode mismatch" in pc_plans[0].notes
 
 print("All engine smoke tests passed")

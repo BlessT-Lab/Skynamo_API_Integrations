@@ -9,8 +9,42 @@ GEOCODE_DELAY_SECONDS = 0.05  # Google allows ~50 req/s; a small delay is plenty
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Nominatim usage policy: identify your app and stay at/below 1 request/second.
-NOMINATIM_USER_AGENT = "SkynamoGeo/2.1 (Skynamo customer geolocation updater)"
+NOMINATIM_USER_AGENT = "SkynamoGeo/2.2 (Skynamo customer geolocation updater)"
 NOMINATIM_MIN_INTERVAL = 1.0
+# Ask Nominatim for several candidates so we can pick the most precise one
+# instead of blindly trusting the first result.
+NOMINATIM_RESULT_LIMIT = 5
+
+# --- Address field roles -------------------------------------------------
+# Each mapped Skynamo field is tagged with the address component it holds.
+# Roles drive (a) structured Nominatim queries and (b) a clean, correctly
+# ordered single-line address for Google and for display/reports.
+ROLE_STREET = "street"
+ROLE_CITY = "city"
+ROLE_STATE = "state"
+ROLE_POSTCODE = "postalcode"
+ROLE_COUNTRY = "country"
+ROLE_OTHER = "other"  # folded into the street line; not a structured key
+
+# Canonical order components appear in a single-line address.
+ADDRESS_ROLES = [ROLE_STREET, ROLE_OTHER, ROLE_CITY, ROLE_STATE,
+                 ROLE_POSTCODE, ROLE_COUNTRY]
+# Structured keys Nominatim understands (ROLE_OTHER folds into street).
+STRUCTURED_ROLES = [ROLE_STREET, ROLE_CITY, ROLE_STATE, ROLE_POSTCODE,
+                    ROLE_COUNTRY]
+ADDRESS_ROLE_LABELS = {
+    ROLE_STREET: "Street / building",
+    ROLE_CITY: "City / town",
+    ROLE_STATE: "State / province",
+    ROLE_POSTCODE: "Postal code",
+    ROLE_COUNTRY: "Country",
+    ROLE_OTHER: "Other / address line",
+}
+DEFAULT_ROLE = ROLE_OTHER
+
+# Values that are effectively empty and must never be sent to a geocoder.
+# Compared case-insensitively after trimming.
+JUNK_ADDRESS_VALUES = {"", "0", "-", "--", "n/a", "na", "none", "null", "."}
 
 # Geocoding providers selectable in the GUI/CLI. Keys are the internal ids
 # used in saved config; values are the labels shown to the user.

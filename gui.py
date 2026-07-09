@@ -24,8 +24,9 @@ from skynamo_geo.config import (
     STATUS_UPDATED, STATUS_UPDATED_LOW_CONF, STATUS_SKIPPED_HAS_COORDS,
     STATUS_SKIPPED_NO_ADDRESS, STATUS_GEOCODE_FAILED, STATUS_UPDATE_FAILED,
     STATUS_PENDING, GEOCODER_PROVIDERS, DEFAULT_PROVIDER,
+    ADDRESS_ROLES, ADDRESS_ROLE_LABELS, DEFAULT_ROLE,
 )
-from skynamo_geo.customers import build_address, collect_custom_field_names
+from skynamo_geo.customers import build_query, collect_custom_field_names
 from skynamo_geo.geocoder import create_geocoder, GeocodeError
 
 ctk.set_appearance_mode("dark")
@@ -51,6 +52,10 @@ CHECK_OFF = "☐"  # empty ballot box
 PROVIDER_LABELS = list(GEOCODER_PROVIDERS.values())
 PROVIDER_BY_LABEL = {label: key for key, label in GEOCODER_PROVIDERS.items()}
 
+ROLE_LABELS = [ADDRESS_ROLE_LABELS[r] for r in ADDRESS_ROLES]
+ROLE_BY_LABEL = {ADDRESS_ROLE_LABELS[r]: r for r in ADDRESS_ROLES}
+ROLE_LABEL_BY_KEY = {r: ADDRESS_ROLE_LABELS[r] for r in ADDRESS_ROLES}
+
 
 class App(ctk.CTk):
     def __init__(self):
@@ -64,7 +69,9 @@ class App(ctk.CTk):
         self.geocoder = None
         self.country = None
         self.customers = []
-        self.field_vars = {}     # field name -> BooleanVar
+        self.field_vars = {}       # field name -> BooleanVar (selected?)
+        self.field_role_vars = {}  # field name -> StringVar (role label)
+        self.field_role_menus = {}  # field name -> CTkOptionMenu
         self.plans = []
         self.report_rows = []
         self.tree_item_to_plan = {}  # tree iid -> Plan
@@ -364,6 +371,7 @@ class App(ctk.CTk):
             self.country_entry.insert(0, cfg["country"])
         self.replace_var.set(bool(cfg.get("replace_existing", False)))
         self._saved_fields = cfg.get("address_fields", [])
+        self._saved_roles = cfg.get("field_roles", {}) or {}
         provider = cfg.get("provider", DEFAULT_PROVIDER)
         if provider in GEOCODER_PROVIDERS:
             self.provider_seg.set(GEOCODER_PROVIDERS[provider])
@@ -375,12 +383,13 @@ class App(ctk.CTk):
         if not self.remember_var.get():
             return
         instance = self.instance_entry.get().strip()
-        selected = [name for name, var in self.field_vars.items() if var.get()]
+        field_roles = self._field_roles()
         settings.save_config({
             "instance_name": instance,
             "country": self.country_entry.get().strip().upper(),
             "replace_existing": self.replace_var.get(),
-            "address_fields": selected,
+            "address_fields": [name for name, _role in field_roles],
+            "field_roles": {name: role for name, role in field_roles},
             "provider": self._provider_key(),
         })
         # API keys are deliberately not persisted.
@@ -503,6 +512,8 @@ class App(ctk.CTk):
         for child in self.fields_frame.winfo_children():
             child.destroy()
         self.field_vars = {}
+        self.field_role_vars = {}
+        self.field_role_menus = {}
         names = collect_custom_field_names(self.customers)
         if not names:
             ctk.CTkLabel(self.fields_frame,
@@ -511,35 +522,59 @@ class App(ctk.CTk):
                                                      pady=8)
             return
         saved = set(getattr(self, "_saved_fields", []) or [])
-        for name in names:
+        saved_roles = getattr(self, "_saved_roles", {}) or {}
+        self.fields_frame.grid_columnconfigure(0, weight=1)
+        for row, name in enumerate(names):
             var = ctk.BooleanVar(value=name in saved)
             var.trace_add("write", lambda *_: self._update_sample())
             ctk.CTkCheckBox(self.fields_frame, text=name, variable=var,
                             checkbox_width=18, checkbox_height=18,
                             corner_radius=4, border_color=BORDER,
                             fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                            text_color=TEXT).pack(anchor="w", padx=8, pady=3)
+                            text_color=TEXT).grid(
+                row=row, column=0, sticky="w", padx=(8, 6), pady=3)
+
+            role_key = saved_roles.get(name, DEFAULT_ROLE)
+            role_var = ctk.StringVar(
+                value=ROLE_LABEL_BY_KEY.get(role_key,
+                                            ROLE_LABEL_BY_KEY[DEFAULT_ROLE]))
+            role_var.trace_add("write", lambda *_: self._update_sample())
+            menu = ctk.CTkOptionMenu(
+                self.fields_frame, values=ROLE_LABELS, variable=role_var,
+                width=150, height=26, corner_radius=8, fg_color=FIELD,
+                button_color=BORDER, button_hover_color=ACCENT,
+                text_color=TEXT, dropdown_fg_color=CARD,
+                dropdown_text_color=TEXT, dropdown_hover_color=BORDER)
+            menu.grid(row=row, column=1, sticky="e", padx=(6, 8), pady=3)
             self.field_vars[name] = var
+            self.field_role_vars[name] = role_var
+            self.field_role_menus[name] = menu
         self._update_sample()
 
-    def _selected_fields(self):
-        return [name for name, var in self.field_vars.items() if var.get()]
+    def _field_roles(self):
+        """Ordered [(field_name, role_key)] for the ticked fields."""
+        result = []
+        for name, var in self.field_vars.items():
+            if var.get():
+                label = self.field_role_vars[name].get()
+                result.append((name, ROLE_BY_LABEL.get(label, DEFAULT_ROLE)))
+        return result
 
     def _update_sample(self):
-        fields = self._selected_fields()
-        if not fields:
+        field_roles = self._field_roles()
+        if not field_roles:
             self.sample_label.configure(text="Sample address: -")
             return
-        sample = next((build_address(c, fields) for c in self.customers
-                       if build_address(c, fields)), None)
+        sample = next((build_query(c, field_roles).text for c in self.customers
+                       if build_query(c, field_roles).text), None)
         self.sample_label.configure(
             text=f"Sample address: {sample or '(no customer has these fields filled)'}")
 
     # -- Step 2: preview (geocode only) ----------------------------------
 
     def on_preview(self):
-        fields = self._selected_fields()
-        if not fields:
+        field_roles = self._field_roles()
+        if not field_roles:
             self.set_status("Select at least one address field.")
             return
         replace = self.replace_var.get()
@@ -548,13 +583,15 @@ class App(ctk.CTk):
         self.report_rows = []
         self.save_btn.configure(state="disabled")
         self._clear_tree()
-        self.log_line(f"Geocoding with fields: {' + '.join(fields)}")
+        labels = [f"{name} ({ROLE_LABEL_BY_KEY[role]})"
+                  for name, role in field_roles]
+        self.log_line("Geocoding with fields: " + ", ".join(labels))
         self._persist_settings()
 
         def work():
             try:
                 plans = engine.geocode_customers(
-                    self.geocoder, self.customers, fields,
+                    self.geocoder, self.customers, field_roles,
                     replace_existing=replace, country=country,
                     on_progress=lambda ev: self.queue.put(("progress", ev)),
                     should_cancel=self.cancel_event.is_set)

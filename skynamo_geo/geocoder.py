@@ -4,6 +4,12 @@
 `GoogleGeocoder` (paid, most accurate) and `NominatimGeocoder` (OpenStreetMap,
 free, no API key, throttled to 1 req/s per its usage policy). Use
 `create_geocoder(provider, api_key)` to construct one from a provider id.
+
+`geocode()` accepts either a plain string or an `AddressQuery` (from
+customers.build_query). Nominatim uses the query's structured components for a
+markedly more accurate search and falls back to the free-form text; Google
+uses the single-line text. Results carry the matched country code and postcode
+so the engine can validate that a pin landed where the input said.
 """
 
 import time
@@ -12,20 +18,23 @@ import requests
 
 from .config import (
     ACCURACY_BY_PRECISION, DEFAULT_ACCURACY, GEOCODE_URL,
-    LOW_CONFIDENCE_PRECISIONS, NOMINATIM_MIN_INTERVAL, NOMINATIM_URL,
-    NOMINATIM_USER_AGENT, REQUEST_TIMEOUT,
+    LOW_CONFIDENCE_PRECISIONS, NOMINATIM_MIN_INTERVAL, NOMINATIM_RESULT_LIMIT,
+    NOMINATIM_URL, NOMINATIM_USER_AGENT, REQUEST_TIMEOUT,
 )
 
 
 class GeocodeResult:
     """Outcome of a single successful geocode."""
 
-    def __init__(self, lat, lng, precision, formatted_address, partial_match):
+    def __init__(self, lat, lng, precision, formatted_address, partial_match,
+                 country_code="", postcode=""):
         self.lat = lat
         self.lng = lng
-        self.precision = precision  # provider precision label (Google location_type)
+        self.precision = precision  # provider precision label (see config)
         self.formatted_address = formatted_address
         self.partial_match = partial_match
+        self.country_code = country_code  # ISO alpha-2, upper-case, or ""
+        self.postcode = postcode
 
     @property
     def accuracy(self):
@@ -41,15 +50,36 @@ class GeocodeError(Exception):
     """Raised for fatal provider errors (bad key, billing, quota)."""
 
 
+def _query_parts(query):
+    """Coerce a str or AddressQuery into (text, structured_dict)."""
+    if isinstance(query, str):
+        return query, {}
+    return (getattr(query, "text", "") or "",
+            getattr(query, "structured", {}) or {})
+
+
 class Geocoder:
     """Base class. Implementations return a GeocodeResult or None (not found)."""
 
-    def geocode(self, address, country=None):
+    def geocode(self, query, country=None):
         raise NotImplementedError
 
     def validate(self, country=None):
         """Probe the provider with a known address; raise GeocodeError if misconfigured."""
         self.geocode("Cape Town", country=country)
+
+
+def _google_components(result):
+    """Pull (country_code, postcode) out of a Google result's components."""
+    country_code = ""
+    postcode = ""
+    for comp in result.get("address_components", []):
+        types = comp.get("types", [])
+        if "country" in types and comp.get("short_name"):
+            country_code = comp["short_name"].upper()
+        if "postal_code" in types and comp.get("long_name"):
+            postcode = comp["long_name"]
+    return country_code, postcode
 
 
 class GoogleGeocoder(Geocoder):
@@ -58,14 +88,15 @@ class GoogleGeocoder(Geocoder):
         self.retries = retries
         self.session = requests.Session()
 
-    def geocode(self, address, country=None):
+    def geocode(self, query, country=None):
         """Geocode one address via Google. Returns a GeocodeResult or None.
 
         None means the address simply could not be found (ZERO_RESULTS).
         A GeocodeError is raised for configuration problems (REQUEST_DENIED)
         so the caller can stop rather than hammering the API for every row.
         """
-        params = {"address": address, "key": self.api_key}
+        text, _structured = _query_parts(query)
+        params = {"address": text, "key": self.api_key}
         if country:
             # Restrict results to the given country (ISO 3166-1 alpha-2 code).
             params["components"] = f"country:{country}"
@@ -87,12 +118,15 @@ class GoogleGeocoder(Geocoder):
             if status == "OK":
                 top = body["results"][0]
                 loc = top["geometry"]["location"]
+                country_code, postcode = _google_components(top)
                 return GeocodeResult(
                     lat=loc["lat"],
                     lng=loc["lng"],
                     precision=top["geometry"].get("location_type", ""),
                     formatted_address=top.get("formatted_address", ""),
                     partial_match=top.get("partial_match", False),
+                    country_code=country_code,
+                    postcode=postcode,
                 )
             if status == "ZERO_RESULTS":
                 return None
@@ -122,6 +156,9 @@ _OSM_ROAD_TYPES = {
     "cycleway", "path", "track", "service",
 }
 
+# How specific each precision bucket is - used to rank candidates.
+_OSM_BUCKET_RANK = {"OSM_BUILDING": 3, "OSM_ROAD": 2, "OSM_AREA": 1}
+
 
 def osm_precision(addresstype):
     """Map a Nominatim addresstype to one of our precision labels."""
@@ -132,12 +169,35 @@ def osm_precision(addresstype):
     return "OSM_AREA"
 
 
+def _pick_best(results):
+    """Choose the most precise Nominatim candidate.
+
+    Ranks by precision bucket (building > road > area), breaking ties on
+    Nominatim's own `importance` score.
+    """
+    def score(r):
+        precision = osm_precision(r.get("addresstype") or r.get("type", ""))
+        try:
+            importance = float(r.get("importance") or 0)
+        except (TypeError, ValueError):
+            importance = 0.0
+        return (_OSM_BUCKET_RANK.get(precision, 0), importance)
+
+    return max(results, key=score)
+
+
 class NominatimGeocoder(Geocoder):
     """OpenStreetMap's free geocoder (Nominatim). No API key required.
 
     The public usage policy requires an identifying User-Agent and at most
     one request per second; this class throttles itself so callers (and the
     engine's own delay) don't need to know about it.
+
+    When given a structured query it uses Nominatim's structured search
+    (street/city/state/postalcode/country), which is far more accurate than a
+    free-form string; it falls back to the free-form text if that finds
+    nothing. Either way it fetches several candidates and keeps the most
+    precise one rather than blindly taking the first.
     """
 
     def __init__(self, retries=2):
@@ -152,14 +212,28 @@ class NominatimGeocoder(Geocoder):
             time.sleep(wait)
         self._last_request = time.monotonic()
 
-    def geocode(self, address, country=None):
+    def geocode(self, query, country=None):
         """Geocode one address via Nominatim. Returns a GeocodeResult or None.
 
-        None means not found or a transient network failure after retries.
-        A GeocodeError is raised when Nominatim blocks us (403/429 that
-        persists), so the caller stops instead of hammering the service.
+        Tries a structured search first (when the query has components), then
+        the free-form text. None means not found or a transient failure after
+        retries. A GeocodeError is raised when Nominatim blocks us (persistent
+        403/429) so the caller stops instead of hammering the service.
         """
-        params = {"q": address, "format": "jsonv2", "limit": 1}
+        text, structured = _query_parts(query)
+        if structured:
+            result = self._search(dict(structured), country)
+            if result is not None:
+                return result
+        if text:
+            return self._search({"q": text}, country)
+        return None
+
+    def _search(self, base_params, country):
+        """Run one Nominatim search (structured or free-form) with retries."""
+        params = dict(base_params)
+        params.update({"format": "jsonv2", "addressdetails": 1,
+                       "limit": NOMINATIM_RESULT_LIMIT, "dedupe": 1})
         if country:
             params["countrycodes"] = country.lower()
 
@@ -192,16 +266,21 @@ class NominatimGeocoder(Geocoder):
 
             if not results:
                 return None
-            top = results[0]
-            return GeocodeResult(
-                lat=float(top["lat"]),
-                lng=float(top["lon"]),
-                precision=osm_precision(top.get("addresstype")
-                                        or top.get("type", "")),
-                formatted_address=top.get("display_name", ""),
-                partial_match=False,
-            )
+            return self._to_result(_pick_best(results))
         return None
+
+    def _to_result(self, top):
+        address = top.get("address") or {}
+        return GeocodeResult(
+            lat=float(top["lat"]),
+            lng=float(top["lon"]),
+            precision=osm_precision(top.get("addresstype")
+                                    or top.get("type", "")),
+            formatted_address=top.get("display_name", ""),
+            partial_match=False,
+            country_code=(address.get("country_code") or "").upper(),
+            postcode=address.get("postcode", "") or "",
+        )
 
 
 def create_geocoder(provider, api_key=None):

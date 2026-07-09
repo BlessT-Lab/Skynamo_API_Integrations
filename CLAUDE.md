@@ -45,7 +45,9 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
   **array** body — `/customers/{id}` is GET-only.
 - `skynamo_geo/config.py` — all constants (endpoints, `ACCURACY_BY_PRECISION`, `STATUS_*`,
   `REPORT_FIELDNAMES`). Changing statuses/columns/accuracy tiers happens here.
-- `skynamo_geo/customers.py` — address-field helpers; `has_coordinates` treats zero/`"0"`/null as missing.
+- `skynamo_geo/customers.py` — address helpers. `build_query(customer, field_roles)` returns an
+  `AddressQuery` (`.text` single-line + `.structured` dict) from an ordered `(field_name, role)`
+  list; `clean_value` drops junk; `has_coordinates` treats zero/`"0"`/null as missing.
 - `skynamo_geo/settings.py` — non-secret config in `%APPDATA%/SkynamoGeo/config.json`. API keys are
   never persisted (re-entered each session); `purge_saved_credentials()` clears any keys older
   versions stored in the OS keyring, called on GUI startup.
@@ -58,10 +60,14 @@ new long-running work must follow this pattern — never update a widget from a 
 
 ## Domain rules that aren't obvious from the code
 
-- **Accuracy is precision-derived, not fixed.** Google's `location_type` maps to a Skynamo
-  `accuracy` (metres) via `ACCURACY_BY_PRECISION`; `APPROXIMATE`/`GEOMETRIC_CENTER`/partial matches
-  are low-confidence, written with `is_approximate=true` and flagged for manual review. Always send
-  an `accuracy` value.
+- **Accuracy is precision-derived, not fixed.** Each provider's precision label maps to a Skynamo
+  `accuracy` (metres) via `ACCURACY_BY_PRECISION`; coarse/partial matches are low-confidence, written
+  with `is_approximate=true` and flagged for manual review. Always send an `accuracy` value.
+- **Address fields are role-mapped, not just concatenated.** The user tags each field with a role
+  (street/city/state/postcode/country/other). This feeds Nominatim a **structured search** (its big
+  accuracy lever) — with multi-candidate selection (`_pick_best`) and a free-form fallback — and
+  builds a clean, canonically-ordered single-line query for Google. `engine._validate_result` then
+  flags country/postcode disagreements as low-confidence. Changing roles/tiers happens in `config.py`.
 - **The Skynamo `PATCH /customers` "Missing Authentication Token" error means wrong route, not auth**
   (AWS API Gateway quirk).
 - Address field names vary per instance and live only in each customer's `custom_fields` array, which
