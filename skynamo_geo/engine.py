@@ -18,7 +18,7 @@ from .config import (
     STATUS_SKIPPED_NO_ADDRESS, STATUS_UPDATED, STATUS_UPDATED_LOW_CONF,
     STATUS_UPDATE_FAILED,
 )
-from .customers import build_address, has_coordinates
+from .customers import build_query, has_coordinates
 from .geocoder import GeocodeError
 
 
@@ -28,6 +28,33 @@ def _noop(*_args, **_kwargs):
 
 def _never_cancel():
     return False
+
+
+def _normalise_postcode(value):
+    """Compare postcodes ignoring case and spaces (e.g. UK 'SW1A 1AA')."""
+    return "".join((value or "").split()).upper()
+
+
+def _validate_result(result, query, country):
+    """Return a list of warnings if the match disagrees with the input.
+
+    Compares the geocoded country against the requested country code and the
+    geocoded postcode against any postcode the input supplied. A warning
+    means the pin may be in the wrong place and should be reviewed.
+    """
+    warnings = []
+    if country and result.country_code and \
+            result.country_code.upper() != country.upper():
+        warnings.append(
+            f"country mismatch (input {country.upper()}, "
+            f"matched {result.country_code.upper()})")
+    input_postcode = (query.structured or {}).get("postalcode")
+    if input_postcode and result.postcode and \
+            _normalise_postcode(result.postcode) != _normalise_postcode(input_postcode):
+        warnings.append(
+            f"postcode mismatch (input {input_postcode}, "
+            f"matched {result.postcode})")
+    return warnings
 
 
 class Plan:
@@ -78,11 +105,14 @@ class Plan:
         }
 
 
-def geocode_customers(geocoder, customers, address_fields,
+def geocode_customers(geocoder, customers, field_roles,
                       replace_existing=False, country=None,
                       on_progress=_noop, should_cancel=_never_cancel,
                       delay=GEOCODE_DELAY_SECONDS):
     """Geocode customers into Plans. Performs NO writes.
+
+    field_roles is an ordered list of (field_name, role) tuples describing how
+    each mapped Skynamo field contributes to the address (see customers.py).
 
     Raises GeocodeError on fatal provider problems (bad key/quota) so the
     caller can stop the whole run rather than failing every row.
@@ -98,25 +128,28 @@ def geocode_customers(geocoder, customers, address_fields,
             plan.status = STATUS_SKIPPED_HAS_COORDS
             plan.notes = "Already has coordinates"
         else:
-            plan.address = build_address(customer, address_fields)
-            if not plan.address:
+            query = build_query(customer, field_roles)
+            plan.address = query.text
+            if not query.text:
                 plan.status = STATUS_SKIPPED_NO_ADDRESS
                 plan.notes = "No address"
             else:
-                result = geocoder.geocode(plan.address, country=country)
+                result = geocoder.geocode(query, country=country)
                 if delay:
                     time.sleep(delay)
                 if result is None:
                     plan.status = STATUS_GEOCODE_FAILED
                     plan.notes = "Address could not be geocoded"
                 else:
+                    warnings = _validate_result(result, query, country)
                     plan.result = result
-                    plan.low_confidence = result.is_low_confidence
+                    plan.low_confidence = result.is_low_confidence or bool(warnings)
                     plan.status = STATUS_PENDING
                     plan.include = True
-                    note_parts = [f"Google match: '{result.formatted_address}'"]
+                    note_parts = [f"Match: '{result.formatted_address}'"]
                     if result.partial_match:
                         note_parts.append("partial match")
+                    note_parts.extend(warnings)
                     if plan.low_confidence:
                         note_parts.append("LOW CONFIDENCE - review manually")
                     plan.notes = "; ".join(note_parts)

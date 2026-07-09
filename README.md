@@ -14,10 +14,14 @@ anything is committed.
 1. **Connect** to a Skynamo instance with an instance name + Skynamo API key.
 2. **Fetch** all customers (paginated). **Inactive customers are skipped** —
    only customers with the top-level `active` flag set are processed.
-3. **Map** one or more custom fields as the address source (field names differ
-   per instance, so the user chooses; selected fields are joined with commas).
+3. **Map** custom fields as the address source and **tag each with its role**
+   (street / city / state / postcode / country / other) — field names differ per
+   instance, so the user chooses. Roles drive a structured, correctly-ordered
+   query; junk values ("0", "N/A", blanks) are stripped.
 4. **Geocode** each address via the chosen provider — Google Maps (API key,
    most accurate) or OpenStreetMap/Nominatim (free, no key, ~1 address/second).
+   OSM uses the role components for a structured search (much more accurate than
+   a free-form string) and keeps the most precise of several candidates.
 5. **Preview** the results (coordinates, precision, confidence) — *no writes yet*.
 6. **Write** the approved rows back to Skynamo via `PATCH /customers`.
 7. **Report** a console/table summary + a CSV, including customers with no
@@ -34,7 +38,7 @@ GeoLocation_Script/
     config.py               # constants: URLs, page size, accuracy map, statuses
     client.py               # SkynamoClient: connect, fetch, update_location
     geocoder.py             # Geocoder base + GoogleGeocoder, GeocodeResult/Error
-    customers.py            # address-field helpers (build/collect/has_coordinates)
+    customers.py            # address helpers (build_query/clean_value/collect/has_coordinates)
     engine.py               # geocode_customers + write_locations + report (the core)
     settings.py             # non-secret config JSON (no credentials stored)
   gui.py                    # CustomTkinter desktop app  (entry point for the .exe)
@@ -142,6 +146,29 @@ The full spec is saved in `skynamo_swagger.json` for reference.
 
 ## 6. Geocoding & accuracy logic
 
+### Role-based field mapping (accuracy starts here)
+Each chosen Skynamo field is tagged with the address component it holds —
+**street / city / state / postcode / country**, or **other** (folded into the
+street line). From that mapping `customers.build_query` produces an
+`AddressQuery` with two forms:
+- `text` — a clean, canonically-ordered single-line address (street, other,
+  city, state, postcode, country) used by Google and for display/reports;
+- `structured` — a `{street, city, state, postalcode, country}` dict used for
+  Nominatim's **structured search**.
+
+Values are cleaned first (`clean_value`): whitespace collapsed and junk
+placeholders — `""`, `"0"`, `"-"`, `"N/A"`, `"none"`, `"null"`, `"."` — dropped
+so they never skew a match.
+
+### OpenStreetMap (Nominatim) accuracy
+- Uses the `structured` components rather than one free-form string — far more
+  precise — and **falls back** to the free-form `text` only if that finds
+  nothing.
+- Fetches several candidates (`limit=5`, `addressdetails=1`, `dedupe=1`) and
+  keeps the **most precise** one (`_pick_best`: building > road > area, ties
+  broken by Nominatim's `importance`) instead of blindly taking the first.
+
+### Precision → accuracy
 Both providers report how precise each match is, which we translate into the
 Skynamo `accuracy` value (metres) so downstream reports can trust precise pins
 and treat coarse ones as approximate:
@@ -162,6 +189,11 @@ and treat coarse ones as approximate:
 - A **partial match** (Google) or any of the **low** precisions above is treated
   as **low confidence**: written with `is_approximate=true`, a coarse accuracy,
   and surfaced in the report/table for manual review.
+- **Result validation** (`engine._validate_result`): the matched country and
+  postcode are compared against the input. A country mismatch (vs the 2-letter
+  code) or a postcode mismatch (vs a mapped postcode field) also flags the row
+  low-confidence with a note — catching pins that landed in the wrong place even
+  when the provider reported a "precise" match.
 - An optional **2-letter country code** (e.g. `ZA`) restricts geocoding to that
   country (Google: `components=country:XX` + `region`; OSM: `countrycodes=xx`),
   which removes wrong-continent matches for bare street names.
@@ -175,10 +207,11 @@ and treat coarse ones as approximate:
 
 Two phases, so any UI can do **preview-then-commit**:
 
-- `geocode_customers(geocoder, customers, address_fields, replace_existing,
+- `geocode_customers(geocoder, customers, field_roles, replace_existing,
   country, on_progress, should_cancel) -> list[Plan]`
-  Decides skip reasons (has-coords / no-address), geocodes the rest, and builds
-  `Plan` objects. **Performs no writes.**
+  Decides skip reasons (has-coords / no-address), builds each address from
+  `field_roles` (an ordered list of `(field_name, role)`), geocodes the rest,
+  validates the result, and builds `Plan` objects. **Performs no writes.**
 - `write_locations(client, plans, on_progress, should_cancel) -> report_rows`
   PATCHes only plans where `include` is true and the plan is `writable`
   (has coordinates). Updates each plan's status in place.
@@ -238,6 +271,15 @@ instance. Use the GUI's preview step to eyeball coordinates before writing.
 
 ## 11. Change log
 
+- **v2.2.0** (2026-07-09) — **Accuracy overhaul.** Address fields are now mapped
+  to **roles** (street/city/state/postcode/country/other) in the GUI (a dropdown
+  per field) and CLI. Nominatim uses those roles for a **structured search** with
+  multi-candidate selection (`_pick_best`) and a free-form fallback — a big OSM
+  precision gain; the same clean, role-ordered query also helps Google. Field
+  values are cleaned (junk like "0"/"N/A" dropped). New **result validation**
+  flags country/postcode mismatches as low-confidence. `geocode_customers` now
+  takes `field_roles`; `config.py` gains role + cleaning constants; new offline
+  tests in `test_geocoder.py`/`test_engine.py`.
 - **v2.1.1** (2026-07-03) — **API keys are no longer remembered.** The GUI never
   stores the Skynamo or Google keys; the checkbox (now "Remember settings")
   persists only non-secret settings. Any keys saved by an earlier version are

@@ -42,7 +42,10 @@ from skynamo_geo.config import (
     STATUS_SKIPPED_NO_ADDRESS, STATUS_UPDATED, STATUS_UPDATED_LOW_CONF,
     STATUS_SKIPPED_HAS_COORDS, STATUS_GEOCODE_FAILED, STATUS_UPDATE_FAILED,
 )
-from skynamo_geo.customers import build_address, collect_custom_field_names
+from skynamo_geo.config import (
+    ADDRESS_ROLES, ADDRESS_ROLE_LABELS, DEFAULT_ROLE,
+)
+from skynamo_geo.customers import build_query, collect_custom_field_names
 from skynamo_geo.geocoder import create_geocoder, GeocodeError
 
 
@@ -184,15 +187,25 @@ def main():
         sys.exit("No custom fields found on customers - nothing to map as an address.")
 
     print("\nMap the field(s) that make up the customer address.")
-    print("Selected fields are combined in order, e.g. Street + City + Country.")
-    address_fields = ask_checkbox("Select address field(s):", field_names)
-    while not address_fields:
+    print("Pick the fields, then tag each with the address component it holds")
+    print("(street, city, etc.) - this improves geocoding accuracy.")
+    selected = ask_checkbox("Select address field(s):", field_names)
+    while not selected:
         print("You must select at least one field.")
-        address_fields = ask_checkbox("Select address field(s):", field_names)
-    print(f"  Address mapping: {' + '.join(address_fields)}")
+        selected = ask_checkbox("Select address field(s):", field_names)
 
-    sample = next((build_address(c, address_fields) for c in customers
-                   if build_address(c, address_fields)), None)
+    role_labels = [ADDRESS_ROLE_LABELS[r] for r in ADDRESS_ROLES]
+    label_to_role = {ADDRESS_ROLE_LABELS[r]: r for r in ADDRESS_ROLES}
+    field_roles = []
+    for name in selected:
+        label = ask_select(f"What is '{name}'?", role_labels)
+        field_roles.append((name, label_to_role.get(label, DEFAULT_ROLE)))
+    print("  Address mapping: "
+          + ", ".join(f"{name} ({ADDRESS_ROLE_LABELS[role]})"
+                      for name, role in field_roles))
+
+    sample = next((build_query(c, field_roles).text for c in customers
+                   if build_query(c, field_roles).text), None)
     if sample:
         print(f"  Sample address: {sample}")
     if not ask_confirm("Does this mapping look correct?", default=True):
@@ -216,7 +229,7 @@ def main():
     print(f"\nGeocoding {total} customers via {provider_name}...\n")
     try:
         plans = engine.geocode_customers(
-            geocoder, customers, address_fields,
+            geocoder, customers, field_roles,
             replace_existing=replace_existing, country=country or None,
             on_progress=on_geocode)
     except GeocodeError as exc:
