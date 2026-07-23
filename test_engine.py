@@ -11,7 +11,7 @@ from skynamo_geo.config import (
 
 
 class FakeGeocoder:
-    """Returns ROOFTOP for known streets, APPROXIMATE for 'Town', None else.
+    """Returns OSM_BUILDING for known streets, OSM_AREA for 'Town', None else.
 
     Reads the query's single-line text (accepts AddressQuery or str) and
     records it so tests can assert what was actually sent.
@@ -25,11 +25,11 @@ class FakeGeocoder:
         text = query if isinstance(query, str) else query.text
         self.calls.append(text)
         if "Main" in text:
-            return GeocodeResult(-33.9, 18.4, "ROOFTOP", "1 Main Rd", False,
+            return GeocodeResult(-33.9, 18.4, "OSM_BUILDING", "1 Main Rd", False,
                                  country_code=self.country_code,
                                  postcode=self.postcode)
         if "Town" in text:
-            return GeocodeResult(-33.7, 19.0, "APPROXIMATE", "Town", False,
+            return GeocodeResult(-33.7, 19.0, "OSM_AREA", "Town", False,
                                  country_code=self.country_code)
         return None
 
@@ -54,8 +54,8 @@ def cust(cid, fields=None, loc=None):
 ROLES = [("Street", ROLE_STREET), ("City", ROLE_CITY)]
 
 customers = [
-    cust(1, {"Street": "1 Main Rd", "City": "Cape Town"}),          # ROOFTOP precise
-    cust(2, {"Street": "", "City": "Town"}),                        # APPROXIMATE low-conf
+    cust(1, {"Street": "1 Main Rd", "City": "Cape Town"}),          # OSM_BUILDING precise
+    cust(2, {"Street": "", "City": "Town"}),                        # OSM_AREA low-conf
     cust(3, {"Street": "", "City": ""}),                            # no address
     cust(4, {"Street": "Nowhere"}, ),                               # geocode fail (None)
     cust(5, {"Street": "1 Main Rd"}, loc={"latitude": -33.9, "longitude": 18.4}),  # has coords
@@ -85,10 +85,10 @@ report = engine.write_locations(client, plans)
 patched_ids = [row[0] for row in client.patched]
 assert patched_ids == [1], patched_ids  # only row 1 written
 assert by_id[1].status == STATUS_UPDATED
-# Row 1 accuracy must be the ROOFTOP value (10), is_approximate False
-assert client.patched[0][3] == 10 and client.patched[0][4] is False
+# Row 1 accuracy must be the OSM_BUILDING value (25), is_approximate False
+assert client.patched[0][3] == 25 and client.patched[0][4] is False
 
-# Re-include row 2 and write again -> it should PATCH with APPROXIMATE/low-conf
+# Re-include row 2 and write again -> it should PATCH with OSM_AREA/low-conf
 client2 = FakeClient()
 by_id[2].include = True
 engine.write_locations(client2, [by_id[2]])
@@ -106,7 +106,7 @@ plans2 = engine.geocode_customers(geo2, customers, ROLES, should_cancel=cancel)
 assert len(plans2) <= 3, len(plans2)
 
 # --- Result validation: a country mismatch flags an otherwise-precise match ---
-geo_wrong = FakeGeocoder(country_code="US")   # ROOFTOP but wrong country
+geo_wrong = FakeGeocoder(country_code="US")   # OSM_BUILDING but wrong country
 val_customers = [cust(10, {"Street": "1 Main Rd", "City": "Cape Town"})]
 val_plans = engine.geocode_customers(geo_wrong, val_customers, ROLES,
                                      country="ZA")

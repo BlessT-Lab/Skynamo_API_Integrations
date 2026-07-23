@@ -1,15 +1,14 @@
 """Geocoding providers.
 
-`Geocoder` is the abstraction the engine depends on. Two implementations:
-`GoogleGeocoder` (paid, most accurate) and `NominatimGeocoder` (OpenStreetMap,
-free, no API key, throttled to 1 req/s per its usage policy). Use
-`create_geocoder(provider, api_key)` to construct one from a provider id.
+`Geocoder` is the abstraction the engine depends on. `NominatimGeocoder`
+(OpenStreetMap, free, no API key, throttled to 1 req/s per its usage policy)
+is the only implementation.
 
 `geocode()` accepts either a plain string or an `AddressQuery` (from
 customers.build_query). Nominatim uses the query's structured components for a
-markedly more accurate search and falls back to the free-form text; Google
-uses the single-line text. Results carry the matched country code and postcode
-so the engine can validate that a pin landed where the input said.
+markedly more accurate search and falls back to the free-form text. Results
+carry the matched country code and postcode so the engine can validate that a
+pin landed where the input said.
 """
 
 import time
@@ -17,7 +16,7 @@ import time
 import requests
 
 from .config import (
-    ACCURACY_BY_PRECISION, DEFAULT_ACCURACY, GEOCODE_URL,
+    ACCURACY_BY_PRECISION, DEFAULT_ACCURACY,
     LOW_CONFIDENCE_PRECISIONS, NOMINATIM_MIN_INTERVAL, NOMINATIM_RESULT_LIMIT,
     NOMINATIM_URL, NOMINATIM_USER_AGENT, REQUEST_TIMEOUT,
 )
@@ -47,7 +46,7 @@ class GeocodeResult:
 
 
 class GeocodeError(Exception):
-    """Raised for fatal provider errors (bad key, billing, quota)."""
+    """Raised for fatal provider errors (e.g. persistent rate-limit blocks)."""
 
 
 def _query_parts(query):
@@ -67,81 +66,6 @@ class Geocoder:
     def validate(self, country=None):
         """Probe the provider with a known address; raise GeocodeError if misconfigured."""
         self.geocode("Cape Town", country=country)
-
-
-def _google_components(result):
-    """Pull (country_code, postcode) out of a Google result's components."""
-    country_code = ""
-    postcode = ""
-    for comp in result.get("address_components", []):
-        types = comp.get("types", [])
-        if "country" in types and comp.get("short_name"):
-            country_code = comp["short_name"].upper()
-        if "postal_code" in types and comp.get("long_name"):
-            postcode = comp["long_name"]
-    return country_code, postcode
-
-
-class GoogleGeocoder(Geocoder):
-    def __init__(self, api_key, retries=2):
-        self.api_key = api_key
-        self.retries = retries
-        self.session = requests.Session()
-
-    def geocode(self, query, country=None):
-        """Geocode one address via Google. Returns a GeocodeResult or None.
-
-        None means the address simply could not be found (ZERO_RESULTS).
-        A GeocodeError is raised for configuration problems (REQUEST_DENIED)
-        so the caller can stop rather than hammering the API for every row.
-        """
-        text, _structured = _query_parts(query)
-        params = {"address": text, "key": self.api_key}
-        if country:
-            # Restrict results to the given country (ISO 3166-1 alpha-2 code).
-            params["components"] = f"country:{country}"
-            params["region"] = country.lower()
-
-        for attempt in range(self.retries + 1):
-            try:
-                resp = self.session.get(GEOCODE_URL, params=params,
-                                        timeout=REQUEST_TIMEOUT)
-                resp.raise_for_status()
-                body = resp.json()
-            except requests.RequestException:
-                if attempt < self.retries:
-                    time.sleep(2)
-                    continue
-                return None
-
-            status = body.get("status")
-            if status == "OK":
-                top = body["results"][0]
-                loc = top["geometry"]["location"]
-                country_code, postcode = _google_components(top)
-                return GeocodeResult(
-                    lat=loc["lat"],
-                    lng=loc["lng"],
-                    precision=top["geometry"].get("location_type", ""),
-                    formatted_address=top.get("formatted_address", ""),
-                    partial_match=top.get("partial_match", False),
-                    country_code=country_code,
-                    postcode=postcode,
-                )
-            if status == "ZERO_RESULTS":
-                return None
-            if status == "OVER_QUERY_LIMIT":
-                if attempt < self.retries:
-                    time.sleep(2)
-                    continue
-                raise GeocodeError(
-                    "Google API rate/quota limit hit (OVER_QUERY_LIMIT). "
-                    "Check your billing and quota.")
-            # REQUEST_DENIED, INVALID_REQUEST, etc. - not worth retrying.
-            raise GeocodeError(
-                f"Google API error: {status} - "
-                f"{body.get('error_message', 'no detail')}")
-        return None
 
 
 # Nominatim `addresstype` values bucketed into our precision labels.
@@ -190,8 +114,8 @@ class NominatimGeocoder(Geocoder):
     """OpenStreetMap's free geocoder (Nominatim). No API key required.
 
     The public usage policy requires an identifying User-Agent and at most
-    one request per second; this class throttles itself so callers (and the
-    engine's own delay) don't need to know about it.
+    one request per second; this class throttles itself so callers don't
+    need to know about it.
 
     When given a structured query it uses Nominatim's structured search
     (street/city/state/postalcode/country), which is far more accurate than a
@@ -254,7 +178,7 @@ class NominatimGeocoder(Geocoder):
                 raise GeocodeError(
                     f"Nominatim blocked the request (HTTP {resp.status_code}). "
                     "The free OpenStreetMap service rate-limits heavy use - "
-                    "wait a while and retry, or switch to Google Maps.")
+                    "wait a while and retry.")
             try:
                 resp.raise_for_status()
                 results = resp.json()
@@ -281,14 +205,3 @@ class NominatimGeocoder(Geocoder):
             country_code=(address.get("country_code") or "").upper(),
             postcode=address.get("postcode", "") or "",
         )
-
-
-def create_geocoder(provider, api_key=None):
-    """Build a Geocoder from a provider id ('google' or 'osm')."""
-    if provider == "osm":
-        return NominatimGeocoder()
-    if provider == "google":
-        if not api_key:
-            raise GeocodeError("Google Maps requires an API key.")
-        return GoogleGeocoder(api_key)
-    raise GeocodeError(f"Unknown geocoding provider: {provider!r}")

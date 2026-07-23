@@ -23,11 +23,10 @@ from skynamo_geo.client import SkynamoClient
 from skynamo_geo.config import (
     STATUS_UPDATED, STATUS_UPDATED_LOW_CONF, STATUS_SKIPPED_HAS_COORDS,
     STATUS_SKIPPED_NO_ADDRESS, STATUS_GEOCODE_FAILED, STATUS_UPDATE_FAILED,
-    STATUS_PENDING, GEOCODER_PROVIDERS, DEFAULT_PROVIDER,
-    ADDRESS_ROLES, ADDRESS_ROLE_LABELS, DEFAULT_ROLE,
+    STATUS_PENDING, ADDRESS_ROLES, ADDRESS_ROLE_LABELS, DEFAULT_ROLE,
 )
 from skynamo_geo.customers import build_query, collect_custom_field_names
-from skynamo_geo.geocoder import create_geocoder, GeocodeError
+from skynamo_geo.geocoder import NominatimGeocoder, GeocodeError
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -48,9 +47,6 @@ TEXT_MUTED = "#9a9a9a"
 
 CHECK_ON = "☑"   # ballot box with check
 CHECK_OFF = "☐"  # empty ballot box
-
-PROVIDER_LABELS = list(GEOCODER_PROVIDERS.values())
-PROVIDER_BY_LABEL = {label: key for key, label in GEOCODER_PROVIDERS.items()}
 
 ROLE_LABELS = [ADDRESS_ROLE_LABELS[r] for r in ADDRESS_ROLES]
 ROLE_BY_LABEL = {ADDRESS_ROLE_LABELS[r]: r for r in ADDRESS_ROLES}
@@ -120,29 +116,8 @@ class App(ctk.CTk):
         self.skynamo_entry = self._labeled_entry(conn, "Skynamo API key", 2,
                                                  show="*")
 
-        ctk.CTkLabel(conn, text="Geocoding provider", anchor="w",
-                     text_color=TEXT).grid(
-            row=3, column=0, padx=(14, 6), pady=4, sticky="w")
-        self.provider_seg = ctk.CTkSegmentedButton(
-            conn, values=PROVIDER_LABELS, command=self._on_provider_change,
-            fg_color=FIELD, selected_color=ACCENT,
-            selected_hover_color=ACCENT_HOVER,
-            unselected_color=FIELD, unselected_hover_color=BORDER,
-            corner_radius=8, height=30)
-        self.provider_seg.set(GEOCODER_PROVIDERS[DEFAULT_PROVIDER])
-        self.provider_seg.grid(row=3, column=1, padx=(0, 14), pady=4,
-                               sticky="ew")
-
-        self.google_label = ctk.CTkLabel(conn, text="Google Maps API key",
-                                         anchor="w", text_color=TEXT)
-        self.google_label.grid(row=4, column=0, padx=(14, 6), pady=4,
-                               sticky="w")
-        self.google_entry = self._entry(conn, show="*")
-        self.google_entry.grid(row=4, column=1, padx=(0, 14), pady=4,
-                               sticky="ew")
-
         self.country_entry = self._labeled_entry(
-            conn, "Country (2-letter, optional)", 5)
+            conn, "Country (2-letter, optional)", 3)
 
         self.remember_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(conn, text="Remember settings (never API keys)",
@@ -151,11 +126,11 @@ class App(ctk.CTk):
                         corner_radius=5, border_color=BORDER,
                         fg_color=ACCENT, hover_color=ACCENT_HOVER,
                         text_color=TEXT).grid(
-            row=6, column=0, columnspan=2, padx=14, pady=6, sticky="w")
+            row=4, column=0, columnspan=2, padx=14, pady=6, sticky="w")
 
         self.connect_btn = self._button(
             conn, "Connect & Load Customers", self.on_connect)
-        self.connect_btn.grid(row=7, column=0, columnspan=2,
+        self.connect_btn.grid(row=5, column=0, columnspan=2,
                               padx=14, pady=(6, 14), sticky="ew")
 
         # Mapping panel
@@ -338,20 +313,6 @@ class App(ctk.CTk):
                      text="Connect & load customers to list fields.",
                      text_color=TEXT_MUTED).pack(anchor="w", padx=8, pady=8)
 
-    # -- Provider selection ------------------------------------------------
-
-    def _provider_key(self):
-        return PROVIDER_BY_LABEL.get(self.provider_seg.get(),
-                                     DEFAULT_PROVIDER)
-
-    def _on_provider_change(self, _value=None):
-        if self._provider_key() == "google":
-            self.google_entry.configure(state="normal")
-            self.google_label.configure(text_color=TEXT)
-        else:
-            self.google_entry.configure(state="disabled")
-            self.google_label.configure(text_color=TEXT_MUTED)
-
     # -- Logging / status -------------------------------------------------
 
     def log_line(self, text):
@@ -372,12 +333,8 @@ class App(ctk.CTk):
         self.replace_var.set(bool(cfg.get("replace_existing", False)))
         self._saved_fields = cfg.get("address_fields", [])
         self._saved_roles = cfg.get("field_roles", {}) or {}
-        provider = cfg.get("provider", DEFAULT_PROVIDER)
-        if provider in GEOCODER_PROVIDERS:
-            self.provider_seg.set(GEOCODER_PROVIDERS[provider])
         # API keys are never remembered; purge any an older version stored.
         settings.purge_saved_credentials(cfg.get("instance_name"))
-        self._on_provider_change()
 
     def _persist_settings(self):
         if not self.remember_var.get():
@@ -390,7 +347,6 @@ class App(ctk.CTk):
             "replace_existing": self.replace_var.get(),
             "address_fields": [name for name, _role in field_roles],
             "field_roles": {name: role for name, role in field_roles},
-            "provider": self._provider_key(),
         })
         # API keys are deliberately not persisted.
 
@@ -454,23 +410,15 @@ class App(ctk.CTk):
     def on_connect(self):
         instance = self.instance_entry.get().strip()
         skynamo_key = self.skynamo_entry.get().strip()
-        provider = self._provider_key()
-        google_key = self.google_entry.get().strip()
         country = self.country_entry.get().strip().upper()
         if not (instance and skynamo_key):
             self.set_status("Enter instance name and Skynamo key first.")
-            return
-        if provider == "google" and not google_key:
-            self.set_status("Enter a Google Maps API key, or switch the "
-                            "provider to OpenStreetMap.")
             return
         if country and len(country) != 2:
             self.set_status("Country must be a 2-letter code (e.g. ZA) or blank.")
             return
         self.country = country or None
-        provider_label = GEOCODER_PROVIDERS[provider]
-        self.log_line(f"Connecting to '{instance}' "
-                      f"(geocoder: {provider_label})...")
+        self.log_line(f"Connecting to '{instance}'...")
 
         def work():
             try:
@@ -480,11 +428,10 @@ class App(ctk.CTk):
                     self.queue.put(("error", message))
                     return
                 self.queue.put(("log", "Skynamo credentials OK."))
-                geocoder = create_geocoder(provider, google_key or None)
-                self.queue.put(("status",
-                                f"Validating {provider_label} geocoder..."))
+                geocoder = NominatimGeocoder()
+                self.queue.put(("status", "Validating OpenStreetMap geocoder..."))
                 geocoder.validate(country=self.country)
-                self.queue.put(("log", f"{provider_label} geocoder OK."))
+                self.queue.put(("log", "OpenStreetMap geocoder OK."))
                 self.queue.put(("status", "Fetching customers..."))
                 customers = client.fetch_all_customers(
                     on_page=lambda n, total: self.queue.put((

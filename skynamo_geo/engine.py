@@ -10,10 +10,9 @@ them identically.
 """
 
 import csv
-import time
 
 from .config import (
-    GEOCODE_DELAY_SECONDS, REPORT_FIELDNAMES,
+    REPORT_FIELDNAMES,
     STATUS_GEOCODE_FAILED, STATUS_PENDING, STATUS_SKIPPED_HAS_COORDS,
     STATUS_SKIPPED_NO_ADDRESS, STATUS_UPDATED, STATUS_UPDATED_LOW_CONF,
     STATUS_UPDATE_FAILED,
@@ -107,8 +106,7 @@ class Plan:
 
 def geocode_customers(geocoder, customers, field_roles,
                       replace_existing=False, country=None,
-                      on_progress=_noop, should_cancel=_never_cancel,
-                      delay=GEOCODE_DELAY_SECONDS):
+                      on_progress=_noop, should_cancel=_never_cancel):
     """Geocode customers into Plans. Performs NO writes.
 
     field_roles is an ordered list of (field_name, role) tuples describing how
@@ -135,8 +133,6 @@ def geocode_customers(geocoder, customers, field_roles,
                 plan.notes = "No address"
             else:
                 result = geocoder.geocode(query, country=country)
-                if delay:
-                    time.sleep(delay)
                 if result is None:
                     plan.status = STATUS_GEOCODE_FAILED
                     plan.notes = "Address could not be geocoded"

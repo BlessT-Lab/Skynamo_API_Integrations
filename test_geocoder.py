@@ -1,33 +1,16 @@
-"""Offline smoke tests for provider selection, the OSM precision mapping,
-role-based query building, value cleaning, and candidate ranking.
-No network calls - only the factory and pure logic."""
+"""Offline smoke tests for the OSM precision mapping, role-based query
+building, value cleaning, and candidate ranking.
+No network calls - only pure logic."""
 
 from skynamo_geo.config import (
-    ACCURACY_BY_PRECISION, LOW_CONFIDENCE_PRECISIONS, GEOCODER_PROVIDERS,
+    ACCURACY_BY_PRECISION, LOW_CONFIDENCE_PRECISIONS,
     ROLE_STREET, ROLE_CITY, ROLE_STATE, ROLE_POSTCODE, ROLE_COUNTRY, ROLE_OTHER,
 )
 from skynamo_geo.customers import clean_value, build_query, AddressQuery
 from skynamo_geo.geocoder import (
-    GoogleGeocoder, NominatimGeocoder, GeocodeError, GeocodeResult,
-    create_geocoder, osm_precision, _pick_best, _query_parts,
+    NominatimGeocoder, GeocodeResult,
+    osm_precision, _pick_best, _query_parts,
 )
-
-# Factory: right class per provider id, key rules enforced
-assert isinstance(create_geocoder("google", "fake-key"), GoogleGeocoder)
-assert isinstance(create_geocoder("osm"), NominatimGeocoder)
-try:
-    create_geocoder("google")  # no key -> error
-    assert False, "google without key should raise"
-except GeocodeError:
-    pass
-try:
-    create_geocoder("mapbox")
-    assert False, "unknown provider should raise"
-except GeocodeError:
-    pass
-
-# Both provider ids must be offered to users
-assert set(GEOCODER_PROVIDERS) == {"google", "osm"}
 
 # addresstype buckets
 assert osm_precision("building") == "OSM_BUILDING"
@@ -104,7 +87,7 @@ tie = [
 assert _pick_best(tie)["importance"] == 0.7  # higher importance wins the tie
 
 # GeocodeResult carries validation components
-r = GeocodeResult(1.0, 2.0, "ROOFTOP", "addr", False,
+r = GeocodeResult(1.0, 2.0, "OSM_BUILDING", "addr", False,
                   country_code="za", postcode="8001")
 assert r.country_code == "za" and r.postcode == "8001"
 

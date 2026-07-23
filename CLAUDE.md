@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A tool that fills in customer latitude/longitude on a Skynamo instance by geocoding their address
-fields via Google Maps or OpenStreetMap (user-selectable). Ships as both a CustomTkinter desktop
+fields via OpenStreetMap (Nominatim) — free, no API key. Ships as both a CustomTkinter desktop
 GUI and an interactive CLI. See [README.md](README.md) for the full user-facing walkthrough and
 Skynamo API reference.
 
@@ -36,10 +36,10 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
   PATCHes only plans where `include` is true and the plan is `writable`. Both take an
   `on_progress(event)` callback and a `should_cancel()` predicate — that's how the GUI streams
   progress and cancels without the core knowing anything about threads or widgets.
-- `skynamo_geo/geocoder.py` — `Geocoder` base class; `GoogleGeocoder` and `NominatimGeocoder`
-  (OpenStreetMap: free, no key, self-throttled to 1 req/s per usage policy) implement it.
-  Front-ends construct one via `create_geocoder(provider, api_key)`; adding a provider = new
-  subclass + register in `create_geocoder` and `GEOCODER_PROVIDERS` (config.py), zero engine changes.
+- `skynamo_geo/geocoder.py` — `Geocoder` base class; `NominatimGeocoder` (OpenStreetMap: free, no
+  key, self-throttled to 1 req/s per usage policy) is the only implementation; front-ends construct
+  it directly (`NominatimGeocoder()`). Adding another provider = new `Geocoder` subclass, zero
+  engine changes.
 - `skynamo_geo/client.py` — `SkynamoClient`. `fetch_all_customers(active_only=True)` skips inactive
   customers by default. `update_location` must PATCH the **collection** endpoint `/customers` with an
   **array** body — `/customers/{id}` is GET-only.
@@ -65,9 +65,9 @@ new long-running work must follow this pattern — never update a widget from a 
   with `is_approximate=true` and flagged for manual review. Always send an `accuracy` value.
 - **Address fields are role-mapped, not just concatenated.** The user tags each field with a role
   (street/city/state/postcode/country/other). This feeds Nominatim a **structured search** (its big
-  accuracy lever) — with multi-candidate selection (`_pick_best`) and a free-form fallback — and
-  builds a clean, canonically-ordered single-line query for Google. `engine._validate_result` then
-  flags country/postcode disagreements as low-confidence. Changing roles/tiers happens in `config.py`.
+  accuracy lever) — with multi-candidate selection (`_pick_best`) and a clean, canonically-ordered
+  single-line query as a free-form fallback. `engine._validate_result` then flags country/postcode
+  disagreements as low-confidence. Changing roles/tiers happens in `config.py`.
 - **The Skynamo `PATCH /customers` "Missing Authentication Token" error means wrong route, not auth**
   (AWS API Gateway quirk).
 - Address field names vary per instance and live only in each customer's `custom_fields` array, which

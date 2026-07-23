@@ -5,7 +5,7 @@ Interactive console tool that:
   1. Connects to a Skynamo instance using an API key + instance name.
   2. Fetches all customers (paginated).
   3. Lets the user map one or more custom fields as the address source.
-  4. Geocodes addresses via Google Maps or OpenStreetMap (user's choice).
+  4. Geocodes addresses via OpenStreetMap (Nominatim).
   5. PATCHes latitude/longitude back to Skynamo, with an accuracy value
      derived from how precise the geocoder's match was.
   6. Prints a summary and saves a CSV report.
@@ -16,8 +16,8 @@ exact same engine, so behaviour stays identical across both.
 Requirements:
     pip install requests questionary
 
-Google Maps needs an API key with the Geocoding API enabled; OpenStreetMap
-(Nominatim) is free and needs no key, but is slower (1 request/second).
+Geocoding is done via OpenStreetMap (Nominatim), which is free and needs no
+API key, but is throttled to ~1 request/second.
 
 Usage:
     python skynamo_geolocation.py
@@ -46,7 +46,7 @@ from skynamo_geo.config import (
     ADDRESS_ROLES, ADDRESS_ROLE_LABELS, DEFAULT_ROLE,
 )
 from skynamo_geo.customers import build_query, collect_custom_field_names
-from skynamo_geo.geocoder import create_geocoder, GeocodeError
+from skynamo_geo.geocoder import NominatimGeocoder, GeocodeError
 
 
 # ---------------------------------------------------------------------------
@@ -138,21 +138,7 @@ def main():
         sys.exit(f"ERROR: {message}")
     print(f"  {message}")
 
-    # --- Geocoding provider + optional country bias ---
-    provider_choice = ask_select(
-        "Geocoding provider:",
-        ["Google Maps (API key required, most accurate)",
-         "OpenStreetMap (free, no key, ~1 address/second)"])
-    provider = "google" if provider_choice.startswith("Google") else "osm"
-
-    google_key = None
-    if provider == "google":
-        google_key = ask_text("Google Maps API key:", password=True)
-        while not google_key:
-            google_key = ask_text(
-                "API key cannot be empty. Google Maps API key:",
-                password=True)
-
+    # --- Optional country bias ---
     country = ask_text(
         "Restrict geocoding to a country? Enter a 2-letter code "
         "(e.g. ZA, GB, US) or leave blank for no restriction:"
@@ -161,7 +147,7 @@ def main():
         print(f"  '{country}' is not a 2-letter code - ignoring country restriction.")
         country = ""
 
-    geocoder = create_geocoder(provider, google_key)
+    geocoder = NominatimGeocoder()
     print("\nValidating geocoder...")
     try:
         geocoder.validate(country=country or None)
@@ -224,9 +210,7 @@ def main():
         tag = f" [{ev['status']}]"
         print(f"[{ev['index']}/{ev['total']}] {ev['name']}{tag}")
 
-    provider_name = ("Google Maps" if provider == "google"
-                     else "OpenStreetMap")
-    print(f"\nGeocoding {total} customers via {provider_name}...\n")
+    print(f"\nGeocoding {total} customers via OpenStreetMap...\n")
     try:
         plans = engine.geocode_customers(
             geocoder, customers, field_roles,

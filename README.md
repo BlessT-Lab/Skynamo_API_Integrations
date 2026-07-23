@@ -3,7 +3,7 @@
 A desktop + CLI tool that fills in customer **latitude/longitude** on a Skynamo
 instance by geocoding their address fields. It connects to the Skynamo public
 API, reads customers, builds an address string from user-mapped custom fields,
-geocodes each via **Google Maps or OpenStreetMap** (user's choice), and writes
+geocodes each via **OpenStreetMap (Nominatim)** — free, no API key — and writes
 the coordinates back — with a preview step so you approve results before
 anything is committed.
 
@@ -18,10 +18,10 @@ anything is committed.
    (street / city / state / postcode / country / other) — field names differ per
    instance, so the user chooses. Roles drive a structured, correctly-ordered
    query; junk values ("0", "N/A", blanks) are stripped.
-4. **Geocode** each address via the chosen provider — Google Maps (API key,
-   most accurate) or OpenStreetMap/Nominatim (free, no key, ~1 address/second).
-   OSM uses the role components for a structured search (much more accurate than
-   a free-form string) and keeps the most precise of several candidates.
+4. **Geocode** each address via OpenStreetMap/Nominatim (free, no key,
+   ~1 address/second). It uses the role components for a structured search
+   (much more accurate than a free-form string) and keeps the most precise of
+   several candidates.
 5. **Preview** the results (coordinates, precision, confidence) — *no writes yet*.
 6. **Write** the approved rows back to Skynamo via `PATCH /customers`.
 7. **Report** a console/table summary + a CSV, including customers with no
@@ -37,7 +37,7 @@ GeoLocation_Script/
     __init__.py
     config.py               # constants: URLs, page size, accuracy map, statuses
     client.py               # SkynamoClient: connect, fetch, update_location
-    geocoder.py             # Geocoder base + GoogleGeocoder, GeocodeResult/Error
+    geocoder.py             # Geocoder base + NominatimGeocoder, GeocodeResult/Error
     customers.py            # address helpers (build_query/clean_value/collect/has_coordinates)
     engine.py               # geocode_customers + write_locations + report (the core)
     settings.py             # non-secret config JSON (no credentials stored)
@@ -66,9 +66,7 @@ identical and new front-ends (or a future web/scheduled runner) can reuse it.
 py -m pip install -r requirements.txt
 py gui.py
 ```
-Flow in the window: pick a **geocoding provider** (Google Maps or
-OpenStreetMap — the Google key field is disabled when OSM is selected) →
-**Connect & Load Customers** → tick address field(s) →
+Flow in the window: **Connect & Load Customers** → tick address field(s) →
 **Preview (geocode only)** → review/untick rows → **Write Selected to Skynamo**
 → **Save Report CSV**. A **Cancel** button stops a run; the work happens on a
 background thread so the window never freezes.
@@ -96,22 +94,16 @@ Produces `dist\SkynamoGeo.exe` (single, double-clickable, no console window).
 
 ## 4. Credentials & settings
 
-- **Google Maps API key** (only if the Google Maps provider is selected) —
-  needs the **Geocoding API** enabled in Google Cloud (Console → APIs &
-  Services → Geocoding API). Free $200/month credit (~40k lookups), then
-  ~$5 per 1,000.
 - **OpenStreetMap (Nominatim)** — no key or account needed. The public service
-  is rate-limited to ~1 request/second (the tool throttles itself) and street
-  coverage is weaker than Google in some regions.
+  is rate-limited to ~1 request/second (the tool throttles itself).
 - **Skynamo API key** — Skynamo Insights → Settings → Integration Tokens →
   *Add access token*.
 
-**API keys are never stored.** You re-enter the Skynamo key (and Google key, if
-used) every time you launch the app. The GUI's **"Remember settings"** checkbox
-only persists **non-secret settings** (instance name, country, provider, replace
-flag, selected address fields) to `%APPDATA%\SkynamoGeo\config.json`. Any API
-keys that an earlier version saved to the Windows Credential Manager are purged
-on startup.
+**API keys are never stored.** You re-enter the Skynamo key every time you
+launch the app. The GUI's **"Remember settings"** checkbox only persists
+**non-secret settings** (instance name, country, replace flag, selected
+address fields) to `%APPDATA%\SkynamoGeo\config.json`. Any API keys that an
+earlier version saved to the Windows Credential Manager are purged on startup.
 
 ---
 
@@ -152,7 +144,8 @@ Each chosen Skynamo field is tagged with the address component it holds —
 street line). From that mapping `customers.build_query` produces an
 `AddressQuery` with two forms:
 - `text` — a clean, canonically-ordered single-line address (street, other,
-  city, state, postcode, country) used by Google and for display/reports;
+  city, state, postcode, country) used as a fallback query and for
+  display/reports;
 - `structured` — a `{street, city, state, postalcode, country}` dict used for
   Nominatim's **structured search**.
 
@@ -169,16 +162,9 @@ so they never skew a match.
   broken by Nominatim's `importance`) instead of blindly taking the first.
 
 ### Precision → accuracy
-Both providers report how precise each match is, which we translate into the
+Nominatim reports how precise each match is, which we translate into the
 Skynamo `accuracy` value (metres) so downstream reports can trust precise pins
 and treat coarse ones as approximate:
-
-| Google `location_type` | Meaning                         | accuracy (m) | Confidence |
-|------------------------|---------------------------------|--------------|------------|
-| `ROOFTOP`              | exact street address            | 10           | high       |
-| `RANGE_INTERPOLATED`   | interpolated along a road       | 50           | high       |
-| `GEOMETRIC_CENTER`     | centre of a street/polyline     | 200          | **low**    |
-| `APPROXIMATE`          | town/suburb centroid            | 3000         | **low**    |
 
 | OSM precision (bucketed `addresstype`) | Meaning                | accuracy (m) | Confidence |
 |----------------------------------------|------------------------|--------------|------------|
@@ -186,17 +172,17 @@ and treat coarse ones as approximate:
 | `OSM_ROAD`                              | street-level match     | 200          | **low**    |
 | `OSM_AREA`                              | suburb/town centroid   | 3000         | **low**    |
 
-- A **partial match** (Google) or any of the **low** precisions above is treated
-  as **low confidence**: written with `is_approximate=true`, a coarse accuracy,
-  and surfaced in the report/table for manual review.
+- Any of the **low** precisions above is treated as **low confidence**: written
+  with `is_approximate=true`, a coarse accuracy, and surfaced in the
+  report/table for manual review.
 - **Result validation** (`engine._validate_result`): the matched country and
   postcode are compared against the input. A country mismatch (vs the 2-letter
   code) or a postcode mismatch (vs a mapped postcode field) also flags the row
   low-confidence with a note — catching pins that landed in the wrong place even
   when the provider reported a "precise" match.
 - An optional **2-letter country code** (e.g. `ZA`) restricts geocoding to that
-  country (Google: `components=country:XX` + `region`; OSM: `countrycodes=xx`),
-  which removes wrong-continent matches for bare street names.
+  country (`countrycodes=xx`), which removes wrong-continent matches for bare
+  street names.
 - See `ACCURACY_BY_PRECISION` and `LOW_CONFIDENCE_PRECISIONS` in
   `skynamo_geo/config.py`. (Standing rule: always send an `accuracy` value;
   derive it from precision when available, otherwise default ≥1000.)
@@ -256,10 +242,9 @@ instance. Use the GUI's preview step to eyeball coordinates before writing.
 
 ## 10. Extending it (where to plug in)
 
-- **Another geocoder** (e.g. Mapbox): subclass `Geocoder` in `geocoder.py`,
-  register it in `create_geocoder` + `GEOCODER_PROVIDERS` (config.py), and the
-  GUI/CLI pickers offer it automatically — no engine changes.
-  `GoogleGeocoder` and `NominatimGeocoder` (OpenStreetMap) exist today.
+- **Another geocoder** (e.g. Mapbox): subclass `Geocoder` in `geocoder.py` and
+  construct it in the GUI/CLI connect flow in place of `NominatimGeocoder()` —
+  no engine changes needed.
 - **Map preview** of pins before committing: a widget (e.g. `tkintermapview`) or
   Qt/web view consuming the existing `Plan` list.
 - **Batch PATCH**: the Skynamo endpoint already accepts an array; optimise inside
@@ -271,6 +256,13 @@ instance. Use the GUI's preview step to eyeball coordinates before writing.
 
 ## 11. Change log
 
+- **v2.3.0** (2026-07-23) — **Removed Google Maps.** Geocoding is now
+  OpenStreetMap (Nominatim)-only — no per-lookup cost, no API key. Removed
+  `GoogleGeocoder`, the provider picker (GUI segmented button, CLI prompt),
+  the Google API key field, `GEOCODER_PROVIDERS`/`DEFAULT_PROVIDER`/
+  `create_geocoder`, and the Google-derived location-type accuracy tiers
+  (`ROOFTOP`/`RANGE_INTERPOLATED`/`GEOMETRIC_CENTER`/`APPROXIMATE`). The GUI
+  and CLI now construct `NominatimGeocoder()` directly.
 - **v2.2.0** (2026-07-09) — **Accuracy overhaul.** Address fields are now mapped
   to **roles** (street/city/state/postcode/country/other) in the GUI (a dropdown
   per field) and CLI. Nominatim uses those roles for a **structured search** with

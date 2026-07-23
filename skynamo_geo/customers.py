@@ -2,8 +2,8 @@
 
 Address fields are mapped to *roles* (street/city/state/postcode/country, or
 "other"). `build_query` turns a customer plus that mapping into an
-`AddressQuery` carrying both a clean single-line `text` (for Google and for
-display/reports) and a `structured` dict (for a more accurate Nominatim
+`AddressQuery` carrying both a clean single-line `text` (a fallback query and
+for display/reports) and a `structured` dict (for a more accurate Nominatim
 structured search).
 """
 
@@ -54,7 +54,7 @@ def clean_value(value):
 class AddressQuery:
     """A geocodable address in two forms.
 
-    text       - clean single-line string (Google + display/report)
+    text       - clean single-line string (fallback query + display/report)
     structured - {role: value} for Nominatim structured search; may be empty
                  when the mapping has no recognised structured roles.
     """
