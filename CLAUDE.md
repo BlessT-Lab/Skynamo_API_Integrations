@@ -96,10 +96,16 @@ follow this pattern — never update a widget from a worker thread.
   then the stem with a trailing sequence marker stripped. Two codes escaping to the same form → the
   match is flagged **ambiguous**, not guessed.
 - **Skynamo has no product-image endpoint.** Upload is generic: `POST /files` (base64 `content`) →
-  file GUID → `PATCH /products` with `{code, files:[...]}`. The `files` array is sent as the **union**
-  of the product's existing GUIDs plus the new ones, because replace-vs-append semantics are
-  undocumented and we must not clobber images already attached. Format is gated on extension **and**
-  magic bytes (`sniff_image_format`); PNG/JPEG only.
+  file GUID → `PATCH /products` with `{code, files:[...]}`. In merge mode the `files` array is sent
+  as the **union** of the product's existing GUIDs plus the new ones (don't clobber attached images);
+  in **replace mode** (`upload_images(replace_existing=True)`) it's set to only this run's GUIDs.
+  Format is gated on extension **and** magic bytes (`sniff_image_format`); PNG/JPEG only.
+- **There is no delete endpoint anywhere in Skynamo's API** — no `DELETE /files/{guid}`, no
+  `DELETE /products/{id}`. "Removing" an image (`image_engine.delete_selected_images`) means
+  re-`PATCH /products` with the product's `files` list minus the removed GUIDs — it detaches the
+  file from the product; the underlying file object may still exist server-side. `GET /files/{guid}`
+  (`client.get_file`) resolves a GUID to a filename for display, since a product's `files` array is
+  only ever bare GUID strings.
 
 ## Working agreements
 

@@ -154,6 +154,30 @@ class SkynamoClient:
             return None, "No file GUID returned by /files"
         return data[0]["id"], ""
 
+    def get_file(self, guid):
+        """GET a single file's metadata by GUID. Returns (file_dict, error).
+
+        Used to resolve an attached image's filename for display; the API has
+        no way to expand a product's `files` array into full objects, so each
+        GUID must be fetched individually. On failure file_dict is None.
+        """
+        try:
+            resp = self.session.get(
+                f"{API_BASE}/files/{guid}",
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            return None, f"Connection error: {exc}"
+        if not resp.ok:
+            return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        try:
+            data = resp.json().get("data") or []
+        except ValueError:
+            return None, "Malformed response from /files/{guid}"
+        if not data:
+            return None, "File not found"
+        return data[0], ""
+
     def attach_files(self, product_code, file_guids):
         """PATCH a product's `files` list by code. Returns (ok, error_message).
 

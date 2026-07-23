@@ -5,7 +5,13 @@ Two phases, mirroring engine.py so any front-end can preview-then-commit:
   2. upload_images(...) -> POSTs each approved image to /files and attaches the
                            returned GUID to its product via PATCH /products
 
-Both report progress via on_progress(event) and can be aborted via
+The same shape backs managing images already on a product:
+  1. list_attached_images(...)   -> resolves a product's file GUIDs to names, no writes
+  2. delete_selected_images(...) -> re-PATCHes the product's files list without the
+                                    removed GUIDs (Skynamo has no delete endpoint, so
+                                    "remove" means detach from the product)
+
+Everything reports progress via on_progress(event) and can be aborted via
 should_cancel(), the same contracts the GUI worker thread already drives.
 """
 
@@ -14,7 +20,9 @@ import csv
 import os
 
 from .config import (
-    IMAGE_REPORT_FIELDNAMES, STATUS_IMG_AMBIGUOUS, STATUS_IMG_BAD_FORMAT,
+    ATTACHED_IMAGE_REPORT_FIELDNAMES, IMAGE_REPORT_FIELDNAMES,
+    STATUS_ATT_DELETE_FAILED, STATUS_ATT_DELETED, STATUS_ATT_FETCH_FAILED,
+    STATUS_ATT_LOADED, STATUS_IMG_AMBIGUOUS, STATUS_IMG_BAD_FORMAT,
     STATUS_IMG_NO_MATCH, STATUS_IMG_PENDING, STATUS_IMG_UPLOAD_FAILED,
     STATUS_IMG_UPLOADED,
 )
@@ -159,13 +167,16 @@ def _flag_duplicate_sequences(plans):
                     plan.notes += "; duplicate image order for this product"
 
 
-def upload_images(client, plans, on_progress=_noop, should_cancel=_never_cancel):
+def upload_images(client, plans, replace_existing=False,
+                  on_progress=_noop, should_cancel=_never_cancel):
     """Upload approved images and attach them to their products.
 
-    Images are grouped by product and uploaded in sequence order. All of a
+    Images are grouped by product and uploaded in sequence order. By default a
     product's newly uploaded GUIDs are merged with its existing `files` in one
-    PATCH, so nothing already attached is lost. Returns report rows for every
-    plan (skips and failures included).
+    PATCH, so nothing already attached is lost. When replace_existing is True,
+    the product's files list is set to ONLY this run's uploads - any images it
+    already had are dropped (detached). Returns report rows for every plan
+    (skips and failures included).
     """
     to_upload = [p for p in plans if p.include and p.writable]
 
@@ -206,11 +217,21 @@ def upload_images(client, plans, on_progress=_noop, should_cancel=_never_cancel)
 
         if not uploaded:
             continue
-        desired = _dedupe(existing + [p.file_guid for p in uploaded])
+        new_guids = [p.file_guid for p in uploaded]
+        if replace_existing:
+            desired = _dedupe(new_guids)
+            dropped = [g for g in existing if g not in desired]
+        else:
+            desired = _dedupe(existing + new_guids)
+            dropped = []
         ok, error = client.attach_files(product_code(product), desired)
         for plan in uploaded:
             if ok:
                 plan.status = STATUS_IMG_UPLOADED
+                if dropped:
+                    plan.notes = _append_note(
+                        plan.notes,
+                        f"replaced {len(dropped)} existing image(s)")
             else:
                 plan.status = STATUS_IMG_UPLOAD_FAILED
                 plan.notes = _append_note(plan.notes,
@@ -241,10 +262,99 @@ def summarize(plans):
     return counts
 
 
-def write_report(report_rows, path):
-    """Write the product-image report rows to a CSV at path."""
+def write_report(report_rows, path, fieldnames=IMAGE_REPORT_FIELDNAMES):
+    """Write report rows to a CSV at path (defaults to the upload columns)."""
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=IMAGE_REPORT_FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(report_rows)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Managing images already attached to a product
+# ---------------------------------------------------------------------------
+
+class AttachedImage:
+    """One file currently attached to a product, and whether to remove it."""
+
+    def __init__(self, product, guid):
+        self.product = product
+        self.guid = guid
+        self.filename = ""          # resolved from GET /files/{guid}
+        self.status = ""            # a STATUS_ATT_* value
+        self.notes = ""
+        self.delete = False         # ticked = detach from the product
+
+    @property
+    def product_code(self):
+        return product_code(self.product)
+
+    @property
+    def product_name(self):
+        return (self.product or {}).get("name", "")
+
+    def to_report_row(self):
+        return {
+            "product_code": self.product_code,
+            "matched_product": self.product_name,
+            "filename": self.filename,
+            "file_guid": self.guid,
+            "status": self.status,
+            "notes": self.notes,
+        }
+
+
+def list_attached_images(client, product, on_progress=_noop,
+                         should_cancel=_never_cancel):
+    """Resolve a product's attached file GUIDs to names. Performs NO writes."""
+    guids = _dedupe(list(product.get("files") or []))
+    total = len(guids)
+    images = []
+    for i, guid in enumerate(guids, 1):
+        if should_cancel():
+            break
+        img = AttachedImage(product, guid)
+        file_obj, error = client.get_file(guid)
+        if file_obj is None:
+            img.status = STATUS_ATT_FETCH_FAILED
+            img.filename = "(unknown)"
+            img.notes = error
+        else:
+            img.filename = file_obj.get("filename") or "(unnamed)"
+            img.status = STATUS_ATT_LOADED
+        images.append(img)
+        on_progress({
+            "phase": "list", "index": i, "total": total,
+            "name": img.filename, "status": img.status, "message": img.notes,
+        })
+    return images
+
+
+def delete_selected_images(client, product, images, on_progress=_noop,
+                           should_cancel=_never_cancel):
+    """Detach the images marked for deletion from the product (one PATCH).
+
+    Skynamo has no delete endpoint, so removal means re-setting the product's
+    files list to only the GUIDs the user kept. Returns report rows for every
+    image (kept ones included). If nothing is marked, no request is made.
+    """
+    to_delete = [img for img in images if img.delete]
+    if not to_delete or should_cancel():
+        return [img.to_report_row() for img in images]
+
+    keep = _dedupe([img.guid for img in images if not img.delete])
+    ok, error = client.attach_files(product_code(product), keep)
+    total = len(to_delete)
+    for i, img in enumerate(to_delete, 1):
+        if ok:
+            img.status = STATUS_ATT_DELETED
+            img.notes = _append_note(img.notes, "detached from product")
+        else:
+            img.status = STATUS_ATT_DELETE_FAILED
+            img.notes = _append_note(img.notes, error)
+        on_progress({
+            "phase": "delete", "index": i, "total": total,
+            "name": img.filename, "status": img.status, "message": img.notes,
+        })
+    return [img.to_report_row() for img in images]

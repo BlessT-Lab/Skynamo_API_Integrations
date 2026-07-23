@@ -7,7 +7,8 @@ is committed:
 1. **Customer geolocation** — fills in customer **latitude/longitude** by geocoding
    their address fields via **OpenStreetMap (Nominatim)** (free, no API key).
 2. **Product image import** — matches local image files to products by the **product
-   code** in the filename and uploads them (a tab in the GUI).
+   code** in the filename and uploads them, with an optional *replace existing* mode
+   and a separate tab for **viewing and removing** images already on a product.
 
 The desktop GUI has a tab per feature; the CLI covers geolocation.
 
@@ -40,12 +41,12 @@ GeoLocation_Script/
   skynamo_geo/              # UI-agnostic core (reusable by any front-end)
     __init__.py
     config.py               # constants: URLs, page size, accuracy map, statuses, image rules
-    client.py               # SkynamoClient: connect, fetch customers/products, update_location, upload_file, attach_files
+    client.py               # SkynamoClient: connect, fetch customers/products, update_location, upload_file, get_file, attach_files
     geocoder.py             # Geocoder base + NominatimGeocoder, GeocodeResult/Error
     customers.py            # address helpers (build_query/clean_value/collect/has_coordinates)
     products.py             # image helpers (filename parsing, code escaping, matching, format sniff)
     engine.py               # geocode_customers + write_locations + report (geolocation core)
-    image_engine.py         # scan_images + upload_images + report (product-image core)
+    image_engine.py         # scan_images + upload_images + list_attached_images + delete_selected_images (product-image core)
     settings.py             # non-secret config JSON (no credentials stored)
   gui.py                    # CustomTkinter desktop app, a tab per feature (entry point for the .exe)
   skynamo_geolocation.py    # CLI front-end for geolocation (thin wrapper over the engine)
@@ -77,10 +78,12 @@ py gui.py
 The window has a tab per feature. **Customer Geolocation**: **Connect & Load
 Customers** → tick address field(s) → **Preview (geocode only)** → review/untick
 rows → **Write Selected to Skynamo** → **Save Report CSV**. **Product Images**:
-**Connect & Load Products** → **Choose folder…** → **Preview (match only)** →
-review/untick rows → **Upload Selected to Skynamo** → **Save Report CSV**. Each
-tab has a **Cancel** button; work happens on a background thread so the window
-never freezes.
+**Connect & Load Products** → **Choose folder…** (optionally tick *Replace
+existing images*) → **Preview (match only)** → review/untick rows → **Upload
+Selected to Skynamo** → **Save Report CSV**. **Manage Images** (reuses the
+Product Images connection): type a product code → **Load Images** → tick images →
+**Remove Selected from Product** → **Save Report CSV**. Each tab has a **Cancel**
+button; work happens on a background thread so the window never freezes.
 
 The GUI uses a dark theme built on a `#1a1a1a` (rgb 26,26,26) background with
 card-style panels; the palette constants live at the top of `gui.py`.
@@ -149,8 +152,14 @@ earlier version saved to the Windows Credential Manager are purged on startup.
   The response's `data[].id` is the created file's **GUID**.
 - **Attach a file to a product:** `PATCH /products` (collection endpoint, array
   body) with `[{ "code": "ABC", "files": ["<guid>", …] }]` — matched by `code`.
-  Send the full desired `files` list (existing + new) since replace/append
-  semantics are unspecified.
+  Send the full desired `files` list; this same call is used to attach (merge),
+  replace, and detach — it just sets the product's `files` to exactly what you send.
+- **Read a file:** `GET /files/{guid}` returns the file's metadata (incl.
+  `filename`) — used to show attached images by name.
+- **No delete endpoint exists.** There is no `DELETE /files/{guid}` and no
+  `DELETE /products/{id}`. Removing an image from a product means PATCHing the
+  product's `files` list without that GUID (detach); the file object itself is
+  not deletable via the public API.
 
 The full spec is saved in `skynamo_swagger.json` for reference.
 
@@ -237,17 +246,36 @@ is flagged **ambiguous** and skipped rather than guessed.
 ### Upload
 Skynamo has no dedicated product-image endpoint, so upload is two steps:
 `POST /files` (the image, base64-encoded) returns a file **GUID**, then
-`PATCH /products` attaches it via `{ "code": "...", "files": [guid, …] }`. The
-tool sends the **union** of the product's existing files plus the new ones, so
-images already on the product are preserved. Images for one product upload in
-sequence order.
+`PATCH /products` attaches it via `{ "code": "...", "files": [guid, …] }`.
+Images for one product upload in sequence order. The preview table shows an
+**Existing** column (how many images the matched product already has).
+
+**Merge (default):** the tool sends the **union** of the product's existing
+files plus the new ones, so images already on the product are preserved.
+
+**Replace (tick "Replace existing images"):** the product's files list is set to
+*only* this run's uploaded images — anything it had before is dropped (detached).
+The report notes how many existing images were replaced.
+
+### Manage / remove existing images
+The **Manage Images** tab views and removes images already on a product. Enter a
+product code and **Load Images**; the tool resolves each attached file's GUID to
+its filename (`GET /files/{guid}`) and lists them. Tick the ones to remove and
+**Remove Selected from Product**.
+
+> **"Remove" means detach, not delete.** Skynamo's public API has *no* delete
+> endpoint (no `DELETE /files/{guid}`, no `DELETE /products/{id}`). Removal
+> re-`PATCH`es the product's `files` list without the ticked GUIDs, so the image
+> no longer shows against the product — but the underlying file may still exist
+> on Skynamo's servers.
 
 ### Log & report
-Every file's outcome shows in the on-screen table and log, and **Save Report CSV**
-writes a report (`filename, product_code, matched_product, sequence, status,
-notes`) — including the reason any image was skipped or failed. Statuses:
-`pending-upload`, `uploaded`, `no-matching-product`, `unsupported-format`,
-`ambiguous-match`, `upload-failed`.
+Every outcome shows in the on-screen table and log, and **Save Report CSV**
+writes a report — for uploads: `filename, product_code, matched_product,
+sequence, status, notes` (statuses `pending-upload`, `uploaded`,
+`no-matching-product`, `unsupported-format`, `ambiguous-match`, `upload-failed`);
+for removals: `product_code, matched_product, filename, file_guid, status, notes`
+(statuses `attached`, `fetch-failed`, `removed`, `remove-failed`).
 
 ---
 
@@ -294,7 +322,7 @@ during preview, before committing).
 py test_engine.py        # geolocation engine: plan statuses, no-write-in-preview, accuracy
 py test_geocoder.py      # OSM precision mapping + query building
 py test_products.py      # image filename parsing/escaping/matching/format sniff
-py test_image_engine.py  # image engine: match statuses, no-upload-in-preview, file-union, order
+py test_image_engine.py  # image engine: match/upload, replace mode, list/remove attached images
 py test_gui_smoke.py     # GUI (both tabs) builds and tears down cleanly
 ```
 The engine tests use a fake client (and fake geocoder) — no network, no real API
@@ -327,6 +355,16 @@ instance. Use each tab's preview step to eyeball results before committing.
 
 ## 11. Change log
 
+- **v2.5.0** (2026-07-23) — **Replace + manage product images.** The Product
+  Images tab gains a **Replace existing images** option (upload sets the
+  product's files to only this run's images instead of merging) and an
+  **Existing** count column in the preview. New **Manage Images** tab: look up a
+  product by code, list its attached images by filename (`GET /files/{guid}`),
+  and remove (detach) selected ones. Skynamo has no delete endpoint, so removal
+  re-PATCHes the product's `files` list without the removed GUIDs — the file may
+  persist server-side. New: `client.get_file`; `image_engine` gains
+  `replace_existing`, `AttachedImage`, `list_attached_images`,
+  `delete_selected_images`; extended offline tests.
 - **v2.4.0** (2026-07-23) — **Product image import.** New **Product Images** tab
   (the GUI is now a tab per feature): match a folder of images to products by the
   code in each filename and upload them. Naming supports multi-image sequences

@@ -6,7 +6,7 @@ REQUEST_TIMEOUT = 30
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Nominatim usage policy: identify your app and stay at/below 1 request/second.
-NOMINATIM_USER_AGENT = "SkynamoGeo/2.4 (Skynamo customer geolocation updater)"
+NOMINATIM_USER_AGENT = "SkynamoGeo/2.5 (Skynamo customer geolocation updater)"
 NOMINATIM_MIN_INTERVAL = 1.0
 # Ask Nominatim for several candidates so we can pick the most precise one
 # instead of blindly trusting the first result.
@@ -97,7 +97,19 @@ STATUS_IMG_BAD_FORMAT = "unsupported-format"
 STATUS_IMG_AMBIGUOUS = "ambiguous-match"
 STATUS_IMG_UPLOAD_FAILED = "upload-failed"
 
+# Attached-image (manage/remove) statuses. Skynamo has no delete endpoint, so
+# "removing" an image means detaching its GUID from the product's files list.
+STATUS_ATT_LOADED = "attached"               # currently on the product
+STATUS_ATT_FETCH_FAILED = "fetch-failed"     # couldn't resolve the file's name
+STATUS_ATT_DELETED = "removed"               # detached from the product
+STATUS_ATT_DELETE_FAILED = "remove-failed"
+
 # Product-image report CSV column order
 IMAGE_REPORT_FIELDNAMES = [
     "filename", "product_code", "matched_product", "sequence", "status", "notes",
+]
+
+# Attached-image (manage/remove) report CSV column order
+ATTACHED_IMAGE_REPORT_FIELDNAMES = [
+    "product_code", "matched_product", "filename", "file_guid", "status", "notes",
 ]

@@ -26,8 +26,11 @@ from skynamo_geo.config import (
     STATUS_PENDING, ADDRESS_ROLES, ADDRESS_ROLE_LABELS, DEFAULT_ROLE,
     STATUS_IMG_PENDING, STATUS_IMG_UPLOADED, STATUS_IMG_NO_MATCH,
     STATUS_IMG_BAD_FORMAT, STATUS_IMG_AMBIGUOUS, STATUS_IMG_UPLOAD_FAILED,
+    STATUS_ATT_LOADED, STATUS_ATT_FETCH_FAILED, STATUS_ATT_DELETED,
+    STATUS_ATT_DELETE_FAILED, ATTACHED_IMAGE_REPORT_FIELDNAMES,
 )
 from skynamo_geo.customers import build_query, collect_custom_field_names
+from skynamo_geo.products import product_code as product_code_of
 from skynamo_geo.geocoder import NominatimGeocoder, GeocodeError
 
 ctk.set_appearance_mode("dark")
@@ -88,6 +91,15 @@ class App(ctk.CTk):
         self.img_cancel_event = threading.Event()
         self.img_worker = None
 
+        # ----- Manage Images tab state -----
+        self.mgmt_product = None
+        self.attached_images = []
+        self.mgmt_report_rows = []
+        self.mgmt_tree_item_to_img = {}  # tree iid -> AttachedImage
+        self.mgmt_queue = queue.Queue()
+        self.mgmt_cancel_event = threading.Event()
+        self.mgmt_worker = None
+
         self._build_ui()
         self._load_saved_settings()
 
@@ -108,6 +120,7 @@ class App(ctk.CTk):
         self.tabview.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
         self._build_geo_tab(self.tabview.add("Customer Geolocation"))
         self._build_image_tab(self.tabview.add("Product Images"))
+        self._build_manage_tab(self.tabview.add("Manage Images"))
 
     def _build_geo_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -366,6 +379,7 @@ class App(ctk.CTk):
         if cfg.get("country"):
             self.country_entry.insert(0, cfg["country"])
         self.replace_var.set(bool(cfg.get("replace_existing", False)))
+        self.img_replace_var.set(bool(cfg.get("image_replace_existing", False)))
         self._saved_fields = cfg.get("address_fields", [])
         self._saved_roles = cfg.get("field_roles", {}) or {}
         # API keys are never remembered; purge any an older version stored.
@@ -376,13 +390,15 @@ class App(ctk.CTk):
             return
         instance = self.instance_entry.get().strip()
         field_roles = self._field_roles()
-        settings.save_config({
+        cfg = settings.load_config()  # merge, so image-tab keys aren't clobbered
+        cfg.update({
             "instance_name": instance,
             "country": self.country_entry.get().strip().upper(),
             "replace_existing": self.replace_var.get(),
             "address_fields": [name for name, _role in field_roles],
             "field_roles": {name: role for name, role in field_roles},
         })
+        settings.save_config(cfg)
         # API keys are deliberately not persisted.
 
     # -- Worker plumbing --------------------------------------------------
@@ -774,7 +790,16 @@ class App(ctk.CTk):
                           "a code becomes '-' in the filename.",
                      anchor="w", wraplength=440, justify="left",
                      text_color=TEXT_MUTED).grid(
-            row=3, column=0, padx=14, pady=(0, 14), sticky="ew")
+            row=3, column=0, padx=14, pady=(0, 6), sticky="ew")
+
+        self.img_replace_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            folder,
+            text="Replace existing images (removes anything already on the product)",
+            variable=self.img_replace_var, checkbox_width=20, checkbox_height=20,
+            corner_radius=5, border_color=BORDER, fg_color=ACCENT,
+            hover_color=ACCENT_HOVER, text_color=TEXT).grid(
+            row=4, column=0, padx=14, pady=(0, 14), sticky="w")
 
         # ----- Action bar -----
         actions = self._card(parent)
@@ -809,18 +834,20 @@ class App(ctk.CTk):
         table_frame.grid(row=3, column=0, padx=16, pady=6, sticky="nsew")
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
-        columns = ("include", "file", "code", "product", "seq", "status")
+        columns = ("include", "file", "code", "product", "seq", "existing",
+                   "status")
         self.img_tree = ttk.Treeview(table_frame, columns=columns,
                                      show="headings", style="Dark.Treeview",
                                      height=6)
         headings = {
-            "include": ("Use", 45), "file": ("File", 220),
-            "code": ("Product code", 130), "product": ("Matched product", 200),
-            "seq": ("Seq", 50), "status": ("Status", 160),
+            "include": ("Use", 45), "file": ("File", 200),
+            "code": ("Product code", 120), "product": ("Matched product", 180),
+            "seq": ("Seq", 50), "existing": ("Existing", 70),
+            "status": ("Status", 150),
         }
         for col, (text, width) in headings.items():
             self.img_tree.heading(col, text=text)
-            anchor = "center" if col in ("include", "seq") else "w"
+            anchor = "center" if col in ("include", "seq", "existing") else "w"
             self.img_tree.column(col, width=width, anchor=anchor)
         self.img_tree.tag_configure("low", background="#3a2f12",
                                     foreground="#f0c453")
@@ -868,6 +895,7 @@ class App(ctk.CTk):
             return
         cfg = settings.load_config()
         cfg["instance_name"] = self.img_instance_entry.get().strip()
+        cfg["image_replace_existing"] = self.img_replace_var.get()
         settings.save_config(cfg)  # merge; never persists API keys
 
     # -- Image worker plumbing --------------------------------------------
@@ -1019,12 +1047,17 @@ class App(ctk.CTk):
         if not to_upload:
             self.img_set_status("No images selected to upload.")
             return
-        self.img_log_line(f"Uploading {len(to_upload)} images to Skynamo...")
+        replace = self.img_replace_var.get()
+        self._persist_image_settings()
+        self.img_log_line(
+            f"Uploading {len(to_upload)} images to Skynamo"
+            f"{' (replacing existing)' if replace else ''}...")
 
         def work():
             try:
                 report_rows = image_engine.upload_images(
                     self.img_client, self.image_plans,
+                    replace_existing=replace,
                     on_progress=lambda ev: self.img_queue.put(("progress", ev)),
                     should_cancel=self.img_cancel_event.is_set)
 
@@ -1085,8 +1118,10 @@ class App(ctk.CTk):
         check = CHECK_ON if (plan.include and plan.writable) else CHECK_OFF
         if not plan.writable:
             check = ""
+        existing = (len(plan.product.get("files") or [])
+                    if plan.product else "")
         return (check, plan.filename, plan.product_code, plan.product_name,
-                plan.sequence or "", plan.status)
+                plan.sequence or "", existing, plan.status)
 
     def _img_populate_tree(self, plans):
         self._img_clear_tree()
@@ -1138,6 +1173,362 @@ class App(ctk.CTk):
             parts.append(f"upload-fail={counts.get(STATUS_IMG_UPLOAD_FAILED, 0)}")
         label = "Preview" if preview else "Done"
         return f"{label}:  " + "   ".join(parts)
+
+    # ====================================================================
+    # Manage Images tab (view / remove images already on a product)
+    # ====================================================================
+
+    def _build_manage_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        # ----- Header -----
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.grid(row=0, column=0, padx=16, pady=(14, 4), sticky="ew")
+        ctk.CTkLabel(header, text="Manage Product Images",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     text_color=TEXT).pack(side="left")
+        ctk.CTkLabel(header,
+                     text="view a product's images · remove (detach) them",
+                     font=ctk.CTkFont(size=12),
+                     text_color=TEXT_MUTED).pack(side="left", padx=(12, 0),
+                                                 pady=(4, 0))
+
+        # ----- Lookup + actions -----
+        top = self._card(parent)
+        top.grid(row=1, column=0, padx=16, pady=(6, 6), sticky="ew")
+        top.grid_columnconfigure(1, weight=1)
+        self._section_title(top, "1", "Find product").grid(
+            row=0, column=0, columnspan=3, padx=14, pady=(12, 6), sticky="w")
+        ctk.CTkLabel(top, text="Product code", anchor="w",
+                     text_color=TEXT).grid(row=1, column=0, padx=(14, 6),
+                                           pady=4, sticky="w")
+        self.mgmt_code_entry = self._entry(top)
+        self.mgmt_code_entry.grid(row=1, column=1, padx=(0, 6), pady=4,
+                                  sticky="ew")
+        self.mgmt_load_btn = self._button(top, "Load Images",
+                                          self.on_mgmt_load, width=140)
+        self.mgmt_load_btn.grid(row=1, column=2, padx=(0, 14), pady=4)
+        ctk.CTkLabel(
+            top,
+            text="Connect & load products on the Product Images tab first. "
+                 "Removing an image detaches it from this product (Skynamo has "
+                 "no delete); the file itself may remain on the server.",
+            anchor="w", wraplength=900, justify="left",
+            text_color=TEXT_MUTED).grid(row=2, column=0, columnspan=3,
+                                        padx=14, pady=(2, 6), sticky="ew")
+
+        actions = ctk.CTkFrame(top, fg_color="transparent")
+        actions.grid(row=3, column=0, columnspan=3, padx=10, pady=(0, 10),
+                     sticky="ew")
+        self.mgmt_delete_btn = self._button(
+            actions, "Remove Selected from Product", self.on_mgmt_delete,
+            state="disabled", fg_color=RED, hover_color=RED_HOVER)
+        self.mgmt_delete_btn.pack(side="left", padx=(4, 6), pady=4)
+        self.mgmt_cancel_btn = self._button(
+            actions, "Cancel", self.on_mgmt_cancel, state="disabled",
+            fg_color=FIELD, hover_color=BORDER, width=90)
+        self.mgmt_cancel_btn.pack(side="left", padx=6, pady=4)
+        self.mgmt_save_btn = self._button(
+            actions, "Save Report CSV", self.on_mgmt_save_report,
+            state="disabled", fg_color=FIELD, hover_color=BORDER)
+        self.mgmt_save_btn.pack(side="left", padx=6, pady=4)
+        self.mgmt_select_all_btn = self._button(
+            actions, "Select all", lambda: self._mgmt_set_all_deletes(True),
+            state="disabled", width=96, fg_color=FIELD, hover_color=BORDER)
+        self.mgmt_select_all_btn.pack(side="right", padx=(6, 4), pady=4)
+        self.mgmt_select_none_btn = self._button(
+            actions, "Select none", lambda: self._mgmt_set_all_deletes(False),
+            state="disabled", width=96, fg_color=FIELD, hover_color=BORDER)
+        self.mgmt_select_none_btn.pack(side="right", padx=6, pady=4)
+
+        # ----- Results table -----
+        table_frame = self._card(parent)
+        table_frame.grid(row=2, column=0, padx=16, pady=6, sticky="nsew")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        columns = ("remove", "filename", "guid", "status")
+        self.mgmt_tree = ttk.Treeview(table_frame, columns=columns,
+                                      show="headings", style="Dark.Treeview",
+                                      height=6)
+        headings = {
+            "remove": ("Remove", 70), "filename": ("Filename", 280),
+            "guid": ("File GUID", 320), "status": ("Status", 140),
+        }
+        for col, (text, width) in headings.items():
+            self.mgmt_tree.heading(col, text=text)
+            anchor = "center" if col == "remove" else "w"
+            self.mgmt_tree.column(col, width=width, anchor=anchor)
+        self.mgmt_tree.tag_configure("skip", foreground="#7a7a7a")
+        self.mgmt_tree.tag_configure("fail", background="#3a1717",
+                                     foreground="#f08c8c")
+        self.mgmt_tree.tag_configure("gone", foreground="#6fae8f")
+        self.mgmt_tree.grid(row=0, column=0, padx=(10, 0), pady=10,
+                            sticky="nsew")
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical",
+                                command=self.mgmt_tree.yview,
+                                style="Dark.Vertical.TScrollbar")
+        self.mgmt_tree.configure(yscrollcommand=yscroll.set)
+        yscroll.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="ns")
+        self.mgmt_tree.bind("<Button-1>", self._mgmt_on_tree_click)
+
+        # ----- Bottom: progress + status + log -----
+        bottom = self._card(parent)
+        bottom.grid(row=3, column=0, padx=16, pady=(6, 14), sticky="ew")
+        bottom.grid_columnconfigure(0, weight=1)
+        self.mgmt_progress = ctk.CTkProgressBar(
+            bottom, progress_color=ACCENT, fg_color=FIELD, height=8,
+            corner_radius=4)
+        self.mgmt_progress.set(0)
+        self.mgmt_progress.grid(row=0, column=0, padx=14, pady=(12, 4),
+                                sticky="ew")
+        self.mgmt_status_label = ctk.CTkLabel(bottom, text="Ready.", anchor="w",
+                                              text_color=TEXT)
+        self.mgmt_status_label.grid(row=1, column=0, padx=14, pady=2,
+                                    sticky="ew")
+        self.mgmt_log = ctk.CTkTextbox(
+            bottom, height=90, fg_color="#151515", text_color="#b8b8b8",
+            corner_radius=10, border_width=1, border_color=BORDER,
+            font=ctk.CTkFont(family="Consolas", size=12))
+        self.mgmt_log.grid(row=2, column=0, padx=14, pady=(4, 14), sticky="ew")
+
+    # -- Manage logging / status ------------------------------------------
+
+    def mgmt_log_line(self, text):
+        self.mgmt_log.insert("end", text + "\n")
+        self.mgmt_log.see("end")
+
+    def mgmt_set_status(self, text):
+        self.mgmt_status_label.configure(text=text)
+
+    # -- Manage worker plumbing -------------------------------------------
+
+    def _mgmt_start_worker(self, target):
+        self.mgmt_cancel_event.clear()
+        self._mgmt_set_busy(True)
+        self.mgmt_worker = threading.Thread(target=target, daemon=True)
+        self.mgmt_worker.start()
+        self.after(100, self._mgmt_poll_queue)
+
+    def _mgmt_poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.mgmt_queue.get_nowait()
+                if kind == "progress":
+                    self._mgmt_on_progress(payload)
+                elif kind == "log":
+                    self.mgmt_log_line(payload)
+                elif kind == "status":
+                    self.mgmt_set_status(payload)
+                elif kind == "done":
+                    payload()
+                    self._mgmt_set_busy(False)
+                    return
+                elif kind == "error":
+                    self.mgmt_log_line(f"ERROR: {payload}")
+                    self.mgmt_set_status("Error - see log.")
+                    self._mgmt_set_busy(False)
+                    return
+        except queue.Empty:
+            pass
+        self.after(100, self._mgmt_poll_queue)
+
+    def _mgmt_on_progress(self, ev):
+        if ev["total"]:
+            self.mgmt_progress.set(ev["index"] / ev["total"])
+        self.mgmt_set_status(f"{ev['phase'].title()} {ev['index']}/{ev['total']}:"
+                             f" {ev['name']}")
+
+    def _mgmt_set_busy(self, busy):
+        self.mgmt_cancel_btn.configure(state="normal" if busy else "disabled")
+        for btn in (self.mgmt_load_btn, self.mgmt_delete_btn,
+                    self.mgmt_save_btn, self.mgmt_select_all_btn,
+                    self.mgmt_select_none_btn):
+            btn.configure(state="disabled" if busy else btn.cget("state"))
+        if not busy:
+            self.mgmt_load_btn.configure(state="normal")
+            if any(img.status == STATUS_ATT_LOADED
+                   for img in self.attached_images):
+                self.mgmt_delete_btn.configure(state="normal")
+                self.mgmt_select_all_btn.configure(state="normal")
+                self.mgmt_select_none_btn.configure(state="normal")
+            if self.mgmt_report_rows:
+                self.mgmt_save_btn.configure(state="normal")
+
+    # -- Step 1: load a product's attached images -------------------------
+
+    def on_mgmt_load(self):
+        if self.img_client is None or not self.products:
+            self.mgmt_set_status(
+                "Connect & load products on the Product Images tab first.")
+            return
+        code = self.mgmt_code_entry.get().strip()
+        if not code:
+            self.mgmt_set_status("Enter a product code.")
+            return
+        product = next((p for p in self.products
+                        if product_code_of(p).casefold() == code.casefold()),
+                       None)
+        if product is None:
+            self.mgmt_set_status(f"No product with code '{code}'.")
+            return
+        self.mgmt_product = product
+        self.attached_images = []
+        self.mgmt_report_rows = []
+        self.mgmt_save_btn.configure(state="disabled")
+        self._mgmt_clear_tree()
+        files = product.get("files") or []
+        self.mgmt_log_line(
+            f"Loading {len(files)} image(s) for product "
+            f"'{product_code_of(product)}'...")
+        if not files:
+            self.mgmt_set_status("This product has no attached images.")
+            return
+
+        def work():
+            try:
+                images = image_engine.list_attached_images(
+                    self.img_client, product,
+                    on_progress=lambda ev: self.mgmt_queue.put(("progress", ev)),
+                    should_cancel=self.mgmt_cancel_event.is_set)
+
+                def finish():
+                    self.attached_images = images
+                    self._mgmt_populate_tree(images)
+                    loaded = sum(1 for i in images
+                                 if i.status == STATUS_ATT_LOADED)
+                    failed = sum(1 for i in images
+                                 if i.status == STATUS_ATT_FETCH_FAILED)
+                    self.mgmt_set_status(
+                        f"Loaded {loaded} image(s)"
+                        f"{f', {failed} name(s) unresolved' if failed else ''}. "
+                        f"Tick images to remove, then 'Remove Selected'.")
+                self.mgmt_queue.put(("done", finish))
+            except Exception as exc:
+                self.mgmt_queue.put(("error", str(exc)))
+
+        self._mgmt_start_worker(work)
+
+    # -- Step 2: remove selected images -----------------------------------
+
+    def on_mgmt_delete(self):
+        to_delete = [i for i in self.attached_images if i.delete]
+        if not to_delete:
+            self.mgmt_set_status("No images ticked for removal.")
+            return
+        product = self.mgmt_product
+        self.mgmt_log_line(
+            f"Removing {len(to_delete)} image(s) from "
+            f"'{product_code_of(product)}'...")
+
+        def work():
+            try:
+                report_rows = image_engine.delete_selected_images(
+                    self.img_client, product, self.attached_images,
+                    on_progress=lambda ev: self.mgmt_queue.put(("progress", ev)),
+                    should_cancel=self.mgmt_cancel_event.is_set)
+                # Keep the in-memory product's files in sync with what remains,
+                # so the Product Images tab's "Existing" count stays accurate.
+                remaining = [i.guid for i in self.attached_images
+                             if i.status != STATUS_ATT_DELETED]
+                product["files"] = remaining
+
+                def finish():
+                    self.mgmt_report_rows = report_rows
+                    self._mgmt_refresh_tree_statuses()
+                    removed = sum(1 for i in self.attached_images
+                                  if i.status == STATUS_ATT_DELETED)
+                    self.mgmt_set_status(
+                        f"Removed {removed} image(s). Save the report if needed.")
+                    self.mgmt_log_line("Done.")
+                    self.mgmt_save_btn.configure(state="normal")
+                self.mgmt_queue.put(("done", finish))
+            except Exception as exc:
+                self.mgmt_queue.put(("error", str(exc)))
+
+        self._mgmt_start_worker(work)
+
+    def on_mgmt_cancel(self):
+        self.mgmt_cancel_event.set()
+        self.mgmt_set_status("Cancelling...")
+        self.mgmt_log_line("Cancel requested - stopping after current item.")
+
+    def on_mgmt_save_report(self):
+        rows = (self.mgmt_report_rows
+                or [i.to_report_row() for i in self.attached_images])
+        if not rows:
+            self.mgmt_set_status("Nothing to save yet.")
+            return
+        default = (f"product_images_removed_"
+                   f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", initialfile=default,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        image_engine.write_report(
+            rows, path, fieldnames=ATTACHED_IMAGE_REPORT_FIELDNAMES)
+        self.mgmt_log_line(f"Report saved to: {path}")
+        self.mgmt_set_status(f"Report saved to {path}")
+
+    # -- Manage tree helpers ----------------------------------------------
+
+    def _mgmt_clear_tree(self):
+        self.mgmt_tree.delete(*self.mgmt_tree.get_children())
+        self.mgmt_tree_item_to_img = {}
+
+    def _mgmt_row_tag(self, img):
+        if img.status == STATUS_ATT_FETCH_FAILED:
+            return "skip"
+        if img.status == STATUS_ATT_DELETE_FAILED:
+            return "fail"
+        if img.status == STATUS_ATT_DELETED:
+            return "gone"
+        return ""
+
+    def _mgmt_deletable(self, img):
+        return img.status in (STATUS_ATT_LOADED, STATUS_ATT_DELETE_FAILED)
+
+    def _mgmt_img_values(self, img):
+        check = CHECK_ON if img.delete else CHECK_OFF
+        if not self._mgmt_deletable(img):
+            check = ""
+        return (check, img.filename, img.guid, img.status)
+
+    def _mgmt_populate_tree(self, images):
+        self._mgmt_clear_tree()
+        for img in images:
+            tag = self._mgmt_row_tag(img)
+            iid = self.mgmt_tree.insert("", "end",
+                                        values=self._mgmt_img_values(img),
+                                        tags=(tag,) if tag else ())
+            self.mgmt_tree_item_to_img[iid] = img
+
+    def _mgmt_refresh_tree_statuses(self):
+        for iid, img in self.mgmt_tree_item_to_img.items():
+            tag = self._mgmt_row_tag(img)
+            self.mgmt_tree.item(iid, values=self._mgmt_img_values(img),
+                                tags=(tag,) if tag else ())
+
+    def _mgmt_on_tree_click(self, event):
+        if self.mgmt_tree.identify("region", event.x, event.y) != "cell":
+            return
+        if self.mgmt_tree.identify_column(event.x) != "#1":  # Remove column
+            return
+        iid = self.mgmt_tree.identify_row(event.y)
+        img = self.mgmt_tree_item_to_img.get(iid)
+        if not img or not self._mgmt_deletable(img):
+            return
+        img.delete = not img.delete
+        self.mgmt_tree.set(iid, "remove",
+                           CHECK_ON if img.delete else CHECK_OFF)
+
+    def _mgmt_set_all_deletes(self, value):
+        for iid, img in self.mgmt_tree_item_to_img.items():
+            if self._mgmt_deletable(img):
+                img.delete = value
+                self.mgmt_tree.set(iid, "remove",
+                                   CHECK_ON if value else CHECK_OFF)
 
 
 def main():
