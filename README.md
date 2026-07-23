@@ -1,11 +1,15 @@
-# Skynamo Customer Geolocation Updater
+# Skynamo Toolkit
 
-A desktop + CLI tool that fills in customer **latitude/longitude** on a Skynamo
-instance by geocoding their address fields. It connects to the Skynamo public
-API, reads customers, builds an address string from user-mapped custom fields,
-geocodes each via **OpenStreetMap (Nominatim)** — free, no API key — and writes
-the coordinates back — with a preview step so you approve results before
-anything is committed.
+A desktop + CLI tool for bulk operations against a Skynamo instance's public API.
+Two features, each with a **preview step** so you approve results before anything
+is committed:
+
+1. **Customer geolocation** — fills in customer **latitude/longitude** by geocoding
+   their address fields via **OpenStreetMap (Nominatim)** (free, no API key).
+2. **Product image import** — matches local image files to products by the **product
+   code** in the filename and uploads them (a tab in the GUI).
+
+The desktop GUI has a tab per feature; the CLI covers geolocation.
 
 ---
 
@@ -35,20 +39,24 @@ anything is committed.
 GeoLocation_Script/
   skynamo_geo/              # UI-agnostic core (reusable by any front-end)
     __init__.py
-    config.py               # constants: URLs, page size, accuracy map, statuses
-    client.py               # SkynamoClient: connect, fetch, update_location
+    config.py               # constants: URLs, page size, accuracy map, statuses, image rules
+    client.py               # SkynamoClient: connect, fetch customers/products, update_location, upload_file, attach_files
     geocoder.py             # Geocoder base + NominatimGeocoder, GeocodeResult/Error
     customers.py            # address helpers (build_query/clean_value/collect/has_coordinates)
-    engine.py               # geocode_customers + write_locations + report (the core)
+    products.py             # image helpers (filename parsing, code escaping, matching, format sniff)
+    engine.py               # geocode_customers + write_locations + report (geolocation core)
+    image_engine.py         # scan_images + upload_images + report (product-image core)
     settings.py             # non-secret config JSON (no credentials stored)
-  gui.py                    # CustomTkinter desktop app  (entry point for the .exe)
-  skynamo_geolocation.py    # CLI front-end (thin wrapper over the engine)
+  gui.py                    # CustomTkinter desktop app, a tab per feature (entry point for the .exe)
+  skynamo_geolocation.py    # CLI front-end for geolocation (thin wrapper over the engine)
   build.bat                 # PyInstaller -> dist/SkynamoGeo.exe
   requirements.txt          # runtime deps
   requirements-build.txt    # build-only deps (pyinstaller)
-  test_engine.py            # engine smoke tests (mocked client + geocoder)
-  test_geocoder.py          # provider factory + OSM precision mapping (offline)
-  test_gui_smoke.py         # builds the GUI widget tree without interaction
+  test_engine.py            # geolocation engine smoke tests (mocked client + geocoder)
+  test_geocoder.py          # OSM precision mapping + query building (offline)
+  test_products.py          # image filename parsing/escaping/matching (offline)
+  test_image_engine.py      # image engine preview/commit (mocked client, offline)
+  test_gui_smoke.py         # builds the GUI (both tabs) without interaction
   skynamo_swagger.json      # downloaded Skynamo API spec (reference only)
   README.md                 # this file
 ```
@@ -66,10 +74,13 @@ identical and new front-ends (or a future web/scheduled runner) can reuse it.
 py -m pip install -r requirements.txt
 py gui.py
 ```
-Flow in the window: **Connect & Load Customers** → tick address field(s) →
-**Preview (geocode only)** → review/untick rows → **Write Selected to Skynamo**
-→ **Save Report CSV**. A **Cancel** button stops a run; the work happens on a
-background thread so the window never freezes.
+The window has a tab per feature. **Customer Geolocation**: **Connect & Load
+Customers** → tick address field(s) → **Preview (geocode only)** → review/untick
+rows → **Write Selected to Skynamo** → **Save Report CSV**. **Product Images**:
+**Connect & Load Products** → **Choose folder…** → **Preview (match only)** →
+review/untick rows → **Upload Selected to Skynamo** → **Save Report CSV**. Each
+tab has a **Cancel** button; work happens on a background thread so the window
+never freezes.
 
 The GUI uses a dark theme built on a `#1a1a1a` (rgb 26,26,26) background with
 card-style panels; the palette constants live at the top of `gui.py`.
@@ -131,6 +142,15 @@ earlier version saved to the Windows Credential Manager are purged on startup.
 - Address data lives in each customer's `custom_fields` array
   (`[{id, name, value}]`), never as top-level fields. Field names vary per
   instance, which is why mapping is interactive.
+- **List products:** `GET /products?page_number=N&page_size=200` (same envelope
+  and paging as customers). Each product has `id`, `code` (unique), `name`,
+  `active`, and `files` (an array of file GUIDs).
+- **Upload a file:** `POST /files` with `{ "filename": "...", "content": "<base64>" }`.
+  The response's `data[].id` is the created file's **GUID**.
+- **Attach a file to a product:** `PATCH /products` (collection endpoint, array
+  body) with `[{ "code": "ABC", "files": ["<guid>", …] }]` — matched by `code`.
+  Send the full desired `files` list (existing + new) since replace/append
+  semantics are unspecified.
 
 The full spec is saved in `skynamo_swagger.json` for reference.
 
@@ -189,6 +209,48 @@ and treat coarse ones as approximate:
 
 ---
 
+## 6a. Product image import
+
+Point the **Product Images** tab at a folder of images. Each image is matched to
+a Skynamo product by the **product code** in its filename, then uploaded and
+attached to that product.
+
+### Naming rules
+- Name each file after the product code: `ABC.png` → product `ABC`.
+- **Multiple images per product** use a trailing sequence, separated by `_` or a
+  space, using digits *or* a letter for order:
+  `ABC_1`, `ABC_2` / `ABC 1`, `ABC 2` / `ABC_A`, `ABC A`.
+- If a product code contains a character that can't appear in a filename
+  (`/ \ : * ? " < > |`), write it as a **hyphen** (`-`): code `AB/C` → file `AB-C.png`.
+- Only **PNG** and **JPG/JPEG** are supported (checked by extension *and* by the
+  file's actual content, so a mis-named file is caught).
+
+### How matching works
+Filenames are ambiguous (is `-` a real hyphen or an escaped `/`? is `ABC_1` the
+code `ABC` plus sequence 1, or a literal code `ABC_1`?), so the tool doesn't try
+to reverse a filename into a code. Instead it applies the **same** hyphen-escaping
+to every real product code and matches the filename against that set — trying the
+whole filename as a literal code first, then the code with a trailing sequence
+marker removed. If two different codes escape to the same filename form, the match
+is flagged **ambiguous** and skipped rather than guessed.
+
+### Upload
+Skynamo has no dedicated product-image endpoint, so upload is two steps:
+`POST /files` (the image, base64-encoded) returns a file **GUID**, then
+`PATCH /products` attaches it via `{ "code": "...", "files": [guid, …] }`. The
+tool sends the **union** of the product's existing files plus the new ones, so
+images already on the product are preserved. Images for one product upload in
+sequence order.
+
+### Log & report
+Every file's outcome shows in the on-screen table and log, and **Save Report CSV**
+writes a report (`filename, product_code, matched_product, sequence, status,
+notes`) — including the reason any image was skipped or failed. Statuses:
+`pending-upload`, `uploaded`, `no-matching-product`, `unsupported-format`,
+`ambiguous-match`, `upload-failed`.
+
+---
+
 ## 7. The engine (skynamo_geo/engine.py)
 
 Two phases, so any UI can do **preview-then-commit**:
@@ -229,14 +291,19 @@ during preview, before committing).
 ## 9. Testing
 
 ```
-py test_engine.py        # engine logic: plan statuses, no-write-in-preview, accuracy
-py test_gui_smoke.py     # GUI widget tree builds and tears down cleanly
+py test_engine.py        # geolocation engine: plan statuses, no-write-in-preview, accuracy
+py test_geocoder.py      # OSM precision mapping + query building
+py test_products.py      # image filename parsing/escaping/matching/format sniff
+py test_image_engine.py  # image engine: match statuses, no-upload-in-preview, file-union, order
+py test_gui_smoke.py     # GUI (both tabs) builds and tears down cleanly
 ```
-`test_engine.py` uses a fake client + fake geocoder (no network, no real API
-keys) and asserts that preview writes nothing and only approved rows get PATCHed.
+The engine tests use a fake client (and fake geocoder) — no network, no real API
+keys — and assert that preview writes/uploads nothing and only approved rows are
+committed. `test_products`/`test_image_engine` build byte fixtures in a temp
+folder.
 
 **Not yet automated:** a true end-to-end run against a live Skynamo test
-instance. Use the GUI's preview step to eyeball coordinates before writing.
+instance. Use each tab's preview step to eyeball results before committing.
 
 ---
 
@@ -250,12 +317,26 @@ instance. Use the GUI's preview step to eyeball coordinates before writing.
 - **Batch PATCH**: the Skynamo endpoint already accepts an array; optimise inside
   `write_locations` only.
 - **Headless/scheduled runs**: call `engine.geocode_customers` +
-  `engine.write_locations` directly — the core has no UI dependency.
+  `engine.write_locations` (or `image_engine.scan_images` +
+  `image_engine.upload_images`) directly — the core has no UI dependency.
+- **Product images in the CLI**: `skynamo_geolocation.py` covers geolocation only
+  today; `image_engine` + `products` are UI-agnostic, so a CLI flow can be added
+  with no core changes.
 
 ---
 
 ## 11. Change log
 
+- **v2.4.0** (2026-07-23) — **Product image import.** New **Product Images** tab
+  (the GUI is now a tab per feature): match a folder of images to products by the
+  code in each filename and upload them. Naming supports multi-image sequences
+  (`CODE_1`/`CODE 2`/`CODE_A`) and hyphen-escaped reserved characters; PNG/JPEG
+  only (validated by content). Matching forward-transforms real product codes to
+  their filename form and flags ambiguous collisions. Upload is `POST /files`
+  (base64) → `PATCH /products` with the file GUID, preserving a product's existing
+  files. On-screen log + CSV report of every outcome. New core: `products.py`,
+  `image_engine.py`; new client methods `fetch_all_products`/`upload_file`/
+  `attach_files`; new offline tests `test_products.py`/`test_image_engine.py`.
 - **v2.3.0** (2026-07-23) — **Removed Google Maps.** Geocoding is now
   OpenStreetMap (Nominatim)-only — no per-lookup cost, no API key. Removed
   `GoogleGeocoder`, the provider picker (GUI segmented button, CLI prompt),

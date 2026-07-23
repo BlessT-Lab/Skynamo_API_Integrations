@@ -1,14 +1,14 @@
 """
-Skynamo Customer Geolocation Updater - desktop GUI
-==================================================
-A CustomTkinter front-end over skynamo_geo.engine. Flow:
+Skynamo Toolkit - desktop GUI
+=============================
+A CustomTkinter front-end over the skynamo_geo core, with two tabs:
 
-  Connect & Load  ->  Map address fields  ->  Preview (geocode only)
-  ->  review/deselect rows  ->  Write Selected to Skynamo  ->  Save report
+  Customer Geolocation - geocode customer addresses and write coordinates.
+  Product Images       - match local image files to products by code and upload.
 
-The engine does all the work on a background thread; the UI stays responsive
-and progress is streamed back through a thread-safe queue. Tkinter widgets are
-only ever touched on the main thread (via _poll_queue).
+Each tab does its work on a background thread; the UI stays responsive and
+progress is streamed back through a thread-safe queue. Tkinter widgets are only
+ever touched on the main thread (via each tab's queue-poll loop).
 """
 
 import queue
@@ -18,12 +18,14 @@ from tkinter import ttk, filedialog
 
 import customtkinter as ctk
 
-from skynamo_geo import engine, settings
+from skynamo_geo import engine, image_engine, settings
 from skynamo_geo.client import SkynamoClient
 from skynamo_geo.config import (
     STATUS_UPDATED, STATUS_UPDATED_LOW_CONF, STATUS_SKIPPED_HAS_COORDS,
     STATUS_SKIPPED_NO_ADDRESS, STATUS_GEOCODE_FAILED, STATUS_UPDATE_FAILED,
     STATUS_PENDING, ADDRESS_ROLES, ADDRESS_ROLE_LABELS, DEFAULT_ROLE,
+    STATUS_IMG_PENDING, STATUS_IMG_UPLOADED, STATUS_IMG_NO_MATCH,
+    STATUS_IMG_BAD_FORMAT, STATUS_IMG_AMBIGUOUS, STATUS_IMG_UPLOAD_FAILED,
 )
 from skynamo_geo.customers import build_query, collect_custom_field_names
 from skynamo_geo.geocoder import NominatimGeocoder, GeocodeError
@@ -56,11 +58,11 @@ ROLE_LABEL_BY_KEY = {r: ADDRESS_ROLE_LABELS[r] for r in ADDRESS_ROLES}
 class App(ctk.CTk):
     def __init__(self):
         super().__init__(fg_color=BG)
-        self.title("Skynamo Geolocation Updater")
-        self.geometry("1080x780")
-        self.minsize(940, 660)
+        self.title("Skynamo Toolkit")
+        self.geometry("1080x800")
+        self.minsize(940, 680)
 
-        # Runtime state
+        # ----- Geolocation tab state -----
         self.client = None
         self.geocoder = None
         self.country = None
@@ -71,11 +73,20 @@ class App(ctk.CTk):
         self.plans = []
         self.report_rows = []
         self.tree_item_to_plan = {}  # tree iid -> Plan
-
-        # Threading
         self.queue = queue.Queue()
         self.cancel_event = threading.Event()
         self.worker = None
+
+        # ----- Product Images tab state -----
+        self.img_client = None
+        self.products = []
+        self.image_plans = []
+        self.image_report_rows = []
+        self.image_folder = None
+        self.img_tree_item_to_plan = {}  # tree iid -> ImagePlan
+        self.img_queue = queue.Queue()
+        self.img_cancel_event = threading.Event()
+        self.img_worker = None
 
         self._build_ui()
         self._load_saved_settings()
@@ -84,12 +95,26 @@ class App(ctk.CTk):
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
-
+        self.grid_rowconfigure(0, weight=1)
         self._style_treeview()
 
+        self.tabview = ctk.CTkTabview(
+            self, fg_color=BG, segmented_button_fg_color=CARD,
+            segmented_button_selected_color=ACCENT,
+            segmented_button_selected_hover_color=ACCENT_HOVER,
+            segmented_button_unselected_color=CARD,
+            segmented_button_unselected_hover_color=BORDER,
+            text_color=TEXT, corner_radius=10)
+        self.tabview.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self._build_geo_tab(self.tabview.add("Customer Geolocation"))
+        self._build_image_tab(self.tabview.add("Product Images"))
+
+    def _build_geo_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(3, weight=1)
+
         # ----- Header -----
-        header = ctk.CTkFrame(self, fg_color="transparent")
+        header = ctk.CTkFrame(parent, fg_color="transparent")
         header.grid(row=0, column=0, padx=16, pady=(14, 4), sticky="ew")
         ctk.CTkLabel(header, text="Skynamo Geolocation Updater",
                      font=ctk.CTkFont(size=20, weight="bold"),
@@ -101,7 +126,7 @@ class App(ctk.CTk):
                                                  pady=(4, 0))
 
         # ----- Top: connection + mapping side by side -----
-        top = ctk.CTkFrame(self, fg_color="transparent")
+        top = ctk.CTkFrame(parent, fg_color="transparent")
         top.grid(row=1, column=0, padx=16, pady=(6, 6), sticky="ew")
         top.grid_columnconfigure(0, weight=1)
         top.grid_columnconfigure(1, weight=1)
@@ -141,9 +166,17 @@ class App(ctk.CTk):
         self._section_title(mapping, "2", "Map address field(s)").grid(
             row=0, column=0, padx=14, pady=(12, 6), sticky="w")
 
+        # Fixed-height container so the scrollable frame's large natural size
+        # doesn't force the whole card tall (it scrolls internally instead).
+        fields_container = ctk.CTkFrame(mapping, fg_color="transparent",
+                                        height=104)
+        fields_container.grid(row=1, column=0, padx=14, pady=4, sticky="nsew")
+        fields_container.grid_propagate(False)
+        fields_container.grid_rowconfigure(0, weight=1)
+        fields_container.grid_columnconfigure(0, weight=1)
         self.fields_frame = ctk.CTkScrollableFrame(
-            mapping, height=150, fg_color=FIELD, corner_radius=10)
-        self.fields_frame.grid(row=1, column=0, padx=14, pady=4, sticky="nsew")
+            fields_container, fg_color=FIELD, corner_radius=10)
+        self.fields_frame.grid(row=0, column=0, sticky="nsew")
         self._fields_placeholder()
 
         self.sample_label = ctk.CTkLabel(
@@ -162,7 +195,7 @@ class App(ctk.CTk):
             row=3, column=0, padx=14, pady=(4, 14), sticky="w")
 
         # ----- Middle: action bar -----
-        actions = self._card(self)
+        actions = self._card(parent)
         actions.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
         self.preview_btn = self._button(
             actions, "Preview (geocode only)", self.on_preview,
@@ -191,7 +224,7 @@ class App(ctk.CTk):
         self.select_none_btn.pack(side="right", padx=6, pady=10)
 
         # ----- Results table -----
-        table_frame = self._card(self)
+        table_frame = self._card(parent)
         table_frame.grid(row=3, column=0, padx=16, pady=6, sticky="nsew")
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
@@ -199,7 +232,8 @@ class App(ctk.CTk):
         columns = ("include", "name", "address", "lat", "lng",
                    "precision", "status")
         self.tree = ttk.Treeview(table_frame, columns=columns,
-                                 show="headings", style="Dark.Treeview")
+                                 show="headings", style="Dark.Treeview",
+                                 height=6)
         headings = {
             "include": ("Use", 50), "name": ("Customer", 200),
             "address": ("Address used", 280), "lat": ("Latitude", 90),
@@ -224,7 +258,7 @@ class App(ctk.CTk):
         self.tree.bind("<Button-1>", self._on_tree_click)
 
         # ----- Bottom: progress + log + summary -----
-        bottom = self._card(self)
+        bottom = self._card(parent)
         bottom.grid(row=4, column=0, padx=16, pady=(6, 14), sticky="ew")
         bottom.grid_columnconfigure(0, weight=1)
 
@@ -237,7 +271,7 @@ class App(ctk.CTk):
                                          text_color=TEXT)
         self.status_label.grid(row=1, column=0, padx=14, pady=2, sticky="ew")
         self.log = ctk.CTkTextbox(
-            bottom, height=110, fg_color="#151515", text_color="#b8b8b8",
+            bottom, height=90, fg_color="#151515", text_color="#b8b8b8",
             corner_radius=10, border_width=1, border_color=BORDER,
             font=ctk.CTkFont(family="Consolas", size=12))
         self.log.grid(row=2, column=0, padx=14, pady=(4, 14), sticky="ew")
@@ -328,6 +362,7 @@ class App(ctk.CTk):
         cfg = settings.load_config()
         if cfg.get("instance_name"):
             self.instance_entry.insert(0, cfg["instance_name"])
+            self.img_instance_entry.insert(0, cfg["instance_name"])
         if cfg.get("country"):
             self.country_entry.insert(0, cfg["country"])
         self.replace_var.set(bool(cfg.get("replace_existing", False)))
@@ -679,6 +714,428 @@ class App(ctk.CTk):
         ]
         if not preview:
             parts.append(f"write-fail={counts.get(STATUS_UPDATE_FAILED, 0)}")
+        label = "Preview" if preview else "Done"
+        return f"{label}:  " + "   ".join(parts)
+
+    # ====================================================================
+    # Product Images tab
+    # ====================================================================
+
+    def _build_image_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(3, weight=1)
+
+        # ----- Header -----
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.grid(row=0, column=0, padx=16, pady=(14, 4), sticky="ew")
+        ctk.CTkLabel(header, text="Product Image Import",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     text_color=TEXT).pack(side="left")
+        ctk.CTkLabel(header,
+                     text="match images to products by code · preview · upload",
+                     font=ctk.CTkFont(size=12),
+                     text_color=TEXT_MUTED).pack(side="left", padx=(12, 0),
+                                                 pady=(4, 0))
+
+        # ----- Top: connection + folder side by side -----
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.grid(row=1, column=0, padx=16, pady=(6, 6), sticky="ew")
+        top.grid_columnconfigure(0, weight=1)
+        top.grid_columnconfigure(1, weight=1)
+
+        conn = self._card(top)
+        conn.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="nsew")
+        self._section_title(conn, "1", "Connection").grid(
+            row=0, column=0, columnspan=2, padx=14, pady=(12, 6), sticky="w")
+        self.img_instance_entry = self._labeled_entry(conn, "Instance name", 1)
+        self.img_skynamo_entry = self._labeled_entry(
+            conn, "Skynamo API key", 2, show="*")
+        self.img_connect_btn = self._button(
+            conn, "Connect & Load Products", self.on_img_connect)
+        self.img_connect_btn.grid(row=3, column=0, columnspan=2,
+                                  padx=14, pady=(6, 14), sticky="ew")
+
+        folder = self._card(top)
+        folder.grid(row=0, column=1, padx=(8, 0), pady=0, sticky="nsew")
+        folder.grid_columnconfigure(0, weight=1)
+        self._section_title(folder, "2", "Image folder").grid(
+            row=0, column=0, padx=14, pady=(12, 6), sticky="w")
+        self.img_folder_label = ctk.CTkLabel(
+            folder, text="No folder selected.", anchor="w",
+            wraplength=440, justify="left", text_color=TEXT_MUTED)
+        self.img_folder_label.grid(row=1, column=0, padx=14, pady=4, sticky="ew")
+        self.img_choose_btn = self._button(
+            folder, "Choose folder…", self.on_choose_folder,
+            fg_color=FIELD, hover_color=BORDER)
+        self.img_choose_btn.grid(row=2, column=0, padx=14, pady=6, sticky="ew")
+        ctk.CTkLabel(folder,
+                     text="Files are named by product code (PNG/JPG). "
+                          "Multiple images: CODE_1, CODE 2, CODE_A. A '/' in "
+                          "a code becomes '-' in the filename.",
+                     anchor="w", wraplength=440, justify="left",
+                     text_color=TEXT_MUTED).grid(
+            row=3, column=0, padx=14, pady=(0, 14), sticky="ew")
+
+        # ----- Action bar -----
+        actions = self._card(parent)
+        actions.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
+        self.img_preview_btn = self._button(
+            actions, "Preview (match only)", self.on_img_preview,
+            state="disabled")
+        self.img_preview_btn.pack(side="left", padx=(12, 6), pady=10)
+        self.img_upload_btn = self._button(
+            actions, "Upload Selected to Skynamo", self.on_img_upload,
+            state="disabled", fg_color=GREEN, hover_color=GREEN_HOVER)
+        self.img_upload_btn.pack(side="left", padx=6, pady=10)
+        self.img_cancel_btn = self._button(
+            actions, "Cancel", self.on_img_cancel, state="disabled",
+            fg_color=RED, hover_color=RED_HOVER, width=90)
+        self.img_cancel_btn.pack(side="left", padx=6, pady=10)
+        self.img_save_btn = self._button(
+            actions, "Save Report CSV", self.on_img_save_report,
+            state="disabled", fg_color=FIELD, hover_color=BORDER)
+        self.img_save_btn.pack(side="left", padx=6, pady=10)
+        self.img_select_all_btn = self._button(
+            actions, "Select all", lambda: self._img_set_all_includes(True),
+            state="disabled", width=96, fg_color=FIELD, hover_color=BORDER)
+        self.img_select_all_btn.pack(side="right", padx=(6, 12), pady=10)
+        self.img_select_none_btn = self._button(
+            actions, "Select none", lambda: self._img_set_all_includes(False),
+            state="disabled", width=96, fg_color=FIELD, hover_color=BORDER)
+        self.img_select_none_btn.pack(side="right", padx=6, pady=10)
+
+        # ----- Results table -----
+        table_frame = self._card(parent)
+        table_frame.grid(row=3, column=0, padx=16, pady=6, sticky="nsew")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        columns = ("include", "file", "code", "product", "seq", "status")
+        self.img_tree = ttk.Treeview(table_frame, columns=columns,
+                                     show="headings", style="Dark.Treeview",
+                                     height=6)
+        headings = {
+            "include": ("Use", 45), "file": ("File", 220),
+            "code": ("Product code", 130), "product": ("Matched product", 200),
+            "seq": ("Seq", 50), "status": ("Status", 160),
+        }
+        for col, (text, width) in headings.items():
+            self.img_tree.heading(col, text=text)
+            anchor = "center" if col in ("include", "seq") else "w"
+            self.img_tree.column(col, width=width, anchor=anchor)
+        self.img_tree.tag_configure("low", background="#3a2f12",
+                                    foreground="#f0c453")
+        self.img_tree.tag_configure("skip", foreground="#7a7a7a")
+        self.img_tree.tag_configure("fail", background="#3a1717",
+                                    foreground="#f08c8c")
+        self.img_tree.grid(row=0, column=0, padx=(10, 0), pady=10, sticky="nsew")
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical",
+                                command=self.img_tree.yview,
+                                style="Dark.Vertical.TScrollbar")
+        self.img_tree.configure(yscrollcommand=yscroll.set)
+        yscroll.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="ns")
+        self.img_tree.bind("<Button-1>", self._img_on_tree_click)
+
+        # ----- Bottom: progress + status + log -----
+        bottom = self._card(parent)
+        bottom.grid(row=4, column=0, padx=16, pady=(6, 14), sticky="ew")
+        bottom.grid_columnconfigure(0, weight=1)
+        self.img_progress = ctk.CTkProgressBar(
+            bottom, progress_color=ACCENT, fg_color=FIELD, height=8,
+            corner_radius=4)
+        self.img_progress.set(0)
+        self.img_progress.grid(row=0, column=0, padx=14, pady=(12, 4),
+                               sticky="ew")
+        self.img_status_label = ctk.CTkLabel(bottom, text="Ready.", anchor="w",
+                                             text_color=TEXT)
+        self.img_status_label.grid(row=1, column=0, padx=14, pady=2, sticky="ew")
+        self.img_log = ctk.CTkTextbox(
+            bottom, height=90, fg_color="#151515", text_color="#b8b8b8",
+            corner_radius=10, border_width=1, border_color=BORDER,
+            font=ctk.CTkFont(family="Consolas", size=12))
+        self.img_log.grid(row=2, column=0, padx=14, pady=(4, 14), sticky="ew")
+
+    # -- Image logging / status -------------------------------------------
+
+    def img_log_line(self, text):
+        self.img_log.insert("end", text + "\n")
+        self.img_log.see("end")
+
+    def img_set_status(self, text):
+        self.img_status_label.configure(text=text)
+
+    def _persist_image_settings(self):
+        if not self.remember_var.get():
+            return
+        cfg = settings.load_config()
+        cfg["instance_name"] = self.img_instance_entry.get().strip()
+        settings.save_config(cfg)  # merge; never persists API keys
+
+    # -- Image worker plumbing --------------------------------------------
+
+    def _img_start_worker(self, target):
+        self.img_cancel_event.clear()
+        self._img_set_busy(True)
+        self.img_worker = threading.Thread(target=target, daemon=True)
+        self.img_worker.start()
+        self.after(100, self._img_poll_queue)
+
+    def _img_poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.img_queue.get_nowait()
+                if kind == "progress":
+                    self._img_on_progress(payload)
+                elif kind == "log":
+                    self.img_log_line(payload)
+                elif kind == "status":
+                    self.img_set_status(payload)
+                elif kind == "done":
+                    payload()
+                    self._img_set_busy(False)
+                    return
+                elif kind == "error":
+                    self.img_log_line(f"ERROR: {payload}")
+                    self.img_set_status("Error - see log.")
+                    self._img_set_busy(False)
+                    return
+        except queue.Empty:
+            pass
+        self.after(100, self._img_poll_queue)
+
+    def _img_on_progress(self, ev):
+        if ev["total"]:
+            self.img_progress.set(ev["index"] / ev["total"])
+        self.img_set_status(f"{ev['phase'].title()} {ev['index']}/{ev['total']}: "
+                            f"{ev['name']}")
+
+    def _img_set_busy(self, busy):
+        self.img_cancel_btn.configure(state="normal" if busy else "disabled")
+        for btn in (self.img_connect_btn, self.img_choose_btn,
+                    self.img_preview_btn, self.img_upload_btn,
+                    self.img_save_btn, self.img_select_all_btn,
+                    self.img_select_none_btn):
+            btn.configure(state="disabled" if busy else btn.cget("state"))
+        if not busy:
+            self.img_connect_btn.configure(state="normal")
+            self.img_choose_btn.configure(state="normal")
+            if self.img_client is not None and self.image_folder:
+                self.img_preview_btn.configure(state="normal")
+            if self.image_plans:
+                self.img_upload_btn.configure(state="normal")
+                self.img_select_all_btn.configure(state="normal")
+                self.img_select_none_btn.configure(state="normal")
+            if self.image_report_rows:
+                self.img_save_btn.configure(state="normal")
+
+    # -- Step 1: connect & load products ----------------------------------
+
+    def on_img_connect(self):
+        instance = self.img_instance_entry.get().strip()
+        skynamo_key = self.img_skynamo_entry.get().strip()
+        if not (instance and skynamo_key):
+            self.img_set_status("Enter instance name and Skynamo key first.")
+            return
+        self.img_log_line(f"Connecting to '{instance}'...")
+
+        def work():
+            try:
+                client = SkynamoClient(instance, skynamo_key)
+                ok, message = client.test_connection()
+                if not ok:
+                    self.img_queue.put(("error", message))
+                    return
+                self.img_queue.put(("log", "Skynamo credentials OK."))
+                self.img_queue.put(("status", "Fetching products..."))
+                products = client.fetch_all_products(
+                    on_page=lambda n, total: self.img_queue.put((
+                        "status", f"Fetched {n}"
+                        f"{f' of {total}' if total else ''} products...")))
+
+                def finish():
+                    self.img_client = client
+                    self.products = products
+                    self.img_log_line(f"Loaded {len(products)} products.")
+                    self.img_set_status(
+                        f"Loaded {len(products)} products. "
+                        f"Choose a folder, then Preview.")
+                    self._persist_image_settings()
+                self.img_queue.put(("done", finish))
+            except Exception as exc:
+                self.img_queue.put(("error", str(exc)))
+
+        self._img_start_worker(work)
+
+    # -- Step 2: choose folder + preview (match only) ---------------------
+
+    def on_choose_folder(self):
+        folder = filedialog.askdirectory(title="Select the image folder")
+        if not folder:
+            return
+        self.image_folder = folder
+        self.img_folder_label.configure(text=folder, text_color=TEXT)
+        self.img_log_line(f"Image folder: {folder}")
+        if self.img_client is not None:
+            self.img_preview_btn.configure(state="normal")
+        self.img_set_status("Folder selected. Preview to match images.")
+
+    def on_img_preview(self):
+        if self.img_client is None:
+            self.img_set_status("Connect and load products first.")
+            return
+        if not self.image_folder:
+            self.img_set_status("Choose an image folder first.")
+            return
+        self.image_plans = []
+        self.image_report_rows = []
+        self.img_save_btn.configure(state="disabled")
+        self._img_clear_tree()
+        self.img_log_line("Matching images in: " + self.image_folder)
+
+        def work():
+            try:
+                plans = image_engine.scan_images(
+                    self.products, self.image_folder,
+                    on_progress=lambda ev: self.img_queue.put(("progress", ev)),
+                    should_cancel=self.img_cancel_event.is_set)
+
+                def finish():
+                    self.image_plans = plans
+                    self._img_populate_tree(plans)
+                    counts = image_engine.summarize(plans)
+                    self.img_set_status(
+                        self._img_summary_text(counts, preview=True))
+                    self.img_log_line("Preview complete. Review rows, then "
+                                      "'Upload Selected to Skynamo'.")
+                self.img_queue.put(("done", finish))
+            except Exception as exc:
+                self.img_queue.put(("error", str(exc)))
+
+        self._img_start_worker(work)
+
+    # -- Step 3: upload to Skynamo ----------------------------------------
+
+    def on_img_upload(self):
+        to_upload = [p for p in self.image_plans if p.include and p.writable]
+        if not to_upload:
+            self.img_set_status("No images selected to upload.")
+            return
+        self.img_log_line(f"Uploading {len(to_upload)} images to Skynamo...")
+
+        def work():
+            try:
+                report_rows = image_engine.upload_images(
+                    self.img_client, self.image_plans,
+                    on_progress=lambda ev: self.img_queue.put(("progress", ev)),
+                    should_cancel=self.img_cancel_event.is_set)
+
+                def finish():
+                    self.image_report_rows = report_rows
+                    self._img_refresh_tree_statuses()
+                    counts = image_engine.summarize(self.image_plans)
+                    self.img_set_status(
+                        self._img_summary_text(counts, preview=False))
+                    self.img_log_line("Upload complete. Save the report if needed.")
+                    self.img_save_btn.configure(state="normal")
+                self.img_queue.put(("done", finish))
+            except Exception as exc:
+                self.img_queue.put(("error", str(exc)))
+
+        self._img_start_worker(work)
+
+    def on_img_cancel(self):
+        self.img_cancel_event.set()
+        self.img_set_status("Cancelling...")
+        self.img_log_line("Cancel requested - stopping after current item.")
+
+    # -- Step 4: save report ----------------------------------------------
+
+    def on_img_save_report(self):
+        rows = (self.image_report_rows
+                or [p.to_report_row() for p in self.image_plans])
+        if not rows:
+            self.img_set_status("Nothing to save yet.")
+            return
+        default = (f"product_images_report_"
+                   f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", initialfile=default,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        image_engine.write_report(rows, path)
+        self.img_log_line(f"Report saved to: {path}")
+        self.img_set_status(f"Report saved to {path}")
+
+    # -- Image tree helpers -----------------------------------------------
+
+    def _img_clear_tree(self):
+        self.img_tree.delete(*self.img_tree.get_children())
+        self.img_tree_item_to_plan = {}
+
+    def _img_row_tag(self, plan):
+        if plan.status in (STATUS_IMG_NO_MATCH, STATUS_IMG_BAD_FORMAT):
+            return "skip"
+        if plan.status == STATUS_IMG_UPLOAD_FAILED:
+            return "fail"
+        if plan.status == STATUS_IMG_AMBIGUOUS:
+            return "low"
+        return ""
+
+    def _img_plan_values(self, plan):
+        check = CHECK_ON if (plan.include and plan.writable) else CHECK_OFF
+        if not plan.writable:
+            check = ""
+        return (check, plan.filename, plan.product_code, plan.product_name,
+                plan.sequence or "", plan.status)
+
+    def _img_populate_tree(self, plans):
+        self._img_clear_tree()
+        for plan in plans:
+            tag = self._img_row_tag(plan)
+            iid = self.img_tree.insert("", "end",
+                                       values=self._img_plan_values(plan),
+                                       tags=(tag,) if tag else ())
+            self.img_tree_item_to_plan[iid] = plan
+
+    def _img_refresh_tree_statuses(self):
+        for iid, plan in self.img_tree_item_to_plan.items():
+            tag = self._img_row_tag(plan)
+            self.img_tree.item(iid, values=self._img_plan_values(plan),
+                               tags=(tag,) if tag else ())
+
+    def _img_on_tree_click(self, event):
+        if self.img_tree.identify("region", event.x, event.y) != "cell":
+            return
+        if self.img_tree.identify_column(event.x) != "#1":  # only the Use column
+            return
+        iid = self.img_tree.identify_row(event.y)
+        plan = self.img_tree_item_to_plan.get(iid)
+        if not plan or not plan.writable:
+            return
+        plan.include = not plan.include
+        self.img_tree.set(iid, "include",
+                          CHECK_ON if plan.include else CHECK_OFF)
+
+    def _img_set_all_includes(self, value):
+        for iid, plan in self.img_tree_item_to_plan.items():
+            if plan.writable:
+                plan.include = value
+                self.img_tree.set(iid, "include",
+                                  CHECK_ON if value else CHECK_OFF)
+
+    def _img_summary_text(self, counts, preview):
+        matched = counts.get(STATUS_IMG_PENDING, 0)
+        if not preview:
+            matched += counts.get(STATUS_IMG_UPLOADED, 0)
+        parts = [
+            f"matched={matched}",
+            f"uploaded={counts.get(STATUS_IMG_UPLOADED, 0)}",
+            f"no-match={counts.get(STATUS_IMG_NO_MATCH, 0)}",
+            f"ambiguous={counts.get(STATUS_IMG_AMBIGUOUS, 0)}",
+            f"bad-format={counts.get(STATUS_IMG_BAD_FORMAT, 0)}",
+        ]
+        if not preview:
+            parts.append(f"upload-fail={counts.get(STATUS_IMG_UPLOAD_FAILED, 0)}")
         label = "Preview" if preview else "Done"
         return f"{label}:  " + "   ".join(parts)
 

@@ -93,3 +93,80 @@ class SkynamoClient:
         if resp.ok:
             return True, ""
         return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+    def fetch_all_products(self, on_page=None, active_only=True):
+        """Paginate through /products (same paging shape as /customers).
+
+        on_page(fetched_count, total_or_None) is called after each page.
+        When active_only is True, products whose `active` flag is False are
+        skipped; pagination still uses the raw page counts so termination is
+        unaffected by filtering.
+        """
+        products = []
+        raw_count = 0
+        page_number = 1
+        while True:
+            resp = self.session.get(
+                f"{API_BASE}/products",
+                params={"page_number": page_number, "page_size": PAGE_SIZE},
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            page_items = body.get("data", [])
+            if not page_items:
+                break
+            raw_count += len(page_items)
+            if active_only:
+                page_items = [p for p in page_items if p.get("active", True)]
+            products.extend(page_items)
+            total = (body.get("page") or {}).get("total_item_count")
+            if on_page:
+                on_page(len(products), total)
+            if total and raw_count >= total:
+                break
+            if len(body["data"]) < PAGE_SIZE:
+                break
+            page_number += 1
+        return products
+
+    def upload_file(self, filename, content_b64):
+        """POST a base64-encoded file to /files. Returns (guid, error_message).
+
+        On success guid is the created file's GUID (from the response's
+        data[].id); on failure guid is None and error_message explains why.
+        """
+        try:
+            resp = self.session.post(
+                f"{API_BASE}/files",
+                json={"filename": filename, "content": content_b64},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            return None, f"Connection error: {exc}"
+        if not resp.ok:
+            return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        try:
+            data = resp.json().get("data") or []
+        except ValueError:
+            return None, "Malformed response from /files"
+        if not data or not data[0].get("id"):
+            return None, "No file GUID returned by /files"
+        return data[0]["id"], ""
+
+    def attach_files(self, product_code, file_guids):
+        """PATCH a product's `files` list by code. Returns (ok, error_message).
+
+        Mirrors update_location: the API accepts updates only on the collection
+        endpoint (PATCH /products) with an array of ProductPatch objects. Pass
+        the full desired `files` list (the caller merges with any existing
+        GUIDs so nothing already attached is lost).
+        """
+        resp = self.session.patch(
+            f"{API_BASE}/products",
+            json=[{"code": product_code, "files": file_guids}],
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.ok:
+            return True, ""
+        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"

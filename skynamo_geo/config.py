@@ -6,7 +6,7 @@ REQUEST_TIMEOUT = 30
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Nominatim usage policy: identify your app and stay at/below 1 request/second.
-NOMINATIM_USER_AGENT = "SkynamoGeo/2.3 (Skynamo customer geolocation updater)"
+NOMINATIM_USER_AGENT = "SkynamoGeo/2.4 (Skynamo customer geolocation updater)"
 NOMINATIM_MIN_INTERVAL = 1.0
 # Ask Nominatim for several candidates so we can pick the most precise one
 # instead of blindly trusting the first result.
@@ -73,4 +73,31 @@ STATUS_PENDING = "pending-write"  # preview produced coords, not yet written
 REPORT_FIELDNAMES = [
     "customer_id", "code", "name", "status", "address_used",
     "latitude", "longitude", "accuracy", "match_precision", "notes",
+]
+
+# --- Product image import ------------------------------------------------
+# Skynamo accepts PNG and JPG/JPEG only. Extensions are checked case-insensitively
+# and the file's leading bytes are sniffed so a mis-named file is caught too.
+ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+# Magic-byte signatures used by sniff_image_format (no Pillow dependency).
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+JPEG_SIGNATURE = b"\xff\xd8\xff"
+
+# A product code may contain characters that can't appear in a filename; each is
+# represented by a hyphen. To match a filename back to its product we apply this
+# same forward transform to every known product code (see products.py).
+WINDOWS_RESERVED_CHARS = '/\\:*?"<>|'
+FILENAME_ESCAPE_CHAR = "-"
+
+# Image plan / report statuses
+STATUS_IMG_PENDING = "pending-upload"        # matched, not yet uploaded
+STATUS_IMG_UPLOADED = "uploaded"
+STATUS_IMG_NO_MATCH = "no-matching-product"
+STATUS_IMG_BAD_FORMAT = "unsupported-format"
+STATUS_IMG_AMBIGUOUS = "ambiguous-match"
+STATUS_IMG_UPLOAD_FAILED = "upload-failed"
+
+# Product-image report CSV column order
+IMAGE_REPORT_FIELDNAMES = [
+    "filename", "product_code", "matched_product", "sequence", "status", "notes",
 ]
