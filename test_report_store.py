@@ -3,6 +3,10 @@ idempotent upserts, camelCase normalisation, nested sub-entity storage,
 period-scoped bookmarks, run history and reconcile. In-memory - no network,
 no files left behind."""
 
+import os
+import shutil
+import tempfile
+
 from skynamo_geo.report_store import (
     ReportStore, normalise_key, normalise_row, default_store_path,
 )
@@ -138,4 +142,90 @@ assert store.counts()["products"] == 1
 assert store.scalar("SELECT COUNT(*) FROM products") == 2
 
 store.close()
+
+# --- thread safety -------------------------------------------------------
+# Regression: the GUI creates the store on the connect worker thread, then uses
+# it from the main thread (labels/dashboard) and from other worker threads
+# (plan/run extract). A default sqlite3 connection is bound to its creating
+# thread, which raised "SQLite objects created in a thread can only be used in
+# that same thread". These tests exercise exactly that pattern.
+import queue as _queue
+import threading
+
+tmpdir = tempfile.mkdtemp(prefix="skynamo_store_threads_")
+try:
+    db = os.path.join(tmpdir, "threaded.db")
+
+    # (a) created on one thread, used on another - the reported failure
+    created = _queue.Queue()
+
+    def build():
+        created.put(ReportStore(db))
+
+    t = threading.Thread(target=build)
+    t.start()
+    t.join()
+    remote = created.get()
+
+    # this main-thread access is what used to raise
+    remote.upsert_entity("products", [{"product_id": "p1", "name": "W"}])
+    assert remote.counts()["products"] == 1
+    remote.record_run("products", "", "full", 1, "", "extracted")
+    assert "products" in remote.last_runs()
+    remote.set_bookmark("/v2/products", "", "bm-1")
+    assert remote.get_bookmark("/v2/products", "") == "bm-1"
+
+    # (b) and used from yet another thread, as plan/run extract would
+    errors = []
+    results = {}
+
+    def worker():
+        try:
+            results["bookmark"] = remote.get_bookmark("/v2/products", "")
+            remote.upsert_entity("products", [{"product_id": "p2", "name": "G"}])
+            results["counts"] = remote.counts()["products"]
+        except Exception as exc:            # noqa: BLE001 - recording it is the test
+            errors.append(exc)
+
+    t2 = threading.Thread(target=worker)
+    t2.start()
+    t2.join()
+    assert not errors, f"cross-thread use must not raise: {errors}"
+    assert results["bookmark"] == "bm-1"
+    assert results["counts"] == 2
+
+    # (c) concurrent readers and writers stay consistent under the lock
+    errors.clear()
+
+    def hammer(n):
+        try:
+            for i in range(25):
+                remote.upsert_entity("products", [
+                    {"product_id": f"t{n}-{i}", "name": f"P{n}-{i}"}])
+                remote.counts()
+                remote.query("SELECT COUNT(*) FROM products")
+        except Exception as exc:            # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=hammer, args=(n,)) for n in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert not errors, f"concurrent access must not raise: {errors}"
+    # 2 from earlier + 4 threads x 25 rows, none lost or duplicated
+    assert remote.counts()["products"] == 2 + 4 * 25, remote.counts()["products"]
+
+    # (d) upsert_entity nests upsert(), so the lock must be re-entrant
+    #     (a plain Lock would deadlock here - this call proves it does not)
+    remote.upsert_entity("activities", [{
+        "activity_id": "a1",
+        "visits": [{"activity_id": "a1", "duration_sec": 60}],
+    }])
+    assert remote.counts()["activity_visits"] == 1
+
+    remote.close()
+finally:
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
 print("All report store tests passed")

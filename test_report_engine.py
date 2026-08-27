@@ -176,4 +176,87 @@ row = plans6[0].to_report_row()
 assert set(row) == {"entity", "mode", "reporting_period", "rows",
                     "date_range", "status", "notes"}
 
+# --- the GUI's threading pattern, end to end ----------------------------
+# Regression for "SQLite objects created in a thread can only be used in that
+# same thread": the GUI creates the store on the connect worker, renders labels
+# from the main thread, then plans and extracts on further worker threads.
+import os
+import shutil
+import tempfile
+import threading
+import queue as _queue
+
+tmpdir = tempfile.mkdtemp(prefix="skynamo_engine_threads_")
+try:
+    db_path = os.path.join(tmpdir, "reporting.db")
+    errors = []
+    handoff = _queue.Queue()
+
+    # 1. connect worker creates the store (as on_rpt_connect does)
+    def connect_worker():
+        try:
+            handoff.put(ReportStore(db_path))
+        except Exception as exc:            # noqa: BLE001
+            errors.append(("connect", exc))
+            handoff.put(None)
+
+    t = threading.Thread(target=connect_worker)
+    t.start(); t.join()
+    shared = handoff.get()
+    assert shared is not None and not errors, errors
+
+    # 2. main thread renders the store labels (counts + last_runs)
+    try:
+        shared.counts()
+        shared.last_runs()
+    except Exception as exc:                # noqa: BLE001
+        errors.append(("main-thread labels", exc))
+
+    # 3. plan worker (a different thread) reads bookmarks
+    plans_out = []
+
+    def plan_worker():
+        try:
+            plans_out.extend(
+                plan_extract(shared, ["products", "customers"], "ThisMonth"))
+        except Exception as exc:            # noqa: BLE001
+            errors.append(("plan", exc))
+
+    t = threading.Thread(target=plan_worker)
+    t.start(); t.join()
+
+    # 4. run worker (yet another thread) writes rows and bookmarks
+    def run_worker():
+        try:
+            client = FakeClient(
+                rows_by_entity={
+                    "products": [{"product_id": "p1", "name": "Widget"}],
+                    "customers": [{"customer_id": "c1", "name": "Acme"}],
+                },
+                bookmarks={"products": "bm-p", "customers": "bm-c"})
+            run_extract(client, shared, plans_out,
+                        started_at="2026-08-27T09:00:00")
+        except Exception as exc:            # noqa: BLE001
+            errors.append(("run", exc))
+
+    t = threading.Thread(target=run_worker)
+    t.start(); t.join()
+
+    # 5. main thread reads the results back (as the dashboard tab does)
+    try:
+        counts = shared.counts()
+        runs = shared.last_runs()
+    except Exception as exc:                # noqa: BLE001
+        errors.append(("main-thread readback", exc))
+        counts, runs = {}, {}
+
+    assert not errors, f"no thread crossing may raise: {errors}"
+    assert counts.get("products") == 1 and counts.get("customers") == 1, counts
+    assert set(runs) == {"products", "customers"}, runs
+    assert shared.get_bookmark("/v2/products", "") == "bm-p"
+    assert shared.get_bookmark("/v2/customers", "ThisMonth") == "bm-c"
+    shared.close()
+finally:
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
 print("All report engine tests passed")

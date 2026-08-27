@@ -15,6 +15,7 @@ Uses stdlib sqlite3 - no new dependency, and nothing extra in the .exe.
 import os
 import re
 import sqlite3
+import threading
 
 from .reporting_config import REPORTING_ENTITIES, STORE_FILENAME
 from .settings import _config_dir
@@ -65,23 +66,39 @@ def _tables():
 
 
 class ReportStore:
-    """Read/write access to the local extract database."""
+    """Read/write access to the local extract database.
+
+    Safe to use from more than one thread. The GUI needs this: the store is
+    created on the connect worker, the extract runs on another worker, and the
+    store/dashboard labels are rendered on the main thread. A sqlite3
+    connection is bound to its creating thread by default, so sharing one would
+    raise "SQLite objects created in a thread can only be used in that same
+    thread". We therefore drop that check and serialise every operation on a
+    re-entrant lock instead - SQLite is fine with serialised access, and the
+    lock has to be re-entrant because upsert_entity() calls upsert().
+    """
 
     def __init__(self, path=None):
         self.path = path or default_store_path()
         if self.path != ":memory:":
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.ensure_schema()
 
     def close(self):
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     # -- schema ----------------------------------------------------------
 
     def ensure_schema(self):
         """Create any missing tables. Safe to call every startup."""
+        with self._lock:
+            self._ensure_schema_locked()
+
+    def _ensure_schema_locked(self):
         cur = self.conn.cursor()
         for table, pk, columns in _tables():
             cols = [f'"{name}" {sql_type}' for name, sql_type in columns.items()]
@@ -138,17 +155,18 @@ class ReportStore:
                f'INSERT OR REPLACE INTO "{table}" ({quoted}) '
                f'VALUES ({placeholders})')
 
-        cur = self.conn.cursor()
-        written = 0
-        for row in rows:
-            norm = normalise_row(row)
-            if norm.get(primary_key) in (None, ""):
-                continue
-            values = [_coerce(norm.get(c)) for c in known]
-            cur.execute(sql, values)
-            written += 1
-        self.conn.commit()
-        return written
+        with self._lock:
+            cur = self.conn.cursor()
+            written = 0
+            for row in rows:
+                norm = normalise_row(row)
+                if norm.get(primary_key) in (None, ""):
+                    continue
+                values = [_coerce(norm.get(c)) for c in known]
+                cur.execute(sql, values)
+                written += 1
+            self.conn.commit()
+            return written
 
     def upsert_entity(self, entity, rows):
         """Upsert a root entity's rows plus any nested sub-entity rows.
@@ -161,6 +179,12 @@ class ReportStore:
         written = {}
         normalised = [normalise_row(r) for r in rows]
 
+        # One lock for the whole entity so a root and its children commit
+        # together rather than interleaving with another thread's extract.
+        with self._lock:
+            return self._upsert_entity_locked(entity, spec, normalised, written)
+
+    def _upsert_entity_locked(self, entity, spec, normalised, written):
         written[spec["table"]] = self.upsert(
             spec["table"], spec["primary_key"], spec["columns"], normalised)
 
@@ -187,76 +211,85 @@ class ReportStore:
         Bookmarks only ever report added data, so deletions have to be found by
         comparing against a full listing.
         """
-        cur = self.conn.cursor()
-        cur.execute(f'SELECT "{primary_key}" FROM "{table}"')
-        existing = {r[0] for r in cur.fetchall()}
-        missing = existing - set(live_keys)
-        for key in missing:
-            cur.execute(
-                f'UPDATE "{table}" SET is_deleted=1 WHERE "{primary_key}"=?',
-                (key,))
-        self.conn.commit()
-        return len(missing)
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(f'SELECT "{primary_key}" FROM "{table}"')
+            existing = {r[0] for r in cur.fetchall()}
+            missing = existing - set(live_keys)
+            for key in missing:
+                cur.execute(
+                    f'UPDATE "{table}" SET is_deleted=1 WHERE "{primary_key}"=?',
+                    (key,))
+            self.conn.commit()
+            return len(missing)
 
     # -- bookmarks -------------------------------------------------------
 
     def get_bookmark(self, endpoint, reporting_period):
         """A bookmark is only valid for the period it was issued against."""
-        cur = self.conn.cursor()
-        cur.execute("SELECT bookmark FROM bookmarks WHERE endpoint=? "
-                    "AND reporting_period=?",
-                    (endpoint, reporting_period or ""))
-        row = cur.fetchone()
-        return row[0] if row else None
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT bookmark FROM bookmarks WHERE endpoint=? "
+                        "AND reporting_period=?",
+                        (endpoint, reporting_period or ""))
+            row = cur.fetchone()
+            return row[0] if row else None
 
     def set_bookmark(self, endpoint, reporting_period, bookmark, when=""):
         """Record a bookmark. Call only AFTER the rows are committed."""
         if not bookmark:
             return
-        self.conn.execute(
-            "INSERT INTO bookmarks (endpoint, reporting_period, bookmark, "
-            "updated_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(endpoint, reporting_period) DO UPDATE SET "
-            "bookmark=excluded.bookmark, updated_at=excluded.updated_at",
-            (endpoint, reporting_period or "", str(bookmark), when))
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO bookmarks (endpoint, reporting_period, bookmark, "
+                "updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(endpoint, reporting_period) DO UPDATE SET "
+                "bookmark=excluded.bookmark, updated_at=excluded.updated_at",
+                (endpoint, reporting_period or "", str(bookmark), when))
+            self.conn.commit()
 
     # -- run history -----------------------------------------------------
 
     def record_run(self, entity, reporting_period, mode, rows, date_range,
                    status, notes="", started_at=""):
-        self.conn.execute(
-            "INSERT INTO runs (started_at, entity, reporting_period, mode, "
-            "rows, date_range, status, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (started_at, entity, reporting_period or "", mode, rows,
-             date_range, status, notes))
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO runs (started_at, entity, reporting_period, mode, "
+                "rows, date_range, status, notes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (started_at, entity, reporting_period or "", mode, rows,
+                 date_range, status, notes))
+            self.conn.commit()
 
     def last_runs(self):
         """Most recent run per entity: {entity: sqlite3.Row}."""
-        cur = self.conn.cursor()
-        cur.execute("SELECT * FROM runs ORDER BY run_id DESC")
-        latest = {}
-        for row in cur.fetchall():
-            latest.setdefault(row["entity"], row)
-        return latest
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM runs ORDER BY run_id DESC")
+            latest = {}
+            for row in cur.fetchall():
+                latest.setdefault(row["entity"], row)
+            return latest
 
     # -- reads -----------------------------------------------------------
 
     def counts(self):
         """{table: live_row_count} for every table in the registry."""
-        cur = self.conn.cursor()
-        result = {}
-        for table, _pk, _cols in _tables():
-            cur.execute(f'SELECT COUNT(*) FROM "{table}" WHERE is_deleted=0')
-            result[table] = cur.fetchone()[0]
-        return result
+        with self._lock:
+            cur = self.conn.cursor()
+            result = {}
+            for table, _pk, _cols in _tables():
+                cur.execute(
+                    f'SELECT COUNT(*) FROM "{table}" WHERE is_deleted=0')
+                result[table] = cur.fetchone()[0]
+            return result
 
     def query(self, sql, params=()):
         """Run a read-only query and return a list of sqlite3.Row."""
-        cur = self.conn.cursor()
-        cur.execute(sql, params)
-        return cur.fetchall()
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute(sql, params)
+            return cur.fetchall()
 
     def scalar(self, sql, params=(), default=0):
         """First column of the first row, or default when NULL/absent."""

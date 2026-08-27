@@ -153,7 +153,10 @@ class ReportingClient:
     def _fetch_token(self):
         """POST the client credentials for a bearer token.
 
-        Raises ReportingError with no credential material in the message.
+        Raises ReportingError. The message includes the server's own OAuth
+        error fields when present - those name the actual problem (e.g.
+        invalid_client vs access_denied vs an audience mismatch) and are not
+        credential material. The client id/secret are never included.
         """
         try:
             resp = self.session.post(TOKEN_URL, timeout=REQUEST_TIMEOUT, json={
@@ -164,31 +167,52 @@ class ReportingClient:
             })
         except requests.RequestException as exc:
             raise ReportingError(f"Could not reach the token endpoint: {exc}")
+
+        detail = _oauth_error_detail(resp)
         if resp.status_code in (401, 403):
             raise ReportingError(
-                "Authentication failed - check the Client ID and Client "
-                "Secret. These come from Settings > Integration Tokens > "
-                "'Add client credential' (not 'Add access token').")
+                "Authentication failed"
+                + (f" ({detail})" if detail else "")
+                + ". Check the Client ID and Client Secret: they come from "
+                  "Skynamo insights > Settings > Integration Tokens > "
+                  "'Add client credential', NOT 'Add access token' (that "
+                  "button issues an x-api-key for the Public API instead). "
+                  "If the 'Add client credential' button is missing, the "
+                  "Reporting API add-on is probably not enabled on this "
+                  "subscription.")
         if not resp.ok:
             raise ReportingError(
-                f"Token request failed: HTTP {resp.status_code}")
+                f"Token request failed: HTTP {resp.status_code}"
+                + (f" - {detail}" if detail else ""))
         try:
             payload = resp.json()
         except ValueError:
             raise ReportingError("Token endpoint returned a malformed response.")
         if not payload.get("access_token"):
-            raise ReportingError("Token endpoint returned no access_token.")
+            raise ReportingError(
+                "Token endpoint returned no access_token"
+                + (f" - {detail}" if detail else ""))
         return payload
 
     def test_connection(self):
-        """Validate credentials cheaply. Returns (ok, message)."""
+        """Validate credentials. Returns (ok, message).
+
+        The token exchange is the authoritative check - if it succeeds the
+        credentials are good. The /v2/roles probe is informational only: it is
+        one of the endpoints the spec leaves undocumented, so a quirk there
+        must not report working credentials as a failure.
+        """
         try:
-            self.tokens.get()
+            payload = self.tokens.get()
         except ReportingError as exc:
             return False, str(exc)
-        rows, error = self._get(ROLES_ENDPOINT, {}, period=None)
+
+        # Documented minimum filter is an empty JSON object.
+        rows, error = self._get(ROLES_ENDPOINT, {"filter": "{}"}, period=None)
         if error:
-            return False, error
+            return True, ("Credentials OK (token issued), but the /v2/roles "
+                          f"probe failed: {error}. This may just be an "
+                          "endpoint quirk - try an extract.")
         return True, f"Connected. {len(rows)} role(s) visible."
 
     # -- requests --------------------------------------------------------
@@ -278,6 +302,28 @@ class ReportingClient:
         if endpoint is None:
             return [], f"Unknown filterable-field kind: {kind!r}"
         return self._get(endpoint, {"filter": "{}"}, period=None)
+
+
+def _oauth_error_detail(resp):
+    """Pull the server's OAuth error fields out of a failed token response.
+
+    Returns something like "invalid_client: Client authentication failed", or
+    "" when there is nothing useful. Only the documented OAuth error fields are
+    read - never the request body - so no credential material can leak.
+    """
+    try:
+        body = resp.json()
+    except (ValueError, AttributeError):
+        text = (getattr(resp, "text", "") or "").strip()
+        return text[:200] if text else ""
+    if not isinstance(body, dict):
+        return ""
+    code = str(body.get("error") or "").strip()
+    description = str(body.get("error_description")
+                      or body.get("message") or "").strip()
+    if code and description:
+        return f"{code}: {description}"[:200]
+    return (code or description)[:200]
 
 
 def _rows_from(body):
