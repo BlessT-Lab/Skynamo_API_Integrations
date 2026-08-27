@@ -168,8 +168,9 @@ class ReportingClient:
         except requests.RequestException as exc:
             raise ReportingError(f"Could not reach the token endpoint: {exc}")
 
-        detail = _oauth_error_detail(resp)
+        # Parsed only on the failure paths - the happy path parses once, below.
         if resp.status_code in (401, 403):
+            detail = _oauth_error_detail(resp)
             raise ReportingError(
                 "Authentication failed"
                 + (f" ({detail})" if detail else "")
@@ -181,6 +182,7 @@ class ReportingClient:
                   "Reporting API add-on is probably not enabled on this "
                   "subscription.")
         if not resp.ok:
+            detail = _oauth_error_detail(resp)
             raise ReportingError(
                 f"Token request failed: HTTP {resp.status_code}"
                 + (f" - {detail}" if detail else ""))
@@ -189,6 +191,7 @@ class ReportingClient:
         except ValueError:
             raise ReportingError("Token endpoint returned a malformed response.")
         if not payload.get("access_token"):
+            detail = _oauth_error_detail(resp)
             raise ReportingError(
                 "Token endpoint returned no access_token"
                 + (f" - {detail}" if detail else ""))
@@ -197,18 +200,30 @@ class ReportingClient:
     def test_connection(self):
         """Validate credentials. Returns (ok, message).
 
-        The token exchange is the authoritative check - if it succeeds the
-        credentials are good. The /v2/roles probe is informational only: it is
-        one of the endpoints the spec leaves undocumented, so a quirk there
-        must not report working credentials as a failure.
+        A token alone is not proof of access: the audience can be wrong, or the
+        credential can exist without being entitled to the Reporting add-on. In
+        both cases a token is issued and every data call then 401s. So an
+        auth-class failure on the probe is a genuine failure.
+
+        Anything else from the probe is only informational - /v2/roles is one of
+        the endpoints the spec leaves undocumented, so a quirk there must not
+        report working credentials as broken.
         """
         try:
-            payload = self.tokens.get()
+            self.tokens.get()
         except ReportingError as exc:
             return False, str(exc)
 
         # Documented minimum filter is an empty JSON object.
-        rows, error = self._get(ROLES_ENDPOINT, {"filter": "{}"}, period=None)
+        rows, error, status = self._get(ROLES_ENDPOINT, {"filter": "{}"},
+                                        period=None)
+        if error and status in (401, 403):
+            return False, (
+                f"A token was issued, but the API rejected it ({error}). That "
+                "is an audience or entitlement problem rather than a wrong "
+                "secret: the credential exists but is not permitted to read "
+                "the Reporting API. Ask Skynamo support to confirm the "
+                "Reporting/Analytics add-on is enabled for this credential.")
         if error:
             return True, ("Credentials OK (token issued), but the /v2/roles "
                           f"probe failed: {error}. This may just be an "
@@ -220,8 +235,9 @@ class ReportingClient:
     def _get(self, endpoint, params, period):
         """GET an endpoint with throttling, token refresh and backoff.
 
-        Returns (rows, error). rows is [] when error is set. Also records the
-        response's x-bookmark / x-date-range on self.
+        Returns (rows, error, status). rows is [] when error is set; status is
+        the HTTP status code when one was received, else None - callers need it
+        to tell an auth rejection from an endpoint quirk.
         """
         self.last_bookmark = None
         url = f"{ANALYTICS_BASE}{endpoint}"
@@ -233,7 +249,7 @@ class ReportingClient:
             try:
                 token = self.tokens.get()
             except ReportingError as exc:
-                return [], str(exc)
+                return [], str(exc), None
 
             headers = {"Authorization": f"Bearer {token}"}
             try:
@@ -243,7 +259,7 @@ class ReportingClient:
                 if attempt < self.retries:
                     self._sleep(2)
                     continue
-                return [], f"Connection error: {exc}"
+                return [], f"Connection error: {exc}", None
 
             # Token may have expired: refresh once and retry.
             if resp.status_code == 401 and not refreshed:
@@ -259,20 +275,21 @@ class ReportingClient:
                     continue
                 return [], ("Rate limit hit. The Reporting API allows only "
                             f"{_limit_text(period)} - wait and retry, or use a "
-                            "shorter reporting period.")
+                            "shorter reporting period."), resp.status_code
 
             if not resp.ok:
-                return [], f"HTTP {resp.status_code}: {resp.text[:200]}"
+                return ([], f"HTTP {resp.status_code}: {resp.text[:200]}",
+                        resp.status_code)
 
             self.last_date_range = resp.headers.get("x-date-range", "") or ""
             self.last_bookmark = resp.headers.get("x-bookmark")
             try:
                 body = resp.json()
             except ValueError:
-                return [], "Malformed JSON in the response."
-            return _rows_from(body), ""
+                return [], "Malformed JSON in the response.", resp.status_code
+            return _rows_from(body), "", resp.status_code
 
-        return [], "Request failed after retries."
+        return [], "Request failed after retries.", None
 
     def fetch(self, entity, reporting_period=None, bookmark=None,
               sub_entities=None, limit=None):
@@ -293,34 +310,42 @@ class ReportingClient:
         if bookmark and spec.get("bookmarkable"):
             params["bookmark"] = bookmark
 
-        rows, error = self._get(spec["endpoint"], params, period)
+        rows, error, _status = self._get(spec["endpoint"], params, period)
         return rows, getattr(self, "last_bookmark", None), self.last_date_range, error
 
     def fetch_filterable_fields(self, kind):
-        """Discover an instance's filterable customer/product custom fields."""
+        """Discover an instance's filterable customer/product custom fields.
+
+        Returns (rows, error).
+        """
         endpoint = FILTERABLE_FIELDS_ENDPOINTS.get(kind)
         if endpoint is None:
             return [], f"Unknown filterable-field kind: {kind!r}"
-        return self._get(endpoint, {"filter": "{}"}, period=None)
+        rows, error, _status = self._get(endpoint, {"filter": "{}"},
+                                         period=None)
+        return rows, error
 
 
 def _oauth_error_detail(resp):
     """Pull the server's OAuth error fields out of a failed token response.
 
     Returns something like "invalid_client: Client authentication failed", or
-    "" when there is nothing useful. Only the documented OAuth error fields are
-    read - never the request body - so no credential material can leak.
+    "" when there is nothing useful.
+
+    ONLY the two standard OAuth error fields are read. Deliberately not the raw
+    body and not a generic `message` field: a gateway in front of the token
+    endpoint can reject a request by echoing it back, and the request body
+    contains the client_id and client_secret. Splicing that into an exception
+    would put credentials into the GUI log and any saved report.
     """
     try:
         body = resp.json()
     except (ValueError, AttributeError):
-        text = (getattr(resp, "text", "") or "").strip()
-        return text[:200] if text else ""
+        return ""
     if not isinstance(body, dict):
         return ""
     code = str(body.get("error") or "").strip()
-    description = str(body.get("error_description")
-                      or body.get("message") or "").strip()
+    description = str(body.get("error_description") or "").strip()
     if code and description:
         return f"{code}: {description}"[:200]
     return (code or description)[:200]

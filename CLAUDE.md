@@ -49,7 +49,10 @@ py test_reporting_client.py                                  # OAuth/token/throt
 py test_report_store.py                                      # SQLite schema/upsert/bookmarks (in-memory)
 py test_report_engine.py                                     # extract plan/run (fake client, offline)
 py test_dashboard.py                                         # HTML dashboard render + escaping (offline)
+py test_diag_redaction.py                                    # asserts the auth diagnostic leaks no secrets (offline)
 py test_gui_smoke.py                                         # builds the GUI (all five tabs) and tears it down
+py diag_reporting_auth.py                                    # diagnose a Reporting API auth failure (read-only, needs creds)
+py live_check_reporting.py                                   # verify entity payloads vs the registry (read-only, needs creds)
 py -m pip install -r requirements-build.txt && build.bat     # -> dist/SkynamoGeo.exe (PyInstaller)
 ```
 
@@ -111,8 +114,15 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
   `Retry-After`. Credentials never appear in a log or exception.
 - `skynamo_geo/report_store.py` — `ReportStore`, SQLite at `%APPDATA%/SkynamoGeo/reporting.db`
   (stdlib `sqlite3`, no new dependency). Schema generated from the registry; `upsert_entity` is
-  idempotent and stores nested sub-entity rows; bookmarks keyed `(endpoint, reporting_period)`;
-  `runs` table is the tool's only persistent history; `reconcile` soft-deletes via `is_deleted`.
+  idempotent, stores nested sub-entity rows, and commits the root **and** its children in one
+  transaction; bookmarks keyed `(endpoint, reporting_period)`; `runs` table is the tool's only
+  persistent history; `reconcile` soft-deletes via `is_deleted`.
+  **Threading:** one instance is usable from several threads (the GUI creates it on one worker and
+  reads it from the main thread and others). Writes serialise on a re-entrant lock; **reads open
+  their own short-lived connection and take no lock**, so a label refresh on the main thread can
+  never freeze the UI behind a bulk upsert. WAL + `busy_timeout` cover concurrency between separate
+  connections/processes. The lock guards the instance, not the file. `query()` is read-only by
+  contract — it may run on a private connection, so a write through it would not commit.
 - `skynamo_geo/report_engine.py` — same two-phase shape: `plan_extract(...)` (reads bookmarks,
   estimates the rate-limit budget, **no network calls**) → `run_extract(...)` (fetch → upsert →
   record run → **then** store the bookmark).
@@ -202,6 +212,17 @@ never gets a stray database.
 - **camelCase vs snake_case**: `VisitExtended`/`RfmVisit` use camelCase, everything else snake_case.
   `report_store.normalise_key` is the single funnel; never index a payload key directly.
 - **The token lifetime is undocumented** — trust `expires_in`, refresh on `401`, never hard-code.
+- **A token is not proof of access.** A wrong `audience` or a credential without the paid add-on
+  still gets a token; every data call then `401`s. `test_connection` therefore treats a `401`/`403`
+  from its probe as a real failure, and anything else as a caveat (`/v2/roles` is one of the
+  undocumented endpoints). `_get` returns the status code so callers can tell those apart.
+- **Never splice a token-endpoint body into an error.** A gateway can reject by echoing the request
+  back, and the request body holds the client id and secret. `_oauth_error_detail` reads *only* the
+  standard `error`/`error_description` fields — not the raw text, not a generic `message`.
+- **`diag_reporting_auth.py` output is shareable only because it redacts** — bearer tokens, the
+  id/secret (shown as length + digest), the JWT `sub`/`azp` (which carry the Client ID), and all row
+  values. `test_diag_redaction.py` enforces that with canary values; keep it passing if you touch
+  the script.
 
 ## Working agreements
 

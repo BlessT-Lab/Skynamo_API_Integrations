@@ -81,7 +81,10 @@ GeoLocation_Script/
   test_report_store.py      # SQLite schema/upsert/bookmarks (in-memory, offline)
   test_report_engine.py     # extract plan/run (fake client, offline)
   test_dashboard.py         # HTML dashboard render + escaping (offline)
+  test_diag_redaction.py    # asserts the auth diagnostic leaks no secrets (offline)
   test_gui_smoke.py         # builds the GUI (all five tabs) without interaction
+  diag_reporting_auth.py    # diagnose a Reporting API auth failure (read-only)
+  live_check_reporting.py   # verify entity payloads against the registry (read-only)
   skynamo_swagger.json      # downloaded Skynamo API spec (reference only)
   docs/                     # Skynamo API knowledge articles (see section 5)
   README.md                 # this file
@@ -387,8 +390,13 @@ py test_reporting_client.py  # OAuth token cache/refresh, 401 retry, 429 backoff
 py test_report_store.py      # schema from registry, idempotent upsert, period-scoped bookmarks
 py test_report_engine.py     # plan makes no calls; bookmark advances only after a commit
 py test_dashboard.py         # renders from a seeded store; self-contained; escapes instance text
+py test_diag_redaction.py    # the auth diagnostic never prints a token, secret or row value
 py test_gui_smoke.py     # GUI (all five tabs) builds and tears down cleanly
 ```
+
+If a Reporting API connection fails, `py diag_reporting_auth.py` shows the token
+exchange and endpoint probes in detail. Its output is redacted (tokens,
+credentials, identifying JWT claims and row values) so it can be shared.
 Every suite is offline: fake clients/sessions, in-memory SQLite, and byte
 fixtures in temp folders — no network and no real credentials. They assert the
 things that matter structurally: preview/plan phases write nothing and make no
@@ -527,6 +535,30 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.8.1** (2026-08-27) — **Reporting fixes found in review.**
+  - **Cross-thread SQLite crash.** The Reporting tab created the store on the
+    connect worker and then used it from the main thread and other workers,
+    which raised *"SQLite objects created in a thread can only be used in that
+    same thread"* on Plan Extract. Writes now serialise on a re-entrant lock and
+    **reads open their own connection**, so a label refresh can't freeze the UI
+    behind a bulk upsert; WAL + `busy_timeout` cover separate connections.
+  - **`upsert_entity` is now one transaction** — a failure part way through a
+    sub-entity no longer leaves a root row (e.g. activities with no order lines).
+  - **A token is no longer mistaken for access.** A wrong audience or a
+    credential without the paid add-on still gets a token, then every data call
+    401s; connecting reported "Connected" anyway. A `401`/`403` on the probe is
+    now a real failure with an explanation, while other probe errors stay a
+    caveat.
+  - **Token errors now name the cause** (`invalid_client`, `access_denied`, an
+    audience mismatch) instead of a generic "Authentication failed" — read from
+    the standard OAuth fields only, never the raw body, which a gateway can echo
+    the request (and therefore the secret) into.
+  - **New `diag_reporting_auth.py`** — read-only auth diagnostic that shows the
+    token exchange and probes, with bearer tokens, credentials, the JWT
+    `sub`/`azp` and all row values **redacted** so the output can be shared.
+    `test_diag_redaction.py` enforces that with canary values.
+  - `test_gui_smoke.py` no longer depends on whether a real `%APPDATA%` store
+    happens to exist (it passed on a clean machine and failed on a used one).
 - **v2.8.0** (2026-08-27) — **Product images in the CLI.** The CLI now opens with
   a feature menu — `geo`, `images`, `manage` — or takes the feature as an
   argument (`py skynamo_geolocation.py images`) to skip it; `--help` prints usage.

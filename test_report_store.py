@@ -5,7 +5,9 @@ no files left behind."""
 
 import os
 import shutil
+import sqlite3
 import tempfile
+import threading
 
 from skynamo_geo.report_store import (
     ReportStore, normalise_key, normalise_row, default_store_path,
@@ -227,5 +229,96 @@ try:
     remote.close()
 finally:
     shutil.rmtree(tmpdir, ignore_errors=True)
+
+# --- upsert_entity is one transaction -----------------------------------
+# A failure part way through a sub-entity must not leave the root rows behind.
+tmpdir2 = tempfile.mkdtemp(prefix="skynamo_store_atomic_")
+try:
+    atomic = ReportStore(os.path.join(tmpdir2, "atomic.db"))
+
+    good = {
+        "activity_id": "ok1", "activity_type": "Visit",
+        "visits": [{"activity_id": "ok1", "duration_sec": 30}],
+    }
+    atomic.upsert_entity("activities", [good])
+    assert atomic.scalar("SELECT COUNT(*) FROM activities") == 1
+
+    # Make the SECOND table's write blow up, after the root has been written.
+    original = atomic._write_rows
+    calls = {"n": 0}
+
+    def exploding(table, primary_key, columns, rows):
+        calls["n"] += 1
+        if calls["n"] == 2:            # the sub-entity write
+            raise sqlite3.OperationalError("simulated failure")
+        return original(table, primary_key, columns, rows)
+
+    atomic._write_rows = exploding
+    try:
+        atomic.upsert_entity("activities", [{
+            "activity_id": "bad1", "activity_type": "Visit",
+            "visits": [{"activity_id": "bad1", "duration_sec": 60}],
+        }])
+        raise AssertionError("expected the simulated failure to propagate")
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        atomic._write_rows = original
+
+    # The root row must have been rolled back with its children.
+    assert atomic.scalar(
+        "SELECT COUNT(*) FROM activities WHERE activity_id='bad1'") == 0, \
+        "root rows must roll back when a sub-entity write fails"
+    assert atomic.scalar(
+        "SELECT COUNT(*) FROM activity_visits WHERE activity_id='bad1'") == 0
+    # ...and the earlier good data is untouched
+    assert atomic.scalar("SELECT COUNT(*) FROM activities") == 1
+    atomic.close()
+finally:
+    shutil.rmtree(tmpdir2, ignore_errors=True)
+
+# --- a read does not wait behind a long write ---------------------------
+# Regression: reads used to take the same lock as writes, so a label refresh on
+# the Tk main thread could freeze the UI for the length of a bulk upsert.
+tmpdir3 = tempfile.mkdtemp(prefix="skynamo_store_nonblock_")
+try:
+    nb = ReportStore(os.path.join(tmpdir3, "nonblock.db"))
+    assert not nb._memory
+
+    holding = threading.Event()
+    release = threading.Event()
+    read_done = threading.Event()
+
+    def long_write():
+        # Hold the write lock, as a bulk upsert does.
+        with nb._lock:
+            holding.set()
+            release.wait(timeout=10)
+
+    writer = threading.Thread(target=long_write)
+    writer.start()
+    assert holding.wait(timeout=5), "writer never acquired the lock"
+
+    def reader():
+        nb.counts()          # must not block on the held write lock
+        nb.last_runs()
+        nb.get_bookmark("/v2/products", "")
+        read_done.set()
+
+    r = threading.Thread(target=reader)
+    r.start()
+    assert read_done.wait(timeout=5), \
+        "a read blocked while the write lock was held - the GUI would freeze"
+    release.set()
+    writer.join(timeout=5)
+    r.join(timeout=5)
+
+    # an in-memory store cannot reopen, so it legitimately shares the lock
+    mem = ReportStore(":memory:")
+    assert mem._memory and mem.counts() is not None
+    mem.close()
+    nb.close()
+finally:
+    shutil.rmtree(tmpdir3, ignore_errors=True)
 
 print("All report store tests passed")

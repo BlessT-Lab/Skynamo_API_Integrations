@@ -251,5 +251,78 @@ session9 = FakeSession(get_responses=[FakeResponse(200, [{"roleId": 1}])])
 c9 = ReportingClient("id", SECRET, session=session9, sleep=lambda s: None)
 ok, message = c9.test_connection()
 assert ok is True and "1 role" in message
+# the probe sends the documented minimum filter
+assert session9.gets[0]["params"] == {"filter": "{}"}
+
+# --- a token that the API then REJECTS must not report as connected -------
+# Regression: a wrong audience or an unentitled credential still yields a
+# token, then every data call 401s. Reporting that as "Connected" sends the
+# user off to run extracts that cannot possibly work.
+for bad_status in (401, 403):
+    # two 401s: the client refreshes once, then gives up
+    session = FakeSession(get_responses=[FakeResponse(bad_status),
+                                        FakeResponse(bad_status),
+                                        FakeResponse(bad_status)])
+    client = ReportingClient("id", SECRET, session=session,
+                             sleep=lambda s: None)
+    ok, message = client.test_connection()
+    assert ok is False, f"{bad_status} probe must fail the connection"
+    assert "audience or entitlement" in message, message
+    assert "add-on" in message
+
+# ...but a NON-auth probe failure is only a caveat, since /v2/roles is one of
+# the undocumented endpoints and may simply be quirky.
+session_quirk = FakeSession(get_responses=[FakeResponse(400, text="odd")])
+c_quirk = ReportingClient("id", SECRET, session=session_quirk,
+                          sleep=lambda s: None)
+ok, message = c_quirk.test_connection()
+assert ok is True, "a 400 from the probe should not block the user"
+assert "Credentials OK" in message and "quirk" in message
+
+# --- _get returns the status code so callers can tell those cases apart ---
+session_st = FakeSession(get_responses=[FakeResponse(200, [{"a": 1}])])
+c_st = ReportingClient("id", SECRET, session=session_st, sleep=lambda s: None)
+rows, error, status = c_st._get("/v2/roles", {}, period=None)
+assert rows == [{"a": 1}] and error == "" and status == 200
+session_st2 = FakeSession(get_responses=[FakeResponse(500, text="boom")])
+c_st2 = ReportingClient("id", SECRET, session=session_st2, sleep=lambda s: None)
+rows, error, status = c_st2._get("/v2/roles", {}, period=None)
+assert rows == [] and status == 500 and "500" in error
+
+# fetch_filterable_fields still returns a 2-tuple for its callers
+session_ff = FakeSession(get_responses=[FakeResponse(200, [{"fieldId": 1}])])
+c_ff = ReportingClient("id", SECRET, session=session_ff, sleep=lambda s: None)
+rows, error = c_ff.fetch_filterable_fields("customer")
+assert rows == [{"fieldId": 1}] and error == ""
+rows, error = c_ff.fetch_filterable_fields("nonsense")
+assert rows == [] and "Unknown filterable-field kind" in error
+
+# --- token errors surface the server's OAuth detail, never the request ----
+session_detail = FakeSession(token_responses=[FakeResponse(
+    401, {"error": "invalid_client",
+          "error_description": "Client authentication failed"})])
+c_detail = ReportingClient("id", SECRET, session=session_detail,
+                           sleep=lambda s: None)
+ok, message = c_detail.test_connection()
+assert ok is False
+assert "invalid_client" in message and "Client authentication failed" in message
+assert SECRET not in message
+
+# A gateway that rejects by echoing the request must NOT have that echoed on:
+# the body would contain client_id and client_secret.
+echoed = {"message": f'Invalid request body: {{"client_secret":"{SECRET}"}}'}
+session_echo = FakeSession(token_responses=[FakeResponse(400, echoed)])
+c_echo = ReportingClient("id", SECRET, session=session_echo,
+                         sleep=lambda s: None)
+ok, message = c_echo.test_connection()
+assert ok is False
+assert SECRET not in message, "must not splice an echoed request into the error"
+# same for a non-JSON echo
+session_echo2 = FakeSession(token_responses=[
+    FakeResponse(400, _MALFORMED, text=f'client_secret={SECRET}')])
+c_echo2 = ReportingClient("id", SECRET, session=session_echo2,
+                          sleep=lambda s: None)
+ok, message = c_echo2.test_connection()
+assert ok is False and SECRET not in message
 
 print("All reporting client tests passed")

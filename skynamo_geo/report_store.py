@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import threading
+from contextlib import contextmanager
 
 from .reporting_config import REPORTING_ENTITIES, STORE_FILENAME
 from .settings import _config_dir
@@ -57,6 +58,22 @@ def _coerce(value):
     return str(value)
 
 
+def _child_rows(normalised, spec, api_name, sub):
+    """Pull one sub-entity's nested rows out of already-normalised parents."""
+    key = normalise_key(api_name)
+    rows = []
+    for parent in normalised:
+        nested = parent.get(key) or parent.get(api_name)
+        if not isinstance(nested, list):
+            continue
+        parent_value = parent.get(spec["primary_key"])
+        for child in nested:
+            child_norm = normalise_row(child)
+            child_norm.setdefault(sub["parent_key"], parent_value)
+            rows.append(child_norm)
+    return rows
+
+
 def _tables():
     """Yield (table_name, primary_key, columns) for every root and sub-entity."""
     for spec in REPORTING_ENTITIES.values():
@@ -68,24 +85,69 @@ def _tables():
 class ReportStore:
     """Read/write access to the local extract database.
 
-    Safe to use from more than one thread. The GUI needs this: the store is
-    created on the connect worker, the extract runs on another worker, and the
-    store/dashboard labels are rendered on the main thread. A sqlite3
-    connection is bound to its creating thread by default, so sharing one would
-    raise "SQLite objects created in a thread can only be used in that same
-    thread". We therefore drop that check and serialise every operation on a
-    re-entrant lock instead - SQLite is fine with serialised access, and the
-    lock has to be re-entrant because upsert_entity() calls upsert().
+    One instance is safe to use from several threads, which the GUI needs: the
+    store is created on the connect worker, extracts run on other workers, and
+    the store/dashboard labels render on the Tk main thread. A sqlite3
+    connection is bound to its creating thread by default, so sharing one
+    raised "SQLite objects created in a thread can only be used in that same
+    thread".
+
+    How that is handled, and the limits of it:
+
+    * Writes go through one connection, serialised on a re-entrant lock. It has
+      to be re-entrant because upsert() is called while the entity-level lock
+      is already held.
+    * Reads open their own short-lived connection instead of taking that lock,
+      so a label refresh on the main thread cannot freeze the UI behind a bulk
+      upsert on a worker. (An in-memory store cannot be reopened, so there
+      reads fall back to the shared connection under the lock.)
+    * WAL mode lets those readers run while a write is in progress, and
+      busy_timeout stops a concurrent writer failing instantly.
+
+    The lock guards THIS INSTANCE, not the file: two ReportStore objects, or
+    two copies of the app, are separate connections and rely on SQLite's own
+    locking - which is what WAL and busy_timeout above are for.
     """
+
+    # Wait this long for another writer before raising "database is locked".
+    BUSY_TIMEOUT_MS = 10_000
 
     def __init__(self, path=None):
         self.path = path or default_store_path()
-        if self.path != ":memory:":
+        self._memory = self.path == ":memory:"
+        if not self._memory:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         self._lock = threading.RLock()
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self.conn = self._connect()
         self.ensure_schema()
+
+    def _connect(self):
+        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={self.BUSY_TIMEOUT_MS}")
+        if not self._memory:
+            # WAL: readers do not block on the writer, which is what keeps the
+            # main thread responsive during an extract.
+            conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    @contextmanager
+    def _reading(self):
+        """Yield a connection for a read.
+
+        File-backed: a private short-lived connection, so reads never wait on
+        the write lock. In-memory: the shared connection, under the lock, since
+        ":memory:" cannot be reopened.
+        """
+        if self._memory:
+            with self._lock:
+                yield self.conn
+            return
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def close(self):
         with self._lock:
@@ -96,9 +158,9 @@ class ReportStore:
     def ensure_schema(self):
         """Create any missing tables. Safe to call every startup."""
         with self._lock:
-            self._ensure_schema_locked()
+            self._create_tables()
 
-    def _ensure_schema_locked(self):
+    def _create_tables(self):
         cur = self.conn.cursor()
         for table, pk, columns in _tables():
             cols = [f'"{name}" {sql_type}' for name, sql_type in columns.items()]
@@ -138,6 +200,21 @@ class ReportStore:
     def upsert(self, table, primary_key, columns, rows):
         """Insert or update rows by primary key. Returns the number written.
 
+        Commits on success, rolls back on failure. Use _write_rows directly to
+        batch several tables into one transaction.
+        """
+        with self._lock:
+            try:
+                written = self._write_rows(table, primary_key, columns, rows)
+            except Exception:
+                self.conn.rollback()
+                raise
+            self.conn.commit()
+            return written
+
+    def _write_rows(self, table, primary_key, columns, rows):
+        """Upsert rows without committing. Caller holds the lock.
+
         Unknown keys in a row are ignored (the API can return more than the
         registry declares); missing ones are left NULL. Rows with no primary
         key value are skipped rather than silently colliding on NULL.
@@ -155,18 +232,15 @@ class ReportStore:
                f'INSERT OR REPLACE INTO "{table}" ({quoted}) '
                f'VALUES ({placeholders})')
 
-        with self._lock:
-            cur = self.conn.cursor()
-            written = 0
-            for row in rows:
-                norm = normalise_row(row)
-                if norm.get(primary_key) in (None, ""):
-                    continue
-                values = [_coerce(norm.get(c)) for c in known]
-                cur.execute(sql, values)
-                written += 1
-            self.conn.commit()
-            return written
+        cur = self.conn.cursor()
+        written = 0
+        for row in rows:
+            norm = normalise_row(row)
+            if norm.get(primary_key) in (None, ""):
+                continue
+            cur.execute(sql, [_coerce(norm.get(c)) for c in known])
+            written += 1
+        return written
 
     def upsert_entity(self, entity, rows):
         """Upsert a root entity's rows plus any nested sub-entity rows.
@@ -174,35 +248,30 @@ class ReportStore:
         Returns {table: rows_written}. Sub-entity rows arrive nested inside each
         root row (that is what `entities` expansion returns), and are linked
         back via the sub-entity's parent_key.
+
+        The root and all of its children go in ONE transaction: a failure part
+        way through a sub-entity would otherwise leave, say, activities stored
+        with no order lines.
         """
         spec = REPORTING_ENTITIES[entity]
-        written = {}
         normalised = [normalise_row(r) for r in rows]
+        written = {}
 
-        # One lock for the whole entity so a root and its children commit
-        # together rather than interleaving with another thread's extract.
         with self._lock:
-            return self._upsert_entity_locked(entity, spec, normalised, written)
-
-    def _upsert_entity_locked(self, entity, spec, normalised, written):
-        written[spec["table"]] = self.upsert(
-            spec["table"], spec["primary_key"], spec["columns"], normalised)
-
-        for api_name, sub in (spec.get("sub_entities") or {}).items():
-            key = normalise_key(api_name)
-            child_rows = []
-            for parent in normalised:
-                nested = parent.get(key) or parent.get(api_name)
-                if not isinstance(nested, list):
-                    continue
-                parent_value = parent.get(spec["primary_key"])
-                for child in nested:
-                    child_norm = normalise_row(child)
-                    child_norm.setdefault(sub["parent_key"], parent_value)
-                    child_rows.append(child_norm)
-            if child_rows:
-                written[sub["table"]] = self.upsert(
-                    sub["table"], sub["primary_key"], sub["columns"], child_rows)
+            try:
+                written[spec["table"]] = self._write_rows(
+                    spec["table"], spec["primary_key"], spec["columns"],
+                    normalised)
+                for api_name, sub in (spec.get("sub_entities") or {}).items():
+                    child_rows = _child_rows(normalised, spec, api_name, sub)
+                    if child_rows:
+                        written[sub["table"]] = self._write_rows(
+                            sub["table"], sub["primary_key"], sub["columns"],
+                            child_rows)
+            except Exception:
+                self.conn.rollback()
+                raise
+            self.conn.commit()
         return written
 
     def reconcile(self, table, primary_key, live_keys):
@@ -227,12 +296,11 @@ class ReportStore:
 
     def get_bookmark(self, endpoint, reporting_period):
         """A bookmark is only valid for the period it was issued against."""
-        with self._lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT bookmark FROM bookmarks WHERE endpoint=? "
-                        "AND reporting_period=?",
-                        (endpoint, reporting_period or ""))
-            row = cur.fetchone()
+        with self._reading() as conn:
+            row = conn.execute(
+                "SELECT bookmark FROM bookmarks WHERE endpoint=? "
+                "AND reporting_period=?",
+                (endpoint, reporting_period or "")).fetchone()
             return row[0] if row else None
 
     def set_bookmark(self, endpoint, reporting_period, bookmark, when=""):
@@ -263,11 +331,9 @@ class ReportStore:
 
     def last_runs(self):
         """Most recent run per entity: {entity: sqlite3.Row}."""
-        with self._lock:
-            cur = self.conn.cursor()
-            cur.execute("SELECT * FROM runs ORDER BY run_id DESC")
+        with self._reading() as conn:
             latest = {}
-            for row in cur.fetchall():
+            for row in conn.execute("SELECT * FROM runs ORDER BY run_id DESC"):
                 latest.setdefault(row["entity"], row)
             return latest
 
@@ -275,21 +341,23 @@ class ReportStore:
 
     def counts(self):
         """{table: live_row_count} for every table in the registry."""
-        with self._lock:
-            cur = self.conn.cursor()
-            result = {}
-            for table, _pk, _cols in _tables():
-                cur.execute(
-                    f'SELECT COUNT(*) FROM "{table}" WHERE is_deleted=0')
-                result[table] = cur.fetchone()[0]
-            return result
+        with self._reading() as conn:
+            return {
+                table: conn.execute(
+                    f'SELECT COUNT(*) FROM "{table}" WHERE is_deleted=0'
+                ).fetchone()[0]
+                for table, _pk, _cols in _tables()
+            }
 
     def query(self, sql, params=()):
-        """Run a read-only query and return a list of sqlite3.Row."""
-        with self._lock:
-            cur = self.conn.cursor()
-            cur.execute(sql, params)
-            return cur.fetchall()
+        """Run a READ query and return a list of sqlite3.Row.
+
+        Reads only - this may run on a private connection, so a statement that
+        writes would not be committed. Use the upsert/bookmark/run methods to
+        change anything.
+        """
+        with self._reading() as conn:
+            return conn.execute(sql, params).fetchall()
 
     def scalar(self, sql, params=(), default=0):
         """First column of the first row, or default when NULL/absent."""
