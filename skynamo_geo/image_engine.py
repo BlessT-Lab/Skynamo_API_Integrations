@@ -16,9 +16,10 @@ should_cancel(), the same contracts the GUI worker thread already drives.
 """
 
 import base64
-import csv
 import os
 
+from . import reports
+from .reports import summarize  # re-exported: callers use image_engine.summarize
 from .config import (
     ATTACHED_IMAGE_REPORT_FIELDNAMES, IMAGE_REPORT_FIELDNAMES,
     STATUS_ATT_DELETE_FAILED, STATUS_ATT_DELETED, STATUS_ATT_FETCH_FAILED,
@@ -254,21 +255,9 @@ def _append_note(notes, extra):
     return (notes + "; " if notes else "") + extra
 
 
-def summarize(plans):
-    """Count plans by status for a summary display."""
-    counts = {}
-    for plan in plans:
-        counts[plan.status] = counts.get(plan.status, 0) + 1
-    return counts
-
-
 def write_report(report_rows, path, fieldnames=IMAGE_REPORT_FIELDNAMES):
     """Write report rows to a CSV at path (defaults to the upload columns)."""
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(report_rows)
-    return path
+    return reports.write_report(report_rows, path, fieldnames)
 
 
 # ---------------------------------------------------------------------------

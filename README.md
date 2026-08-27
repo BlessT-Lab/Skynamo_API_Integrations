@@ -1,16 +1,28 @@
 # Skynamo Toolkit
 
-A desktop + CLI tool for bulk operations against a Skynamo instance's public API.
-Two features, each with a **preview step** so you approve results before anything
-is committed:
+A desktop + CLI tool for bulk operations and reporting against a Skynamo instance.
+Each data-changing feature has a **preview step** so you approve results before
+anything is committed:
 
 1. **Customer geolocation** — fills in customer **latitude/longitude** by geocoding
    their address fields via **OpenStreetMap (Nominatim)** (free, no API key).
 2. **Product image import** — matches local image files to products by the **product
    code** in the filename and uploads them, with an optional *replace existing* mode
    and a separate tab for **viewing and removing** images already on a product.
+3. **Reporting** — extracts business data from Skynamo's **Reporting API** into a
+   local SQLite store, using bookmark deltas so you never re-pull what you already
+   have. See [§12](#12-reporting).
+4. **Dashboards** — builds a self-contained, shareable **HTML dashboard** from that
+   store. See [§13](#13-dashboards).
 
-The desktop GUI has a tab per feature; the CLI covers geolocation.
+The desktop GUI has a tab per feature (five tabs); the CLI covers geolocation.
+
+> **This tool talks to two different Skynamo APIs.** Features 1–2 use the **Public
+> API** (`api.skynamo.me/v1`, API-key auth, included in your subscription). Feature 3
+> uses the **Reporting API** (`analytics-api.svc.skynamo.me`, OAuth2 client
+> credentials, read-only, and a **paid add-on**). They are separate products with
+> separate credentials — [§12.1](#121-how-it-differs-from-the-public-api) explains why
+> that matters.
 
 ---
 
@@ -47,6 +59,12 @@ GeoLocation_Script/
     products.py             # image helpers (filename parsing, code escaping, matching, format sniff)
     engine.py               # geocode_customers + write_locations + report (geolocation core)
     image_engine.py         # scan_images + upload_images + list_attached_images + delete_selected_images (product-image core)
+    reports.py              # shared summarize() + write_report() used by every engine
+    reporting_config.py     # Reporting API registry: endpoints, periods, rate limits, entities
+    reporting_client.py     # ReportingClient: OAuth2 token cache, per-period throttle, filter builder
+    report_store.py         # ReportStore: SQLite schema/upsert/bookmarks/run history
+    report_engine.py        # plan_extract + run_extract (reporting core)
+    dashboard.py            # build_dashboard -> one self-contained HTML file
     settings.py             # non-secret config JSON (no credentials stored)
   gui.py                    # CustomTkinter desktop app, a tab per feature (entry point for the .exe)
   skynamo_geolocation.py    # CLI front-end for geolocation (thin wrapper over the engine)
@@ -57,8 +75,13 @@ GeoLocation_Script/
   test_geocoder.py          # OSM precision mapping + query building (offline)
   test_products.py          # image filename parsing/escaping/matching (offline)
   test_image_engine.py      # image engine preview/commit (mocked client, offline)
-  test_gui_smoke.py         # builds the GUI (both tabs) without interaction
+  test_reporting_client.py  # OAuth/token/throttle/filter building (fake session, offline)
+  test_report_store.py      # SQLite schema/upsert/bookmarks (in-memory, offline)
+  test_report_engine.py     # extract plan/run (fake client, offline)
+  test_dashboard.py         # HTML dashboard render + escaping (offline)
+  test_gui_smoke.py         # builds the GUI (all five tabs) without interaction
   skynamo_swagger.json      # downloaded Skynamo API spec (reference only)
+  docs/                     # Skynamo API knowledge articles (see section 5)
   README.md                 # this file
 ```
 
@@ -162,6 +185,27 @@ earlier version saved to the Windows Credential Manager are purged on startup.
   not deletable via the public API.
 
 The full spec is saved in `skynamo_swagger.json` for reference.
+
+### Further reading — the knowledge articles in `docs/`
+
+The notes above cover only the slice of the API this toolkit uses. Three standalone articles document
+the wider picture:
+
+- **[Skynamo Public API — Complete Reference](docs/skynamo-public-api-guide.md)** — all 62 paths and
+  118 operations of `v1.0.28`: connecting, pagination, the filter syntax, write semantics, files,
+  custom fields, an explicit can/cannot list, troubleshooting, and a full field reference for every
+  schema.
+- **[Pulling Skynamo data for BI with the Public API](docs/skynamo-public-api-for-bi.md)** — the
+  extraction-capability matrix, three delta tiers, the `row_version` watermark pattern, Python and
+  Power Query extractors, and a dimensional model.
+- **[Skynamo Reporting API and the Power BI Connector](docs/skynamo-reporting-api-and-powerbi.md)** —
+  the *separate, paid* Analytics API (`v2.0`): OAuth2 client-credentials, its filter query language,
+  reporting periods, bookmark-based deltas, published rate limits, and the official Power BI
+  connector.
+
+> `skynamo_swagger.json` is `v1.0.27`; the articles are written against the live `v1.0.28`
+> (`https://apidocs.skynamo.com/swagger_2.0.1023_1.0.28.json`). The only differences are
+> `DELETE /visitfrequencies` and the `ignore_deals` flag on `/dealgroups`.
 
 ---
 
@@ -323,15 +367,22 @@ py test_engine.py        # geolocation engine: plan statuses, no-write-in-previe
 py test_geocoder.py      # OSM precision mapping + query building
 py test_products.py      # image filename parsing/escaping/matching/format sniff
 py test_image_engine.py  # image engine: match/upload, replace mode, list/remove attached images
-py test_gui_smoke.py     # GUI (both tabs) builds and tears down cleanly
+py test_reporting_client.py  # OAuth token cache/refresh, 401 retry, 429 backoff, throttle, filters
+py test_report_store.py      # schema from registry, idempotent upsert, period-scoped bookmarks
+py test_report_engine.py     # plan makes no calls; bookmark advances only after a commit
+py test_dashboard.py         # renders from a seeded store; self-contained; escapes instance text
+py test_gui_smoke.py     # GUI (all five tabs) builds and tears down cleanly
 ```
-The engine tests use a fake client (and fake geocoder) — no network, no real API
-keys — and assert that preview writes/uploads nothing and only approved rows are
-committed. `test_products`/`test_image_engine` build byte fixtures in a temp
-folder.
+Every suite is offline: fake clients/sessions, in-memory SQLite, and byte
+fixtures in temp folders — no network and no real credentials. They assert the
+things that matter structurally: preview/plan phases write nothing and make no
+API calls, only approved rows are committed, bookmarks never advance before their
+rows commit, and the dashboard never references an external resource.
 
-**Not yet automated:** a true end-to-end run against a live Skynamo test
-instance. Use each tab's preview step to eyeball results before committing.
+**Not yet automated:** a true end-to-end run against a live Skynamo instance. Use
+each tab's preview/plan step to eyeball results before committing, and see
+[§12.2](#122-credentials) for the Reporting API credentials needed to try that
+side at all.
 
 ---
 
@@ -350,11 +401,132 @@ instance. Use each tab's preview step to eyeball results before committing.
 - **Product images in the CLI**: `skynamo_geolocation.py` covers geolocation only
   today; `image_engine` + `products` are UI-agnostic, so a CLI flow can be added
   with no core changes.
+- **More reporting entities**: add an entry to `REPORTING_ENTITIES` in
+  `skynamo_geo/reporting_config.py` — the client, store schema and extract engine
+  all drive off that registry, so no other code changes.
 
 ---
 
-## 11. Change log
+## 12. Reporting
 
+The **Reporting** tab extracts business data into a local database, which the
+Dashboards tab then reads. It uses Skynamo's **Reporting API** — a different
+product from the Public API the rest of this tool uses.
+
+### 12.1 How it differs from the Public API
+
+| | Public API | Reporting API |
+|---|---|---|
+| Host | `api.skynamo.me/v1` | `analytics-api.svc.skynamo.me` |
+| Auth | `X-API-KEY` + `X-API-CLIENT` | **OAuth2 client credentials → JWT** |
+| Cost | included | **paid add-on** |
+| Direction | read **and write** | **read only** |
+| Dates | build it yourself | 21 named reporting periods, financial-year aware |
+| Deltas | `row_version` on some paths | **bookmarks** (`x-bookmark` header) |
+| Rate limits | undocumented | **published and tight** (see below) |
+
+Full reference: [docs/skynamo-reporting-api-and-powerbi.md](docs/skynamo-reporting-api-and-powerbi.md).
+
+### 12.2 Credentials
+
+**Skynamo insights → Settings → Integration Tokens → *Add client credential***.
+
+> This is the same screen as the Public API key, with a **different button**.
+> *Add access token* gives you an `x-api-key` (Public API); *Add client credential*
+> gives you a **Client ID + Client Secret** pair (Reporting API). Clicking the wrong
+> one is the most common setup mistake. If the button is missing, the paid add-on
+> probably isn't enabled on your subscription.
+
+As with the Skynamo API key, **neither the Client ID nor the Secret is ever
+stored** — you re-enter them each session. Only your period and entity selection
+persist.
+
+### 12.3 Reporting periods and rate limits
+
+You pick a named period rather than building date filters. The rate limit **scales
+inversely with how much data the period covers**, so choose the shortest period
+that answers your question:
+
+| Limit | Periods |
+|---|---|
+| 30 queries / 30s | `ThisDay`, `PrevDay`, `ThisWeek`, `PrevWeek`, `This30Days`, `Prev30Days`, `ThisMonth`, `PrevMonth` |
+| 4 queries / minute | `This90Days`, `Prev90Days`, `FinThisQuarter`, `FinPrevQuarter` |
+| 4 queries / 10 min | `This180Days`, `Prev180Days`, `This365Days`, `Prev365Days`, `FinThisYear`, `FinPrevYear` |
+| **2 queries / 10 min** | `AllData` |
+
+The tab shows the allowance for your current selection and warns when a run will be
+throttled. It self-throttles rather than failing, so a large run just takes longer.
+**`AllData` is for a one-off backfill, not a schedule** — seed history once, then
+use a short period with bookmarks.
+
+### 12.4 How an extract works
+
+1. **Plan Extract** — reads the stored bookmarks and shows, per entity, whether it
+   will be a **full** load or a **delta**, and what it will cost. **Makes no API
+   calls at all.**
+2. Untick anything you don't want (same tick-the-row behaviour as the other tabs).
+3. **Run Extract** — fetches each entity (sub-entities expanded in the *same* call,
+   which is far cheaper than paging), merges the rows into the store by primary key,
+   records the run, and only *then* advances the bookmark. A failure on one entity
+   never aborts the rest.
+4. **Save Report CSV** for a per-entity record of what happened.
+
+Entities in this version: `activities` (with visits, order totals, order lines),
+`customers` (with invoices, targets), `users` (with targets), `products`,
+`invoices`.
+
+The store lives at `%APPDATA%\SkynamoGeo\reporting.db` (plain SQLite — open it with
+any SQLite tool if you want to query it directly). Re-extracting the same rows is
+idempotent, so running twice never duplicates data.
+
+> **Two caveats worth knowing.** Bookmarks report *added* data, not deletions, so
+> rows deleted in Skynamo linger until a reconcile marks them deleted. And the API
+> spec has known defects — two endpoints declare the wrong response schema and 7 of
+> 11 are undocumented — so the column definitions in `reporting_config.py` should be
+> confirmed against your instance before you rely on them.
+
+---
+
+## 13. Dashboards
+
+The **Dashboards** tab renders the local store into **one self-contained `.html`
+file**: charts are inline SVG, the CSS is inline, and nothing loads from the
+internet. It opens in any browser, prints cleanly, and can be emailed as-is.
+
+Because it reads only the local store, **building a dashboard makes no API calls**
+— it's free to rebuild as often as you like, and costs nothing against your rate
+limit.
+
+Panels: an overview KPI row (orders and value, invoiced, outstanding, visits,
+active customers), order value over time, top customers, top products, visits by
+user, visit type (on-site/off-site/scheduled), targets vs actuals, and a **data
+freshness** panel showing when each entity was last extracted and the exact server
+window (`x-date-range`) it used — so nobody mistakes a stale dashboard for a live
+one.
+
+Any panel with no data says so explicitly rather than rendering an empty box. If
+the whole store is empty, the tab tells you to run an extract first.
+
+---
+
+## 14. Change log
+
+- **v2.7.0** (2026-08-27) — **Reporting connector + Dashboards.** Two new tabs.
+  **Reporting** talks to Skynamo's Reporting API (a separate paid product: OAuth2
+  client credentials, read-only) and extracts activities/customers/users/products/
+  invoices into a local SQLite store at `%APPDATA%\SkynamoGeo\reporting.db`, using
+  bookmark deltas so repeat runs only fetch what changed. Plan-then-run: the plan
+  phase makes **no API calls** and estimates the cost against the period's published
+  rate limit (which the client also self-throttles to). **Dashboards** renders that
+  store into one self-contained HTML file — inline SVG charts, no external requests,
+  no new dependencies — with a data-freshness panel showing the server window each
+  extract actually used. New core: `reporting_config.py` (the entity registry — the
+  one place to add entities), `reporting_client.py`, `report_store.py`,
+  `report_engine.py`, `dashboard.py`, plus `reports.py` which de-duplicates the CSV
+  writer and `summarize` that were copied across the engines. Four new offline test
+  suites. Also corrected a docs claim: files and products have no DELETE endpoint,
+  but the Public API does have DELETEs for invoices/tasks/scheduled visits/order
+  statuses/deal groups.
 - **v2.5.0** (2026-07-23) — **Replace + manage product images.** The Product
   Images tab gains a **Replace existing images** option (upload sets the
   product's files to only this run's images instead of merging) and an

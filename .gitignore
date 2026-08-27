@@ -163,3 +163,10 @@ cython_debug/
 # Spreadsheets
 .csv
 .xlsx
+
+# Vendor API handbook binaries (PDF/HTML/PNG, ~6.8MB) - the markdown guides in
+# docs/ are tracked; these large derived copies are kept local.
+docs/Skynamo API Docs/
+
+# Local reporting extract store (built by the Reporting tab, machine-specific)
+reporting.db

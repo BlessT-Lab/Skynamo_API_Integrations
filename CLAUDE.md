@@ -4,16 +4,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Skynamo toolkit with two features that talk to a Skynamo instance's public API:
+A Skynamo toolkit. It talks to **two separate Skynamo APIs** — see the table below, this
+distinction matters constantly:
+
 1. **Customer geolocation** — fills in customer latitude/longitude by geocoding their address
-   fields via OpenStreetMap (Nominatim) — free, no API key.
+   fields via OpenStreetMap (Nominatim) — free, no API key. *(Public API)*
 2. **Product images** — matches local image files to products by the code in the filename and
    uploads them (`POST /files` → `PATCH /products` with the file GUID), in merge or replace mode;
-   and a separate tab to view/remove the images already attached to a product.
+   and a separate tab to view/remove the images already attached to a product. *(Public API)*
+3. **Reporting** — extracts business data (activities, customers, users, products, invoices) into a
+   local SQLite store using bookmark deltas. *(Reporting API)*
+4. **Dashboards** — renders a self-contained HTML dashboard from that store. *(local only)*
 
-Ships as a CustomTkinter desktop GUI (three tabs — geolocation, image import, image management)
-plus an interactive CLI (geolocation only, so far). See [README.md](README.md) for the full
-user-facing walkthrough and Skynamo API reference.
+Ships as a CustomTkinter desktop GUI (five tabs) plus an interactive CLI (geolocation only, so
+far). See [README.md](README.md) for the full user-facing walkthrough and API reference.
+
+### The two APIs
+| | Public API (`client.py`) | Reporting API (`reporting_client.py`) |
+|---|---|---|
+| Host | `api.skynamo.me/v1` | `analytics-api.svc.skynamo.me` |
+| Auth | `X-API-CLIENT` + `X-API-KEY` headers | OAuth2 client-credentials → JWT Bearer |
+| Direction | read **and write** | **read only** (11 GET endpoints) |
+| Cost | included | **paid add-on** |
+| Rate limits | undocumented | published and tight — see domain rules |
+
+`docs/skynamo-reporting-api-and-powerbi.md` is the authoritative reference for the Reporting API
+(the local `skynamo_swagger.json` only covers the Public API).
 
 ## Commands
 
@@ -25,7 +41,11 @@ py test_engine.py                                            # geolocation engin
 py test_geocoder.py                                          # OSM precision mapping + query building (offline)
 py test_products.py                                          # image filename parsing/escaping/matching (offline)
 py test_image_engine.py                                      # image engine preview/commit (mocked client, offline)
-py test_gui_smoke.py                                         # builds the GUI (both tabs) and tears it down
+py test_reporting_client.py                                  # OAuth/token/throttle/filter building (fake session)
+py test_report_store.py                                      # SQLite schema/upsert/bookmarks (in-memory)
+py test_report_engine.py                                     # extract plan/run (fake client, offline)
+py test_dashboard.py                                         # HTML dashboard render + escaping (offline)
+py test_gui_smoke.py                                         # builds the GUI (all five tabs) and tears it down
 py -m pip install -r requirements-build.txt && build.bat     # -> dist/SkynamoGeo.exe (PyInstaller)
 ```
 
@@ -68,21 +88,54 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
 - `skynamo_geo/customers.py` — address helpers. `build_query(customer, field_roles)` returns an
   `AddressQuery` (`.text` single-line + `.structured` dict) from an ordered `(field_name, role)`
   list; `clean_value` drops junk; `has_coordinates` treats zero/`"0"`/null as missing.
-- `skynamo_geo/settings.py` — non-secret config in `%APPDATA%/SkynamoGeo/config.json`. API keys are
-  never persisted (re-entered each session); `purge_saved_credentials()` clears any keys older
-  versions stored in the OS keyring, called on GUI startup.
+- `skynamo_geo/settings.py` — non-secret config in `%APPDATA%/SkynamoGeo/config.json`. API keys and
+  Reporting API client credentials are **never persisted** (re-entered each session);
+  `purge_saved_credentials()` clears any keys older versions stored in the OS keyring, called on GUI
+  startup. Both `_persist_*` helpers read-modify-write so the tabs don't clobber each other's keys.
+- `skynamo_geo/reports.py` — shared `summarize(items)` and `write_report(rows, path, fieldnames)`.
+  All three engines re-export these; don't re-implement a CSV writer.
+
+### Reporting side (the second API)
+- `skynamo_geo/reporting_config.py` — **the single declaration of the Reporting API surface**:
+  endpoints, the 21 reporting periods, `RATE_LIMIT_BY_PERIOD`, `STATUS_RPT_*`, and
+  `REPORTING_ENTITIES` (per entity: endpoint, primary key, columns, sub-entities, `bookmarkable`,
+  `has_period`, `order_by`). Adding an entity is a change **here only** — client, store and engine
+  all drive off the registry.
+- `skynamo_geo/reporting_client.py` — `ReportingClient`, `TokenCache`, `_PeriodThrottle`,
+  `build_filter`. Shaped like `SkynamoClient` ((value, error) returns) but OAuth2. Self-throttles
+  per reporting period; refreshes the token once on `401`; backs off on `429`/`503` honouring
+  `Retry-After`. Credentials never appear in a log or exception.
+- `skynamo_geo/report_store.py` — `ReportStore`, SQLite at `%APPDATA%/SkynamoGeo/reporting.db`
+  (stdlib `sqlite3`, no new dependency). Schema generated from the registry; `upsert_entity` is
+  idempotent and stores nested sub-entity rows; bookmarks keyed `(endpoint, reporting_period)`;
+  `runs` table is the tool's only persistent history; `reconcile` soft-deletes via `is_deleted`.
+- `skynamo_geo/report_engine.py` — same two-phase shape: `plan_extract(...)` (reads bookmarks,
+  estimates the rate-limit budget, **no network calls**) → `run_extract(...)` (fetch → upsert →
+  record run → **then** store the bookmark).
+- `skynamo_geo/dashboard.py` — `build_dashboard(store, out_path, ...)`: one self-contained HTML file
+  with hand-built inline SVG charts. No matplotlib (it would add ~40MB to the one-file exe) and no
+  external requests. Everything from the instance goes through `html.escape`.
 
 ### GUI threading model (gui.py)
-The GUI is a `CTkTabview` with three tabs: **Customer Geolocation**, **Product Images**, and
-**Manage Images** (`_build_geo_tab`/`_build_image_tab`/`_build_manage_tab`). Tkinter is not
-thread-safe. Each tab runs its engine on its own `threading.Thread`, pushes events onto its own
-`queue.Queue`, and the main thread drains it via `self.after(100, ...)` — the **only** place widgets
-are touched. Cancel is a per-tab `threading.Event` passed in as `should_cancel`. The three tabs keep
-fully separate state/queues/workers, distinguished by attribute prefix: the geo tab's plain names,
-the Product Images tab's `img_*`/`_img_*`, and the Manage Images tab's `mgmt_*`/`_mgmt_*`. Product
-Images and Manage Images share the one connected `SkynamoClient` + loaded `products` list (Manage
-Images tells the user to connect on the Product Images tab first). Any new long-running work must
-follow this pattern — never update a widget from a worker thread.
+The GUI is a `CTkTabview` with five tabs, one `_build_*_tab` method each: **Customer Geolocation**,
+**Product Images**, **Manage Images**, **Reporting**, **Dashboards**. Tkinter is not thread-safe.
+Each tab runs its engine on its own `threading.Thread`, pushes events onto its own `queue.Queue`,
+and the main thread drains it via `self.after(100, ...)` — the **only** place widgets are touched.
+Cancel is a per-tab `threading.Event` passed in as `should_cancel`. Tabs keep fully separate
+state/queues/workers, distinguished by attribute prefix:
+
+| Tab | Prefix | Shares |
+|---|---|---|
+| Customer Geolocation | *(plain names)* | own `SkynamoClient` |
+| Product Images | `img_*` / `_img_*` | `img_client` + `products` |
+| Manage Images | `mgmt_*` / `_mgmt_*` | reuses Product Images' client/products |
+| Reporting | `rpt_*` / `_rpt_*` | own `ReportingClient` + `ReportStore` |
+| Dashboards | `dash_*` / `_dash_*` | reads the store (no client, no thread needed) |
+
+Any new long-running work must follow this pattern — never update a widget from a worker thread.
+Note the Dashboards tab and the Reporting tab's store label deliberately **do not create** the
+SQLite file just to render; they check `os.path.exists` first, so a user who never opens Reporting
+never gets a stray database.
 
 ## Domain rules that aren't obvious from the code
 
@@ -109,12 +162,42 @@ follow this pattern — never update a widget from a worker thread.
   as the **union** of the product's existing GUIDs plus the new ones (don't clobber attached images);
   in **replace mode** (`upload_images(replace_existing=True)`) it's set to only this run's GUIDs.
   Format is gated on extension **and** magic bytes (`sniff_image_format`); PNG/JPEG only.
-- **There is no delete endpoint anywhere in Skynamo's API** — no `DELETE /files/{guid}`, no
-  `DELETE /products/{id}`. "Removing" an image (`image_engine.delete_selected_images`) means
-  re-`PATCH /products` with the product's `files` list minus the removed GUIDs — it detaches the
-  file from the product; the underlying file object may still exist server-side. `GET /files/{guid}`
-  (`client.get_file`) resolves a GUID to a filename for display, since a product's `files` array is
-  only ever bare GUID strings.
+- **Files and products have no DELETE endpoint** — there is no `DELETE /files/{guid}` and no
+  `DELETE /products/{id}`. (The Public API *does* have DELETEs for `/invoices`,
+  `/invoicesbyexternalid`, `/tasks`, `/scheduledvisits`, `/orderstatuses` and `/dealgroups/{id}` —
+  just not for the resources this tool writes.) So "removing" an image
+  (`image_engine.delete_selected_images`) means re-`PATCH /products` with the product's `files` list
+  minus the removed GUIDs — it detaches the file from the product; the underlying file object may
+  still exist server-side. `GET /files/{guid}` (`client.get_file`) resolves a GUID to a filename for
+  display, since a product's `files` array is only ever bare GUID strings.
+
+### Reporting API rules (all learned the hard way from the spec)
+- **Rate limits are the dominant design constraint**, and they scale *inversely* with how much data
+  the period covers: `30 q/30s` (day/week/30-day), `4 q/min` (90-day/quarter), `4 q/10min`
+  (180/365-day, financial), **`2 q/10min` for `AllData`**. Hence: `_PeriodThrottle`, the planner's
+  budget warning, and the rule below.
+- **Prefer one `entities`-expanded call over many paged calls.** Paging a year-wide query in 500-row
+  pages can take an hour against a 4-per-10-minutes budget. `build_filter` expands all sub-entities
+  by default for exactly this reason.
+- **`order` is mandatory whenever `skip`/`limit` are used** — the spec says so twice. `build_filter`
+  adds it automatically, and omits paging entirely for entities with no documented sortable field.
+- **A bookmark is scoped to `(endpoint, reportingPeriod)`.** Reusing one across periods returns
+  meaningless results, so the store is keyed on both. `/v2/products` has no period (unqualified
+  bookmark); `/v2/users` has no bookmark at all (full reload).
+- **Store the bookmark only after the rows commit** — otherwise an interrupted run silently skips
+  data forever. `run_extract` does upsert → record run → set bookmark, in that order.
+- **Bookmarks never report deletions** ("new data that was added"), which is why the store has
+  `is_deleted` + `reconcile()` rather than trusting deltas.
+- **Log the `x-date-range` response header.** It is the only proof of which window the server
+  actually computed, and financial-period arithmetic (year start, month start day, week start) has
+  real off-by-one risk. The Reporting tab prints it per entity after every run.
+- **Two response schemas in the spec are wrong** (`/v2/products` declares `CustomerExtended`,
+  `/v2/yearonyearsales` declares `UserTimeSegment`) and 7 of 11 endpoints have empty descriptions.
+  The registry's column lists are therefore **unverified against a live instance** — confirm before
+  trusting them. `_rows_from` tolerates several envelope shapes for the same reason.
+- **camelCase vs snake_case**: `VisitExtended`/`RfmVisit` use camelCase, everything else snake_case.
+  `report_store.normalise_key` is the single funnel; never index a payload key directly.
+- **The token lifetime is undocumented** — trust `expires_in`, refresh on `401`, never hard-code.
 
 ## Working agreements
 

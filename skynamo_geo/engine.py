@@ -9,8 +9,7 @@ via a should_cancel() predicate, so a GUI worker thread or the CLI can drive
 them identically.
 """
 
-import csv
-
+from . import reports
 from .config import (
     REPORT_FIELDNAMES,
     STATUS_GEOCODE_FAILED, STATUS_PENDING, STATUS_SKIPPED_HAS_COORDS,
@@ -19,6 +18,7 @@ from .config import (
 )
 from .customers import build_query, has_coordinates
 from .geocoder import GeocodeError
+from .reports import summarize  # re-exported: callers use engine.summarize
 
 
 def _noop(*_args, **_kwargs):
@@ -195,18 +195,6 @@ def write_locations(client, plans, on_progress=_noop,
     return [p.to_report_row() for p in plans]
 
 
-def summarize(plans):
-    """Count plans by status for a summary display."""
-    counts = {}
-    for plan in plans:
-        counts[plan.status] = counts.get(plan.status, 0) + 1
-    return counts
-
-
-def write_report(report_rows, path):
-    """Write the report rows to a CSV at path."""
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=REPORT_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(report_rows)
-    return path
+def write_report(report_rows, path, fieldnames=REPORT_FIELDNAMES):
+    """Write the report rows to a CSV at path (defaults to the geo columns)."""
+    return reports.write_report(report_rows, path, fieldnames)

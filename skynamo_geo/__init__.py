@@ -1,8 +1,13 @@
 """Skynamo toolkit.
 
-UI-agnostic core (client, geocoder, engine, image_engine, products, settings)
-plus front-ends (CLI in skynamo_geolocation.py, GUI in gui.py) that share it.
-Two features: customer geolocation and product-image import.
+UI-agnostic core plus front-ends (CLI in skynamo_geolocation.py, GUI in
+gui.py) that share it. Talks to two separate Skynamo APIs:
+
+  Public API    (client.py)           - read/write: customers, products, files
+  Reporting API (reporting_client.py) - read-only analytics, OAuth2
+
+Features: customer geolocation, product-image import/management, reporting
+extracts into a local store, and HTML dashboards built from that store.
 """
 
-__version__ = "2.5.0"
+__version__ = "2.7.0"
