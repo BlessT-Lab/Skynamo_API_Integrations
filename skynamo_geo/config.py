@@ -6,7 +6,7 @@ REQUEST_TIMEOUT = 30
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Nominatim usage policy: identify your app and stay at/below 1 request/second.
-NOMINATIM_USER_AGENT = "SkynamoGeo/2.7 (Skynamo customer geolocation updater)"
+NOMINATIM_USER_AGENT = "SkynamoGeo/2.8 (Skynamo customer geolocation updater)"
 NOMINATIM_MIN_INTERVAL = 1.0
 # Ask Nominatim for several candidates so we can pick the most precise one
 # instead of blindly trusting the first result.

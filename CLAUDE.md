@@ -16,8 +16,10 @@ distinction matters constantly:
    local SQLite store using bookmark deltas. *(Reporting API)*
 4. **Dashboards** — renders a self-contained HTML dashboard from that store. *(local only)*
 
-Ships as a CustomTkinter desktop GUI (five tabs) plus an interactive CLI (geolocation only, so
-far). See [README.md](README.md) for the full user-facing walkthrough and API reference.
+Ships as a CustomTkinter desktop GUI (five tabs) plus an interactive CLI. The CLI covers
+geolocation, image import and image management (`geo`/`images`/`manage`, chosen by a menu or an
+argv shortcut); Reporting and Dashboards are GUI-only. See [README.md](README.md) for the full
+user-facing walkthrough and API reference.
 
 ### The two APIs
 | | Public API (`client.py`) | Reporting API (`reporting_client.py`) |
@@ -36,7 +38,9 @@ far). See [README.md](README.md) for the full user-facing walkthrough and API re
 ```
 py -m pip install -r requirements.txt                       # runtime deps
 py gui.py                                                    # run the GUI
-py skynamo_geolocation.py                                    # run the CLI
+py skynamo_geolocation.py                                    # run the CLI (feature menu)
+py skynamo_geolocation.py geo|images|manage                   # skip the menu
+py test_cli_images.py                                         # CLI image flows (scripted prompts, offline)
 py test_engine.py                                            # geolocation engine smoke tests (mocked, no network/keys)
 py test_geocoder.py                                          # OSM precision mapping + query building (offline)
 py test_products.py                                          # image filename parsing/escaping/matching (offline)

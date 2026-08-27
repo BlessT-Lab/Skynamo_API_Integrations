@@ -15,7 +15,8 @@ anything is committed:
 4. **Dashboards** — builds a self-contained, shareable **HTML dashboard** from that
    store. See [§13](#13-dashboards).
 
-The desktop GUI has a tab per feature (five tabs); the CLI covers geolocation.
+The desktop GUI has a tab per feature (five tabs). The CLI covers geolocation,
+image import and image management; Reporting and Dashboards are GUI-only.
 
 > **This tool talks to two different Skynamo APIs.** Features 1–2 use the **Public
 > API** (`api.skynamo.me/v1`, API-key auth, included in your subscription). Feature 3
@@ -67,7 +68,7 @@ GeoLocation_Script/
     dashboard.py            # build_dashboard -> one self-contained HTML file
     settings.py             # non-secret config JSON (no credentials stored)
   gui.py                    # CustomTkinter desktop app, a tab per feature (entry point for the .exe)
-  skynamo_geolocation.py    # CLI front-end for geolocation (thin wrapper over the engine)
+  skynamo_geolocation.py    # CLI front-end: geo / images / manage (thin wrapper over the engines)
   build.bat                 # PyInstaller -> dist/SkynamoGeo.exe
   requirements.txt          # runtime deps
   requirements-build.txt    # build-only deps (pyinstaller)
@@ -75,6 +76,7 @@ GeoLocation_Script/
   test_geocoder.py          # OSM precision mapping + query building (offline)
   test_products.py          # image filename parsing/escaping/matching (offline)
   test_image_engine.py      # image engine preview/commit (mocked client, offline)
+  test_cli_images.py        # CLI image flows: scripted prompts, fake client (offline)
   test_reporting_client.py  # OAuth/token/throttle/filter building (fake session, offline)
   test_report_store.py      # SQLite schema/upsert/bookmarks (in-memory, offline)
   test_report_engine.py     # extract plan/run (fake client, offline)
@@ -116,7 +118,20 @@ card-style panels; the palette constants live at the top of `gui.py`.
 py -m pip install -r requirements.txt
 py skynamo_geolocation.py
 ```
-Interactive prompts mirror the GUI steps, then geocodes and writes in one pass.
+Starts with a menu of three features; interactive prompts then mirror the
+equivalent GUI steps, including the preview-before-commit confirmation and the
+CSV report (written to the current directory).
+
+Pass the feature name to skip the menu:
+```
+py skynamo_geolocation.py geo       # geocode customer addresses
+py skynamo_geolocation.py images    # upload product images from a folder
+py skynamo_geolocation.py manage    # list / remove images on one product
+py skynamo_geolocation.py --help
+```
+Reporting and Dashboards are GUI-only — the reporting engine is UI-agnostic, so
+a CLI flow is possible, but the extract is long-running and rate-limited enough
+that the tabbed UI with a progress bar and cancel is the better fit.
 
 ### Standalone .exe (no Python on the target machine)
 ```
@@ -367,6 +382,7 @@ py test_engine.py        # geolocation engine: plan statuses, no-write-in-previe
 py test_geocoder.py      # OSM precision mapping + query building
 py test_products.py      # image filename parsing/escaping/matching/format sniff
 py test_image_engine.py  # image engine: match/upload, replace mode, list/remove attached images
+py test_cli_images.py    # CLI image flows: confirmation gating, deselection, replace warning
 py test_reporting_client.py  # OAuth token cache/refresh, 401 retry, 429 backoff, throttle, filters
 py test_report_store.py      # schema from registry, idempotent upsert, period-scoped bookmarks
 py test_report_engine.py     # plan makes no calls; bookmark advances only after a commit
@@ -398,9 +414,9 @@ side at all.
 - **Headless/scheduled runs**: call `engine.geocode_customers` +
   `engine.write_locations` (or `image_engine.scan_images` +
   `image_engine.upload_images`) directly — the core has no UI dependency.
-- **Product images in the CLI**: `skynamo_geolocation.py` covers geolocation only
-  today; `image_engine` + `products` are UI-agnostic, so a CLI flow can be added
-  with no core changes.
+- **Reporting/Dashboards in the CLI**: `report_engine` and `dashboard` are
+  UI-agnostic like everything else, so a `report`/`dash` feature could be added
+  to `skynamo_geolocation.py` alongside the existing three with no core changes.
 - **More reporting entities**: add an entry to `REPORTING_ENTITIES` in
   `skynamo_geo/reporting_config.py` — the client, store schema and extract engine
   all drive off that registry, so no other code changes.
@@ -511,6 +527,19 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.8.0** (2026-08-27) — **Product images in the CLI.** The CLI now opens with
+  a feature menu — `geo`, `images`, `manage` — or takes the feature as an
+  argument (`py skynamo_geolocation.py images`) to skip it; `--help` prints usage.
+  **images** matches a folder against product codes, prints a match summary
+  (including *why* each unmatched/ambiguous/unsupported file was rejected) and how
+  many images each product already has, then uploads only after you confirm, with
+  optional individual selection. **manage** looks a product up by code, resolves
+  its attached images to filenames and detaches the ones you tick. Replace mode
+  spells out exactly which products will lose existing images and asks a second
+  time. Both write the same CSV reports the GUI does. Credentials and connection
+  are now a shared step, and the geolocation flow is unchanged. New offline suite
+  `test_cli_images.py` drives the flows with scripted prompts, asserting nothing
+  uploads before confirmation and that deselection is honoured.
 - **v2.7.0** (2026-08-27) — **Reporting connector + Dashboards.** Two new tabs.
   **Reporting** talks to Skynamo's Reporting API (a separate paid product: OAuth2
   client credentials, read-only) and extracts activities/customers/users/products/
