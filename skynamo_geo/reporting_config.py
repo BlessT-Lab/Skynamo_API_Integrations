@@ -57,6 +57,132 @@ RATE_LIMIT_BY_PERIOD["AllData"] = _LIMIT_2_PER_10MIN
 # Anything unrecognised gets the most conservative budget.
 DEFAULT_RATE_LIMIT = _LIMIT_2_PER_10MIN
 
+# --- Sub-entity column shapes -------------------------------------------
+# Orders, quotes and credit requests are the same shape with different key
+# names ("As orders, keyed quote_id / quote_item_id" in the spec), so build
+# them rather than repeating four near-identical literals.
+
+def _document_total_columns(doc_id):
+    """Header/total row of a sales document (one per document)."""
+    return {
+        doc_id: "TEXT", "activity_id": "TEXT", "date": "TEXT",
+        "reference": "TEXT", "discount": "REAL",
+        "prices_include_tax": "INTEGER", "discount_value": "REAL",
+        "subtotal_value": "REAL", "tax_value": "REAL", "quote_id": "TEXT",
+        "customer_id": "TEXT", "customer_name": "TEXT",
+        "user_id": "TEXT", "display_name": "TEXT",
+        "summary_tax_note": "TEXT", "summary_reporting_note": "TEXT",
+    }
+
+
+def _document_item_columns(item_id, doc_id):
+    """Line-item row of a sales document (many per document)."""
+    return {
+        item_id: "TEXT", doc_id: "TEXT", "activity_id": "TEXT",
+        "product_id": "TEXT", "product_code": "TEXT", "quantity": "REAL",
+        "unit_name": "TEXT", "unit_multiplier": "REAL",
+        "list_price": "REAL", "unit_price": "REAL",
+        "item_discount": "REAL", "item_discount_value": "REAL",
+        "item_subtotal_value": "REAL", "tax_rate": "REAL",
+        "item_tax_value": "REAL", "quote_id": "TEXT",
+    }
+
+
+def _document_pair(api_total, api_items, table_prefix, doc_id, item_id):
+    """The {totals, items} sub-entity pair for one document type."""
+    return {
+        api_total: {
+            "table": f"{table_prefix}_totals",
+            "primary_key": doc_id,
+            "parent_key": "activity_id",
+            "columns": _document_total_columns(doc_id),
+        },
+        api_items: {
+            "table": f"{table_prefix}_items",
+            "primary_key": item_id,
+            "parent_key": "activity_id",
+            "columns": _document_item_columns(item_id, doc_id),
+        },
+    }
+
+
+# Every sub-entity /v2/activities can expand. They all come back in the SAME
+# request, so including them costs no extra API calls - only a larger response.
+_ACTIVITY_SUB_ENTITIES = {
+    "visits": {
+        "table": "activity_visits",
+        "primary_key": "activity_id",
+        "parent_key": "activity_id",
+        "columns": {
+            "activity_id": "TEXT", "start_time": "TEXT", "end_time": "TEXT",
+            "duration_sec": "INTEGER", "is_scheduled": "INTEGER",
+            "is_onsite": "INTEGER",
+        },
+    },
+    "surveys": {
+        "table": "surveys",
+        "primary_key": "survey_item_id",
+        "parent_key": "activity_id",
+        "columns": {
+            "survey_item_id": "TEXT", "survey_id": "TEXT",
+            "activity_id": "TEXT", "product_id": "TEXT",
+            "product_code": "TEXT", "product_name": "TEXT",
+            "stock_level": "REAL", "facings": "REAL", "retail_price": "REAL",
+        },
+    },
+    "forms": {
+        "table": "activity_forms",
+        "primary_key": "completed_form_id",
+        "parent_key": "activity_id",
+        "columns": {
+            "completed_form_id": "TEXT", "activity_id": "TEXT",
+            "completed_date": "TEXT", "form_type": "TEXT",
+            "json_view": "TEXT",
+        },
+    },
+    # No unique field in the spec for these two, so the store derives a
+    # deterministic key from the identifying columns (see synthetic_key).
+    "comments": {
+        "table": "activity_comments",
+        "primary_key": "row_key",
+        "parent_key": "activity_id",
+        "synthetic_key": ["activity_id", "date", "customer_comment"],
+        "columns": {
+            "row_key": "TEXT", "activity_id": "TEXT", "date": "TEXT",
+            "customer_comment": "TEXT",
+        },
+    },
+    "emails": {
+        "table": "activity_emails",
+        "primary_key": "row_key",
+        "parent_key": "activity_id",
+        "synthetic_key": ["activity_id", "date", "recipients", "description"],
+        "columns": {
+            "row_key": "TEXT", "activity_id": "TEXT", "date": "TEXT",
+            "recipients": "TEXT", "description": "TEXT",
+        },
+    },
+}
+_ACTIVITY_SUB_ENTITIES.update(_document_pair(
+    "orderTotals", "orders", "order", "order_id", "order_item_id"))
+_ACTIVITY_SUB_ENTITIES.update(_document_pair(
+    "quoteTotals", "quotes", "quote", "quote_id", "quote_item_id"))
+_ACTIVITY_SUB_ENTITIES.update(_document_pair(
+    "creditRequestTotals", "creditRequests", "credit_request",
+    "credit_request_id", "credit_request_item_id"))
+
+# Which table holds each document type, for breakdowns in the dashboard.
+DOCUMENT_TABLES = {
+    "Orders": ("order_totals", "order_items"),
+    "Quotes": ("quote_totals", "quote_items"),
+    "Credit requests": ("credit_request_totals", "credit_request_items"),
+    "Visits": ("activity_visits", None),
+    "Surveys": ("surveys", None),
+    "Forms": ("activity_forms", None),
+    "Comments": ("activity_comments", None),
+    "Emails": ("activity_emails", None),
+}
+
 # --- Entity registry -----------------------------------------------------
 # Per entity:
 #   endpoint      - path under ANALYTICS_BASE
@@ -91,47 +217,10 @@ REPORTING_ENTITIES = {
             "start_time": "TEXT", "end_time": "TEXT",
             "longitude": "REAL", "latitude": "REAL", "comment": "TEXT",
         },
-        "sub_entities": {
-            "visits": {
-                "table": "activity_visits",
-                "primary_key": "activity_id",
-                "parent_key": "activity_id",
-                "columns": {
-                    "activity_id": "TEXT", "start_time": "TEXT",
-                    "end_time": "TEXT", "duration_sec": "INTEGER",
-                    "is_scheduled": "INTEGER", "is_onsite": "INTEGER",
-                },
-            },
-            "orderTotals": {
-                "table": "order_totals",
-                "primary_key": "order_id",
-                "parent_key": "activity_id",
-                "columns": {
-                    "order_id": "TEXT", "activity_id": "TEXT", "date": "TEXT",
-                    "reference": "TEXT", "discount": "REAL",
-                    "prices_include_tax": "INTEGER",
-                    "discount_value": "REAL", "subtotal_value": "REAL",
-                    "tax_value": "REAL", "quote_id": "TEXT",
-                    "customer_id": "TEXT", "customer_name": "TEXT",
-                    "user_id": "TEXT", "display_name": "TEXT",
-                },
-            },
-            "orders": {
-                "table": "order_items",
-                "primary_key": "order_item_id",
-                "parent_key": "activity_id",
-                "columns": {
-                    "order_item_id": "TEXT", "order_id": "TEXT",
-                    "activity_id": "TEXT", "product_id": "TEXT",
-                    "product_code": "TEXT", "quantity": "REAL",
-                    "unit_name": "TEXT", "unit_multiplier": "REAL",
-                    "list_price": "REAL", "unit_price": "REAL",
-                    "item_discount": "REAL", "item_discount_value": "REAL",
-                    "item_subtotal_value": "REAL", "tax_rate": "REAL",
-                    "item_tax_value": "REAL", "quote_id": "TEXT",
-                },
-            },
-        },
+        # All 11 documented sub-entities - they arrive in the same request, so
+        # this is what turns a vague "activity" into "an order / a quote / a
+        # visit / a survey / a form / an email".
+        "sub_entities": _ACTIVITY_SUB_ENTITIES,
     },
     "customers": {
         "endpoint": "/v2/customers",

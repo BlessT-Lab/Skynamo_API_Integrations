@@ -495,9 +495,41 @@ use a short period with bookmarks.
    never aborts the rest.
 4. **Save Report CSV** for a per-entity record of what happened.
 
-Entities in this version: `activities` (with visits, order totals, order lines),
-`customers` (with invoices, targets), `users` (with targets), `products`,
-`invoices`.
+Entities in this version: `activities` (with **all 11** sub-entities — see
+below), `customers` (with invoices, targets), `users` (with targets),
+`products`, `invoices`.
+
+### 12.5 What kind of activity was it?
+
+"Activity" on its own is vague, so the extract pulls every sub-entity the
+endpoint offers and stores each as its own table. Two things then tell you what
+actually happened:
+
+- **`activities.activity_type`** — the activity's own type (Visit, Order, Quote,
+  Call, Credit Request, Form, …). The values come from your instance, so the
+  dashboard groups by whatever it finds rather than a fixed list.
+- **What it produced** — each document type lands in its own table:
+
+| Document | Header table | Line-item table |
+|---|---|---|
+| Orders | `order_totals` | `order_items` |
+| Quotes | `quote_totals` | `quote_items` |
+| Credit requests | `credit_request_totals` | `credit_request_items` |
+| Visits | `activity_visits` | — |
+| Surveys / stocktakes | `surveys` | — |
+| Completed forms | `activity_forms` | — |
+| Comments | `activity_comments` | — |
+| Emails | `activity_emails` | — |
+
+All of it arrives in the **same** API request, so pulling the full breakdown
+costs **no extra calls** and nothing against the rate limit — only a larger
+response.
+
+Two notes on the data. `order_totals.quote_id` records the quote an order came
+from, which is what makes quote→order conversion measurable (the dashboard shows
+it). And comments and emails have no unique id in the API, so the store derives
+a deterministic key from their contents — multiple comments per activity are
+kept, and re-extracting the same ones doesn't duplicate them.
 
 The store lives at `%APPDATA%\SkynamoGeo\reporting.db` (plain SQLite — open it with
 any SQLite tool if you want to query it directly). Re-extracting the same rows is
@@ -521,12 +553,20 @@ Because it reads only the local store, **building a dashboard makes no API calls
 — it's free to rebuild as often as you like, and costs nothing against your rate
 limit.
 
-Panels: an overview KPI row (orders and value, invoiced, outstanding, visits,
-active customers), order value over time, top customers, top products, visits by
-user, visit type (on-site/off-site/scheduled), targets vs actuals, and a **data
-freshness** panel showing when each entity was last extracted and the exact server
-window (`x-date-range`) it used — so nobody mistakes a stale dashboard for a live
-one.
+Panels:
+
+- **Overview** — orders and value, invoiced, outstanding, visits, active customers
+- **What the activities were** — count by `activity_type`
+- **Documents produced** — orders / quotes / credit requests / visits / surveys /
+  forms / comments / emails, counted per document rather than per line
+- **Value by document type** — quotes beside orders, with **quote→order
+  conversion** where the order records the quote it came from
+- **Survey / stocktake findings** — average recorded stock level per product
+- Order value over time, top customers, top products, visits by user, visit type
+  (on-site/off-site/scheduled), targets vs actuals
+- **Data freshness** — when each entity was last extracted and the exact server
+  window (`x-date-range`) it used, so nobody mistakes a stale dashboard for a
+  live one
 
 Any panel with no data says so explicitly rather than rendering an empty box. If
 the whole store is empty, the tab tells you to run an extract first.
@@ -535,6 +575,18 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.9.0** (2026-08-27) — **Activity breakdown.** "Activity" was too vague to
+  act on, so the extract now pulls **all 11** of the sub-entities
+  `/v2/activities` offers, not 3: quotes, credit requests, surveys, completed
+  forms, comments and emails join orders and visits, each in its own table. This
+  costs **no extra API calls** — sub-entities arrive in the same request.
+  New dashboard panels answer "what was it": **activity count by type**,
+  **documents produced** (per document, not per line), **value by document type**
+  with **quote→order conversion**, and **survey/stocktake findings**. Comments and
+  emails have no id in the API, so the store derives a deterministic key from
+  their contents — multiple per activity are kept and re-extracting doesn't
+  duplicate. The four sales-document shapes are now generated from one helper
+  rather than four near-identical literals.
 - **v2.8.1** (2026-08-27) — **Reporting fixes found in review.**
   - **Cross-thread SQLite crash.** The Reporting tab created the store on the
     connect worker and then used it from the main thread and other workers,

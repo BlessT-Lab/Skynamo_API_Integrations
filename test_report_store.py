@@ -321,4 +321,87 @@ try:
 finally:
     shutil.rmtree(tmpdir3, ignore_errors=True)
 
+# --- synthetic keys for sub-entities the API gives no key ---------------
+# Comments and emails on an activity have no unique field. Keying them on
+# activity_id would make each one overwrite the last.
+from skynamo_geo.report_store import synthetic_key
+
+assert synthetic_key({"a": "1", "b": "2"}, ["a", "b"]) == \
+    synthetic_key({"a": "1", "b": "2"}, ["a", "b"]), "must be deterministic"
+assert synthetic_key({"a": "1"}, ["a"]) != synthetic_key({"a": "2"}, ["a"])
+# a missing field is treated as empty rather than raising
+assert synthetic_key({}, ["a", "b"])
+# the separator prevents ("ab","c") colliding with ("a","bc")
+assert synthetic_key({"a": "ab", "b": "c"}, ["a", "b"]) != \
+    synthetic_key({"a": "a", "b": "bc"}, ["a", "b"])
+
+tmpdir4 = tempfile.mkdtemp(prefix="skynamo_store_synthetic_")
+try:
+    syn = ReportStore(os.path.join(tmpdir4, "syn.db"))
+    activity = {
+        "activity_id": "a1", "activity_type": "Visit",
+        "comments": [
+            {"activity_id": "a1", "date": "2026-08-01", "customer_comment": "first"},
+            {"activity_id": "a1", "date": "2026-08-02", "customer_comment": "second"},
+            {"activity_id": "a1", "date": "2026-08-03", "customer_comment": "third"},
+        ],
+        "emails": [
+            {"activity_id": "a1", "date": "2026-08-01",
+             "recipients": "a@b.c", "description": "quote sent"},
+            {"activity_id": "a1", "date": "2026-08-02",
+             "recipients": "d@e.f", "description": "follow up"},
+        ],
+    }
+    written = syn.upsert_entity("activities", [activity])
+    assert written["activity_comments"] == 3, \
+        f"all three comments must survive, got {written.get('activity_comments')}"
+    assert written["activity_emails"] == 2
+    assert syn.scalar("SELECT COUNT(*) FROM activity_comments") == 3
+    # re-extracting the same payload must not duplicate
+    syn.upsert_entity("activities", [activity])
+    assert syn.scalar("SELECT COUNT(*) FROM activity_comments") == 3, \
+        "synthetic keys must make re-extraction idempotent"
+    assert syn.scalar("SELECT COUNT(*) FROM activity_emails") == 2
+    # every comment is linked back to its activity
+    assert syn.scalar(
+        "SELECT COUNT(*) FROM activity_comments WHERE activity_id='a1'") == 3
+    syn.close()
+finally:
+    shutil.rmtree(tmpdir4, ignore_errors=True)
+
+# --- all 11 activity document types round-trip --------------------------
+tmpdir5 = tempfile.mkdtemp(prefix="skynamo_store_docs_")
+try:
+    docs = ReportStore(os.path.join(tmpdir5, "docs.db"))
+    docs.upsert_entity("activities", [{
+        "activity_id": "a9", "activity_type": "Order",
+        "orderTotals": [{"order_id": "o1", "subtotal_value": 100.0}],
+        "orders": [{"order_item_id": "oi1", "order_id": "o1", "quantity": 2}],
+        "quoteTotals": [{"quote_id": "q1", "subtotal_value": 250.0}],
+        "quotes": [{"quote_item_id": "qi1", "quote_id": "q1", "quantity": 5}],
+        "creditRequestTotals": [{"credit_request_id": "cr1",
+                                 "subtotal_value": 30.0}],
+        "creditRequests": [{"credit_request_item_id": "cri1",
+                            "credit_request_id": "cr1", "quantity": 1}],
+        "surveys": [{"survey_item_id": "s1", "survey_id": "sv1",
+                     "product_code": "W1", "stock_level": 12, "facings": 3}],
+        "forms": [{"completed_form_id": "f1", "form_type": "Audit"}],
+        "visits": [{"activity_id": "a9", "duration_sec": 900}],
+        "comments": [{"activity_id": "a9", "date": "x", "customer_comment": "c"}],
+        "emails": [{"activity_id": "a9", "date": "x", "recipients": "r",
+                    "description": "d"}],
+    }])
+    counts = docs.counts()
+    for table in ("order_totals", "order_items", "quote_totals", "quote_items",
+                  "credit_request_totals", "credit_request_items", "surveys",
+                  "activity_forms", "activity_visits", "activity_comments",
+                  "activity_emails"):
+        assert counts.get(table) == 1, f"{table}={counts.get(table)}"
+    # the activity itself records what type it was
+    assert docs.scalar("SELECT activity_type FROM activities WHERE "
+                       "activity_id='a9'", default="") == "Order"
+    docs.close()
+finally:
+    shutil.rmtree(tmpdir5, ignore_errors=True)
+
 print("All report store tests passed")

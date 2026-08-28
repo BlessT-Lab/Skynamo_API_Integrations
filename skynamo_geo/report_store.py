@@ -12,6 +12,7 @@ merge instead of duplicating.
 Uses stdlib sqlite3 - no new dependency, and nothing extra in the .exe.
 """
 
+import hashlib
 import os
 import re
 import sqlite3
@@ -58,9 +59,23 @@ def _coerce(value):
     return str(value)
 
 
+def synthetic_key(row, fields):
+    """Deterministic id for a row the API gives no key of its own.
+
+    Comments and emails on an activity have no documented unique field, so
+    keying them on activity_id alone would make every comment overwrite the
+    last. Hashing the identifying fields keeps one row per distinct comment
+    while staying idempotent: the same content always yields the same key, so
+    re-extracting does not duplicate.
+    """
+    parts = [str(row.get(f, "")) for f in fields]
+    return hashlib.sha1("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
 def _child_rows(normalised, spec, api_name, sub):
     """Pull one sub-entity's nested rows out of already-normalised parents."""
     key = normalise_key(api_name)
+    key_fields = sub.get("synthetic_key")
     rows = []
     for parent in normalised:
         nested = parent.get(key) or parent.get(api_name)
@@ -70,6 +85,9 @@ def _child_rows(normalised, spec, api_name, sub):
         for child in nested:
             child_norm = normalise_row(child)
             child_norm.setdefault(sub["parent_key"], parent_value)
+            if key_fields and not child_norm.get(sub["primary_key"]):
+                child_norm[sub["primary_key"]] = synthetic_key(
+                    child_norm, key_fields)
             rows.append(child_norm)
     return rows
 

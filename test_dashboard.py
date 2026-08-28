@@ -160,6 +160,76 @@ try:
     assert _invoice_totals(blank) == (0, 0)
     blank.close()
 
+    # --- activity breakdown: the point of the expansion -----------------
+    br = ReportStore(os.path.join(tmp, "breakdown.db"))
+    br.upsert_entity("products", [
+        {"product_id": "p1", "name": "Widget", "code": "W1"}])
+    br.upsert_entity("activities", [
+        {   # an order-producing visit
+            "activity_id": "a1", "activity_type": "Visit",
+            "customer_name": "Acme", "display_name": "Rep One",
+            "orderTotals": [{"order_id": "o1", "date": "2026-08-01",
+                             "subtotal_value": 400.0, "quote_id": "q1"}],
+            "orders": [{"order_item_id": "oi1", "order_id": "o1",
+                        "product_id": "p1", "item_subtotal_value": 400.0}],
+            "visits": [{"activity_id": "a1", "duration_sec": 1200,
+                        "is_onsite": True}],
+            "surveys": [{"survey_item_id": "s1", "product_id": "p1",
+                         "stock_level": 14, "facings": 4}],
+        },
+        {   # a quote that was NOT converted
+            "activity_id": "a2", "activity_type": "Quote",
+            "customer_name": "Globex",
+            "quoteTotals": [{"quote_id": "q2", "date": "2026-08-02",
+                             "subtotal_value": 900.0}],
+            "quotes": [{"quote_item_id": "qi2", "quote_id": "q2"}],
+        },
+        {   # the quote that WAS converted (o1 above references q1)
+            "activity_id": "a3", "activity_type": "Quote",
+            "quoteTotals": [{"quote_id": "q1", "date": "2026-08-01",
+                             "subtotal_value": 400.0}],
+        },
+        {   # a credit request
+            "activity_id": "a4", "activity_type": "Credit Request",
+            "creditRequestTotals": [{"credit_request_id": "cr1",
+                                     "subtotal_value": 50.0}],
+        },
+        {   # a phone call with only a comment
+            "activity_id": "a5", "activity_type": "Call",
+            "comments": [{"activity_id": "a5", "date": "2026-08-03",
+                          "customer_comment": "called back"}],
+        },
+    ])
+    html_out = open(build_dashboard(
+        br, os.path.join(tmp, "breakdown.html"),
+        title="Breakdown"), encoding="utf-8").read()
+
+    # the panels exist
+    for heading in ("What the activities were", "Documents produced",
+                    "Value by document type", "Survey / stocktake findings"):
+        assert heading in html_out, heading
+    # each activity type is named, with its count
+    for label in ("Visit", "Quote", "Credit Request", "Call"):
+        assert label in html_out, label
+    # 2 quotes, 1 order, 1 credit request, 1 visit, 1 survey, 1 comment
+    assert "Orders" in html_out and "Quotes" in html_out
+    assert "Credit requests" in html_out
+    # quote -> order conversion: 1 of 2 quotes converted
+    assert "1 of 2 quotes became orders (50%)" in html_out, "conversion line"
+    # document values are shown
+    assert "900" in html_out or "1,300" in html_out
+    # survey stock level appears
+    assert "Widget" in html_out
+    br.close()
+
+    # an activity with no type falls back rather than vanishing
+    untyped = ReportStore(os.path.join(tmp, "untyped.db"))
+    untyped.upsert_entity("activities", [{"activity_id": "z1"}])
+    out_untyped = open(build_dashboard(
+        untyped, os.path.join(tmp, "untyped.html")), encoding="utf-8").read()
+    assert "(unspecified)" in out_untyped
+    untyped.close()
+
     # --- self-contained: nothing loads from the network ---
     assert "http://" not in dash and "https://" not in dash, \
         "dashboard must not reference any external resource"

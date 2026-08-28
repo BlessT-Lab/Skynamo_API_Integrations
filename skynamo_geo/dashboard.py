@@ -15,6 +15,8 @@ import html
 import os
 from datetime import datetime
 
+from .reporting_config import DOCUMENT_TABLES
+
 # Palette chosen to stay legible printed and in both light and dark viewers.
 _INK = "#1f2933"
 _MUTED = "#6b7280"
@@ -240,6 +242,96 @@ def _kpis(store):
     return f'<div class="kpis">{"".join(tiles)}</div>'
 
 
+def _activity_types(store):
+    """What the activities actually were, from the root activity_type field."""
+    rows = store.query(
+        "SELECT COALESCE(NULLIF(activity_type, ''), '(unspecified)') AS t, "
+        f"COUNT(*) AS n FROM activities WHERE {_LIVE} "
+        "GROUP BY t ORDER BY n DESC")
+    return _bar_chart([(r[0], r[1]) for r in rows], value_format=_num)
+
+
+def _document_breakdown(store):
+    """How many of each document type the activities produced.
+
+    Counts the header/total row per document (not line items), so "Orders: 12"
+    means twelve orders rather than twelve order lines.
+    """
+    pairs = []
+    for label, (table, item_table) in DOCUMENT_TABLES.items():
+        try:
+            n = store.scalar(
+                f'SELECT COUNT(*) FROM "{table}" WHERE {_LIVE}', default=0)
+        except Exception:          # table absent in an older store
+            continue
+        lines = None
+        if item_table:
+            try:
+                lines = store.scalar(
+                    f'SELECT COUNT(*) FROM "{item_table}" WHERE {_LIVE}',
+                    default=0)
+            except Exception:
+                lines = None
+        # Only mention line items when there are some - "(0 lines)" is noise.
+        name = f"{label} ({_num(lines)} lines)" if lines else label
+        pairs.append((name, n))
+    if not any(n for _l, n in pairs):
+        return _no_data("No documents in the store for this period.")
+    return _bar_chart(pairs, value_format=_num)
+
+
+def _document_values(store):
+    """Value per document type, so quotes can be compared with orders."""
+    pairs = []
+    for label, table in (("Orders", "order_totals"),
+                         ("Quotes", "quote_totals"),
+                         ("Credit requests", "credit_request_totals")):
+        try:
+            pairs.append((label, store.scalar(
+                f'SELECT SUM(subtotal_value) FROM "{table}" WHERE {_LIVE}',
+                default=0)))
+        except Exception:
+            continue
+    if not any(v for _l, v in pairs):
+        return _no_data()
+    body = _bar_chart(pairs, value_format=_money)
+    # Quote -> order conversion, which the API gives as a direct foreign key.
+    try:
+        quotes = store.scalar(
+            f"SELECT COUNT(*) FROM quote_totals WHERE {_LIVE}", default=0)
+        converted = store.scalar(
+            "SELECT COUNT(DISTINCT quote_id) FROM order_totals "
+            f"WHERE {_LIVE} AND quote_id IS NOT NULL AND quote_id != ''",
+            default=0)
+    except Exception:
+        return body
+    if quotes:
+        pct = converted / quotes * 100
+        body += (f'<p class="note">{_num(converted)} of {_num(quotes)} quotes '
+                 f'became orders ({pct:.0f}%).</p>')
+    return body
+
+
+def _survey_findings(store, limit=8):
+    """Stocktake/survey results - stock level and facings per product."""
+    try:
+        rows = store.query(
+            "SELECT COALESCE(NULLIF(p.name, ''), NULLIF(s.product_code, ''), "
+            "                'Unknown') AS what, "
+            "       AVG(s.stock_level) AS stock, COUNT(*) AS n "
+            "FROM surveys s "
+            "LEFT JOIN products p ON p.product_id = s.product_id "
+            f"WHERE s.{_LIVE} "
+            "GROUP BY what ORDER BY n DESC LIMIT ?", (limit,))
+    except Exception:
+        return _no_data("No survey data in the store.")
+    pairs = [(f"{r[0]} ({_num(r[2])} obs)", r[1]) for r in rows
+             if r[1] is not None]
+    if not pairs:
+        return _no_data("No survey/stocktake results for this period.")
+    return _bar_chart(pairs, value_format=lambda v: _num(v, 1))
+
+
 def _orders_over_time(store):
     rows = store.query(
         "SELECT substr(date, 1, 10) AS d, SUM(subtotal_value) "
@@ -395,6 +487,19 @@ def build_dashboard(store, out_path, title="Skynamo Dashboard",
 
     panels = [
         _panel("Overview", _kpis(store)),
+        f'<div class="grid2">'
+        + _panel("What the activities were", _activity_types(store),
+                 note="From each activity's own type field.")
+        + _panel("Documents produced", _document_breakdown(store),
+                 note="One count per document, not per line item.")
+        + '</div>',
+        f'<div class="grid2">'
+        + _panel("Value by document type", _document_values(store),
+                 note="Quotes beside orders, with conversion where the order "
+                      "records the quote it came from.")
+        + _panel("Survey / stocktake findings", _survey_findings(store),
+                 note="Average recorded stock level per product.")
+        + '</div>',
         f'<div class="grid2">'
         + _panel("Order value over time", _orders_over_time(store))
         + _panel("Top customers by order value", _top_customers(store),

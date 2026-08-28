@@ -86,10 +86,16 @@ assert n2["n"] == 2, "a token inside the skew window must be refreshed"
 # --- build_filter ---
 act = REPORTING_ENTITIES["activities"]
 f = build_filter(act)
-# Sub-entities expanded by default (one call beats paging)
-assert set(f["entities"]) == {"visits", "orderTotals", "orders"}
+# Every sub-entity the registry declares is expanded by default - they come
+# back in the same call, so this costs no extra requests.
+assert set(f["entities"]) == set(act["sub_entities"])
 assert all(v == {"include": True} for v in f["entities"].values())
 assert "limit" not in f and "order" not in f
+# the breakdown the whole point of this: each document type is requested
+for expected in ("orderTotals", "orders", "quoteTotals", "quotes",
+                 "creditRequestTotals", "creditRequests", "visits",
+                 "surveys", "forms", "comments", "emails"):
+    assert expected in f["entities"], expected
 
 # order is mandatory whenever skip/limit are used
 f2 = build_filter(act, limit=100, skip=0)
