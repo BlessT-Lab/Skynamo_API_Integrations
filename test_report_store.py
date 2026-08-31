@@ -76,7 +76,7 @@ activity = {
          "quantity": 2, "item_subtotal_value": 100.0},
     ],
 }
-written = store.upsert_entity("activities", [activity])
+written, _dropped = store.upsert_entity("activities", [activity])
 assert written["activities"] == 1
 assert written["activity_visits"] == 1
 assert written["order_totals"] == 1
@@ -352,7 +352,7 @@ try:
              "recipients": "d@e.f", "description": "follow up"},
         ],
     }
-    written = syn.upsert_entity("activities", [activity])
+    written, _dropped = syn.upsert_entity("activities", [activity])
     assert written["activity_comments"] == 3, \
         f"all three comments must survive, got {written.get('activity_comments')}"
     assert written["activity_emails"] == 2

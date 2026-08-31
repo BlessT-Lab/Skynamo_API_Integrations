@@ -10,4 +10,4 @@ Features: customer geolocation, product-image import/management, reporting
 extracts into a local store, and HTML dashboards built from that store.
 """
 
-__version__ = "2.9.0"
+__version__ = "2.9.1"

@@ -174,7 +174,7 @@ def run_extract(client, store, plans, on_progress=_noop,
             plan.notes = _append_note(plan.notes, error)
         else:
             try:
-                written = store.upsert_entity(plan.entity, rows)
+                written, dropped = store.upsert_entity(plan.entity, rows)
             except Exception as exc:   # a bad payload must not kill the run
                 plan.status = STATUS_RPT_FAILED
                 plan.notes = _append_note(plan.notes, f"store error: {exc}")
@@ -184,6 +184,18 @@ def run_extract(client, store, plans, on_progress=_noop,
                 detail = ", ".join(f"{t}={n}" for t, n in written.items() if n)
                 if detail:
                     plan.notes = _append_note(plan.notes, detail)
+                # Rows the store had to discard because the registry's key for
+                # that table is not a field this instance returns. Several
+                # sub-entity keys are unverified guesses, and a silent zero
+                # looks exactly like "there was no data" - so say so loudly.
+                if dropped:
+                    lost = ", ".join(f"{t} ({n} rows)"
+                                     for t, n in sorted(dropped.items()))
+                    plan.notes = _append_note(
+                        plan.notes,
+                        f"WARNING: discarded rows with no primary key: {lost}"
+                        " - the registry's key for those tables is probably"
+                        " wrong for this instance; run live_check_reporting.py")
                 # Only now is it safe to advance the watermark.
                 if new_bookmark and plan.spec.get("bookmarkable"):
                     store.set_bookmark(plan.endpoint, plan.reporting_period,

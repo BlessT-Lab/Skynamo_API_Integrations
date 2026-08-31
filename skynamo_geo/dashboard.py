@@ -77,20 +77,27 @@ def _bar_chart(pairs, value_format=_num, width=680, bar_height=26):
 
     Horizontal because the labels are customer/product names, which do not fit
     under vertical bars.
+
+    Values may be negative (credit requests are refunds), so bars are scaled by
+    the largest ABSOLUTE value and negatives drawn in a distinct colour. Scaling
+    by the plain maximum would draw an all-negative set far outside the track,
+    and would shrink a large refund to a 1px sliver when positives are present.
     """
     pairs = [(l, float(v or 0)) for l, v in pairs if v is not None]
     if not pairs:
         return _no_data()
-    top = max(v for _l, v in pairs) or 1.0
+    scale = max(abs(v) for _l, v in pairs) or 1.0
     label_w = 190
     track_w = width - label_w - 90
     height = len(pairs) * (bar_height + 8) + 8
+    has_negative = any(v < 0 for _l, v in pairs)
 
     parts = [f'<svg class="chart" viewBox="0 0 {width} {height}" '
              f'role="img" width="100%" height="{height}">']
     for i, (label, value) in enumerate(pairs):
         y = 8 + i * (bar_height + 8)
-        bar_w = max(1.0, (value / top) * track_w)
+        bar_w = min(track_w, max(1.0, (abs(value) / scale) * track_w))
+        colour = _WARN if value < 0 else _ACCENT
         parts.append(
             f'<text x="0" y="{y + bar_height * 0.7:.0f}" class="lbl">'
             f'{_esc(_truncate(label, 26))}</text>')
@@ -99,13 +106,17 @@ def _bar_chart(pairs, value_format=_num, width=680, bar_height=26):
             f'height="{bar_height}" fill="{_GRID}" rx="3"/>')
         parts.append(
             f'<rect x="{label_w}" y="{y}" width="{bar_w:.1f}" '
-            f'height="{bar_height}" fill="{_ACCENT}" rx="3"/>')
+            f'height="{bar_height}" fill="{colour}" rx="3"/>')
         parts.append(
             f'<text x="{label_w + track_w + 8}" '
             f'y="{y + bar_height * 0.7:.0f}" class="val">'
             f'{_esc(value_format(value))}</text>')
     parts.append("</svg>")
-    return "".join(parts)
+    svg = "".join(parts)
+    if has_negative:
+        svg += ('<p class="note">Bars are scaled by magnitude; negative values '
+                'are shown in amber.</p>')
+    return svg
 
 
 def _line_chart(pairs, value_format=_num, width=680, height=220):
@@ -242,93 +253,135 @@ def _kpis(store):
     return f'<div class="kpis">{"".join(tiles)}</div>'
 
 
-def _activity_types(store):
-    """What the activities actually were, from the root activity_type field."""
+def _read(store, sql, params=(), default=0):
+    """Read one value, returning (value, error_message).
+
+    Errors are returned rather than swallowed: a locked database or a bad
+    column would otherwise make a whole series vanish from a chart with no
+    indication, which reads as "there were none of those".
+    """
+    try:
+        return store.scalar(sql, params, default=default), ""
+    except Exception as exc:                      # noqa: BLE001 - reported
+        return default, str(exc)
+
+
+def _errors_note(errors):
+    if not errors:
+        return ""
+    return (f'<p class="note warn">Could not read: '
+            f'{_esc("; ".join(sorted(set(errors))))}. '
+            f'Figures below are incomplete.</p>')
+
+
+def _activity_types(store, limit=12):
+    """What the activities actually were, from the root activity_type field.
+
+    Capped like the other rankings: activity_type values are instance-specific
+    and unbounded, and an uncapped chart blows the panel out of the grid.
+    """
     rows = store.query(
         "SELECT COALESCE(NULLIF(activity_type, ''), '(unspecified)') AS t, "
         f"COUNT(*) AS n FROM activities WHERE {_LIVE} "
-        "GROUP BY t ORDER BY n DESC")
-    return _bar_chart([(r[0], r[1]) for r in rows], value_format=_num)
+        "GROUP BY t ORDER BY n DESC LIMIT ?", (limit + 1,))
+    pairs = [(r[0], r[1]) for r in rows]
+    note = ""
+    if len(pairs) > limit:
+        pairs = pairs[:limit]
+        note = (f'<p class="note">Showing the top {limit} types; more exist in '
+                f'the store.</p>')
+    return _bar_chart(pairs, value_format=_num) + note
 
 
 def _document_breakdown(store):
     """How many of each document type the activities produced.
 
     Counts the header/total row per document (not line items), so "Orders: 12"
-    means twelve orders rather than twelve order lines.
+    means twelve orders rather than twelve order lines. Line counts go in the
+    note rather than the bar label: the bar length encodes documents, and
+    packing a second metric into the label invites comparing the wrong numbers
+    (and gets truncated mid-figure).
     """
-    pairs = []
+    pairs, lines, errors = [], [], []
     for label, (table, item_table) in DOCUMENT_TABLES.items():
-        try:
-            n = store.scalar(
-                f'SELECT COUNT(*) FROM "{table}" WHERE {_LIVE}', default=0)
-        except Exception:          # table absent in an older store
+        n, err = _read(store, f'SELECT COUNT(*) FROM "{table}" WHERE {_LIVE}')
+        if err:
+            errors.append(label)
             continue
-        lines = None
-        if item_table:
-            try:
-                lines = store.scalar(
-                    f'SELECT COUNT(*) FROM "{item_table}" WHERE {_LIVE}',
-                    default=0)
-            except Exception:
-                lines = None
-        # Only mention line items when there are some - "(0 lines)" is noise.
-        name = f"{label} ({_num(lines)} lines)" if lines else label
-        pairs.append((name, n))
-    if not any(n for _l, n in pairs):
-        return _no_data("No documents in the store for this period.")
-    return _bar_chart(pairs, value_format=_num)
+        if n:
+            pairs.append((label, n))      # zero-count bars are just noise
+        if item_table and n:
+            count, err = _read(
+                store, f'SELECT COUNT(*) FROM "{item_table}" WHERE {_LIVE}')
+            if not err and count:
+                lines.append(f"{label} {_num(count)}")
+    if not pairs:
+        return (_errors_note(errors)
+                + _no_data("No documents in the store for this period."))
+    body = _errors_note(errors) + _bar_chart(pairs, value_format=_num)
+    if lines:
+        body += f'<p class="note">Line items — {", ".join(lines)}.</p>'
+    return body
 
 
 def _document_values(store):
     """Value per document type, so quotes can be compared with orders."""
-    pairs = []
-    for label, table in (("Orders", "order_totals"),
-                         ("Quotes", "quote_totals"),
-                         ("Credit requests", "credit_request_totals")):
-        try:
-            pairs.append((label, store.scalar(
-                f'SELECT SUM(subtotal_value) FROM "{table}" WHERE {_LIVE}',
-                default=0)))
-        except Exception:
+    # Derived from DOCUMENT_TABLES so a new document type appears here too:
+    # those with a line-item table are the sales documents that carry a value.
+    pairs, errors = [], []
+    for label, (table, item_table) in DOCUMENT_TABLES.items():
+        if not item_table:
             continue
-    if not any(v for _l, v in pairs):
-        return _no_data()
-    body = _bar_chart(pairs, value_format=_money)
-    # Quote -> order conversion, which the API gives as a direct foreign key.
-    try:
-        quotes = store.scalar(
-            f"SELECT COUNT(*) FROM quote_totals WHERE {_LIVE}", default=0)
-        converted = store.scalar(
-            "SELECT COUNT(DISTINCT quote_id) FROM order_totals "
-            f"WHERE {_LIVE} AND quote_id IS NOT NULL AND quote_id != ''",
-            default=0)
-    except Exception:
-        return body
-    if quotes:
+        value, err = _read(
+            store, f'SELECT SUM(subtotal_value) FROM "{table}" WHERE {_LIVE}')
+        if err:
+            errors.append(label)
+            continue
+        if value:
+            pairs.append((label, value))
+    if not pairs:
+        return _errors_note(errors) + _no_data()
+    body = _errors_note(errors) + _bar_chart(pairs, value_format=_money)
+
+    # Quote -> order conversion. Only count orders whose quote is actually in
+    # the store: a delta or short period routinely holds orders raised against
+    # quotes from an earlier window, which otherwise gives percentages >100%.
+    quotes, err_q = _read(
+        store, f"SELECT COUNT(*) FROM quote_totals WHERE {_LIVE}")
+    converted, err_c = _read(
+        store,
+        "SELECT COUNT(DISTINCT o.quote_id) FROM order_totals o "
+        f"WHERE o.{_LIVE} AND o.quote_id IS NOT NULL AND o.quote_id != '' "
+        "AND o.quote_id IN (SELECT quote_id FROM quote_totals "
+        f"                  WHERE {_LIVE})")
+    if not (err_q or err_c) and quotes:
         pct = converted / quotes * 100
         body += (f'<p class="note">{_num(converted)} of {_num(quotes)} quotes '
-                 f'became orders ({pct:.0f}%).</p>')
+                 f'in this extract became orders ({pct:.0f}%).</p>')
     return body
 
 
 def _survey_findings(store, limit=8):
-    """Stocktake/survey results - stock level and facings per product."""
+    """Stocktake/survey results - average stock level per product.
+
+    Grouped by product_id, not by display name: distinct products sharing a
+    name would otherwise be merged and their averages presented as one.
+    """
     try:
         rows = store.query(
-            "SELECT COALESCE(NULLIF(p.name, ''), NULLIF(s.product_code, ''), "
-            "                'Unknown') AS what, "
+            "SELECT COALESCE(MIN(NULLIF(p.name, '')), "
+            "                MIN(NULLIF(s.product_code, '')), 'Unknown') AS what, "
             "       AVG(s.stock_level) AS stock, COUNT(*) AS n "
             "FROM surveys s "
             "LEFT JOIN products p ON p.product_id = s.product_id "
-            f"WHERE s.{_LIVE} "
-            "GROUP BY what ORDER BY n DESC LIMIT ?", (limit,))
-    except Exception:
-        return _no_data("No survey data in the store.")
-    pairs = [(f"{r[0]} ({_num(r[2])} obs)", r[1]) for r in rows
-             if r[1] is not None]
+            f"WHERE s.{_LIVE} AND s.stock_level IS NOT NULL "
+            "GROUP BY s.product_id, s.product_code "
+            "ORDER BY n DESC LIMIT ?", (limit,))
+    except Exception as exc:                      # noqa: BLE001 - reported
+        return _no_data(f"Could not read survey data: {exc}")
+    pairs = [(f"{r[0]} ({_num(r[2])} obs)", r[1]) for r in rows]
     if not pairs:
-        return _no_data("No survey/stocktake results for this period.")
+        return _no_data("No survey/stocktake stock levels for this period.")
     return _bar_chart(pairs, value_format=lambda v: _num(v, 1))
 
 
@@ -468,6 +521,7 @@ main{max-width:1180px;margin:0 auto;display:grid;gap:20px}
 .chart .axis{font-size:11px;fill:%(muted)s}
 .nodata{color:%(muted)s;font-style:italic;margin:8px 0 0;font-size:14px}
 .note{color:%(muted)s;font-size:12px;margin:0 0 12px}
+.note.warn{color:%(warn)s;font-weight:600}
 .tablewrap{overflow-x:auto}
 table{border-collapse:collapse;width:100%%;font-size:14px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid %(grid)s;
@@ -477,7 +531,7 @@ th{color:%(muted)s;font-weight:600;font-size:12px;text-transform:uppercase;
 tbody tr:last-child td{border-bottom:none}
 footer{max-width:1180px;margin:24px auto 0;color:%(muted)s;font-size:12px}
 @media print{body{background:#fff;padding:0}.panel,.kpi{break-inside:avoid}}
-""" % {"ink": _INK, "muted": _MUTED, "grid": _GRID}
+""" % {"ink": _INK, "muted": _MUTED, "grid": _GRID, "warn": _WARN}
 
 
 def build_dashboard(store, out_path, title="Skynamo Dashboard",

@@ -68,7 +68,11 @@ def synthetic_key(row, fields):
     while staying idempotent: the same content always yields the same key, so
     re-extracting does not duplicate.
     """
-    parts = [str(row.get(f, "")) for f in fields]
+    # A field that is absent and a field that is present-but-null are the same
+    # thing here. Without this, str(None) -> "None" hashes differently from the
+    # missing case and the "re-extracting does not duplicate" guarantee breaks,
+    # which matters because the API's envelope is inconsistent about nulls.
+    parts = ["" if row.get(f) is None else str(row.get(f)) for f in fields]
     return hashlib.sha1("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -219,11 +223,12 @@ class ReportStore:
         """Insert or update rows by primary key. Returns the number written.
 
         Commits on success, rolls back on failure. Use _write_rows directly to
-        batch several tables into one transaction.
+        batch several tables into one transaction, or to see the skipped count.
         """
         with self._lock:
             try:
-                written = self._write_rows(table, primary_key, columns, rows)
+                written, _skipped = self._write_rows(
+                    table, primary_key, columns, rows)
             except Exception:
                 self.conn.rollback()
                 raise
@@ -231,11 +236,16 @@ class ReportStore:
             return written
 
     def _write_rows(self, table, primary_key, columns, rows):
-        """Upsert rows without committing. Caller holds the lock.
+        """Upsert rows without committing. Returns (written, skipped).
 
         Unknown keys in a row are ignored (the API can return more than the
-        registry declares); missing ones are left NULL. Rows with no primary
-        key value are skipped rather than silently colliding on NULL.
+        registry declares); missing ones are left NULL.
+
+        Rows with no primary key value are skipped rather than colliding on
+        NULL - and COUNTED, because that is the signature of the registry
+        naming a key field this instance does not actually use. Several
+        sub-entity keys are unverified guesses from a spec with known defects,
+        so a silent zero here would look identical to "there was no data".
         """
         known = list(columns.keys())
         if primary_key not in known:
@@ -252,20 +262,25 @@ class ReportStore:
 
         cur = self.conn.cursor()
         written = 0
+        skipped = 0
         for row in rows:
             norm = normalise_row(row)
             if norm.get(primary_key) in (None, ""):
+                skipped += 1
                 continue
             cur.execute(sql, [_coerce(norm.get(c)) for c in known])
             written += 1
-        return written
+        return written, skipped
 
     def upsert_entity(self, entity, rows):
         """Upsert a root entity's rows plus any nested sub-entity rows.
 
-        Returns {table: rows_written}. Sub-entity rows arrive nested inside each
-        root row (that is what `entities` expansion returns), and are linked
-        back via the sub-entity's parent_key.
+        Returns (written, skipped), both {table: count}. `skipped` only carries
+        tables that actually lost rows, and means the registry's primary key for
+        that table is not a field this instance returns - see _write_rows.
+
+        Sub-entity rows arrive nested inside each root row (that is what
+        `entities` expansion returns) and are linked back via parent_key.
 
         The root and all of its children go in ONE transaction: a failure part
         way through a sub-entity would otherwise leave, say, activities stored
@@ -274,23 +289,30 @@ class ReportStore:
         spec = REPORTING_ENTITIES[entity]
         normalised = [normalise_row(r) for r in rows]
         written = {}
+        skipped = {}
+
+        def record(table, result):
+            count, missed = result
+            written[table] = count
+            if missed:
+                skipped[table] = missed
 
         with self._lock:
             try:
-                written[spec["table"]] = self._write_rows(
+                record(spec["table"], self._write_rows(
                     spec["table"], spec["primary_key"], spec["columns"],
-                    normalised)
+                    normalised))
                 for api_name, sub in (spec.get("sub_entities") or {}).items():
                     child_rows = _child_rows(normalised, spec, api_name, sub)
                     if child_rows:
-                        written[sub["table"]] = self._write_rows(
+                        record(sub["table"], self._write_rows(
                             sub["table"], sub["primary_key"], sub["columns"],
-                            child_rows)
+                            child_rows))
             except Exception:
                 self.conn.rollback()
                 raise
             self.conn.commit()
-        return written
+        return written, skipped
 
     def reconcile(self, table, primary_key, live_keys):
         """Soft-delete rows whose key is absent from a full key sweep.

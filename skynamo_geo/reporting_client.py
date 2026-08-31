@@ -25,7 +25,8 @@ import requests
 from .config import REQUEST_TIMEOUT
 from .reporting_config import (
     ANALYTICS_BASE, DEFAULT_RATE_LIMIT, FILTERABLE_FIELDS_ENDPOINTS,
-    RATE_LIMIT_BY_PERIOD, REPORTING_ENTITIES, ROLES_ENDPOINT,
+    RATE_LIMIT_BY_PERIOD, REPORTING_ENTITIES, REPORTING_NETWORK_RETRIES,
+    REPORTING_TIMEOUT, ROLES_ENDPOINT,
     TOKEN_AUDIENCE, TOKEN_DEFAULT_TTL, TOKEN_REFRESH_SKEW, TOKEN_URL,
 )
 
@@ -242,6 +243,7 @@ class ReportingClient:
         self.last_bookmark = None
         url = f"{ANALYTICS_BASE}{endpoint}"
         refreshed = False
+        network_failures = 0
 
         for attempt in range(self.retries + 1):
             if period:
@@ -254,12 +256,24 @@ class ReportingClient:
             headers = {"Authorization": f"Bearer {token}"}
             try:
                 resp = self.session.get(url, params=params, headers=headers,
-                                        timeout=REQUEST_TIMEOUT)
+                                        timeout=REPORTING_TIMEOUT)
             except requests.RequestException as exc:
-                if attempt < self.retries:
+                # Every retry re-enters the throttle above, so on a tight
+                # period each one costs a slot of the published allowance.
+                # Retry network failures at most REPORTING_NETWORK_RETRIES
+                # times rather than burning the whole budget.
+                network_failures += 1
+                if network_failures <= REPORTING_NETWORK_RETRIES:
                     self._sleep(2)
                     continue
-                return [], f"Connection error: {exc}", None
+                hint = ""
+                if isinstance(exc, requests.Timeout):
+                    hint = (f" The request did not complete within "
+                            f"{REPORTING_TIMEOUT}s - this endpoint returns "
+                            f"every expanded sub-entity in one response, so a "
+                            f"wide reporting period can be very large. Try a "
+                            f"shorter period.")
+                return [], f"Connection error: {exc}.{hint}", None
 
             # Token may have expired: refresh once and retry.
             if resp.status_code == 401 and not refreshed:

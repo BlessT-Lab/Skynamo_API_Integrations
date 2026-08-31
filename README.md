@@ -575,6 +575,37 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.9.1** (2026-08-27) — **Review fixes to the breakdown.**
+  - **Discarded rows are now reported.** If a sub-entity's primary key is not a
+    field your instance returns, the store discards every row of it — and
+    several of those keys are unverified guesses from a defective spec. A silent
+    zero looked exactly like "there was no data"; the extract now emits a
+    **WARNING** naming the table, the row count and what to do about it.
+    `live_check_reporting.py` now diffs each **sub-entity**'s columns and key
+    too (it previously only checked root entities), and suggests candidate
+    `*_id` fields when the declared key is absent.
+  - **Quote→order conversion could exceed 100%** — orders raised against quotes
+    from an earlier window counted against only the quotes in this extract.
+    Now scoped to quotes actually present, and labelled "in this extract".
+  - **Survey panel could claim "no results" when there were some** — the row
+    limit was applied before null stock levels were filtered out. Also grouped
+    by product id rather than name, so distinct products sharing a name are no
+    longer merged into one average.
+  - **Negative values render correctly** — credit requests are refunds; bars are
+    scaled by magnitude (an all-negative set previously drew outside the chart)
+    and shown in amber.
+  - **Read failures are named, not swallowed** — a locked database made a whole
+    series vanish silently, reading as "there were none of those".
+  - Activity types are capped like the other rankings; zero-count document types
+    are omitted rather than drawn as empty bars; line counts moved out of the
+    bar labels (they were being truncated mid-number and invited comparing two
+    different metrics); "Value by document type" derives its tables from
+    `DOCUMENT_TABLES` instead of re-hardcoding them.
+  - **Synthetic keys treat absent and null identically** — the API is
+    inconsistent, and hashing `"None"` duplicated the row on re-extract.
+  - **One expanded call gets a longer timeout** and retries a network failure
+    only once: each retry re-enters the rate-limit throttle, so on `AllData`
+    (2 queries per 10 minutes) retries could burn the whole allowance.
 - **v2.9.0** (2026-08-27) — **Activity breakdown.** "Activity" was too vague to
   act on, so the extract now pulls **all 11** of the sub-entities
   `/v2/activities` offers, not 3: quotes, credit requests, surveys, completed

@@ -90,16 +90,56 @@ def _describe(rows, spec):
     if not missing and not extra:
         print("      registry columns match the payload exactly.")
 
-    # Sub-entities only appear when `entities` expansion worked.
+    # Sub-entities only appear when `entities` expansion worked. These get the
+    # SAME column/primary-key diff as the root: a sub-entity whose primary key
+    # is not in the payload has every row silently discarded by the store, and
+    # several of those keys are unverified guesses from a defective spec.
     for api_name, sub in (spec.get("sub_entities") or {}).items():
-        value = sample.get(api_name) or sample.get(normalise_key(api_name))
+        _describe_sub(rows, api_name, sub)
+
+
+def _describe_sub(rows, api_name, sub):
+    """Diff one sub-entity's payload against its registry declaration."""
+    # Scan every row - the first activity may simply have no quotes.
+    nested = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = row.get(api_name) or row.get(normalise_key(api_name))
         if isinstance(value, list):
-            n = len(value)
-            keys = sorted(value[0].keys()) if n and isinstance(value[0], dict) else []
-            print(f"      sub-entity '{api_name}': {n} row(s)"
-                  + (f", keys: {', '.join(keys[:10])}" if keys else ""))
-        else:
-            print(f"      sub-entity '{api_name}': absent in this sample")
+            nested.extend(v for v in value if isinstance(v, dict))
+    if not nested:
+        print(f"      sub-entity '{api_name}': no rows in this sample "
+              f"(cannot verify)")
+        return
+
+    actual = set()
+    for child in nested:
+        actual |= {normalise_key(k) for k in child}
+    declared = set(sub.get("columns") or {})
+    pk = sub["primary_key"]
+
+    print(f"      sub-entity '{api_name}': {len(nested)} row(s)")
+    if sub.get("synthetic_key"):
+        missing_src = [f for f in sub["synthetic_key"] if f not in actual]
+        note = (f" - source fields missing: {', '.join(missing_src)}"
+                if missing_src else " - all source fields present")
+        print(f"        key: synthetic from {sub['synthetic_key']}{note}")
+    elif pk in actual:
+        print(f"        key: '{pk}' PRESENT")
+    else:
+        print(f"        !! key '{pk}' NOT IN PAYLOAD - the store would discard")
+        print(f"           EVERY row of this sub-entity. Candidates: "
+              f"{', '.join(sorted(k for k in actual if k.endswith('_id'))) or '(none ending _id)'}")
+
+    missing = sorted(declared - actual - {pk})
+    if missing:
+        print(f"        registry columns NOT in payload: {', '.join(missing)}")
+    extra = sorted(k for k in actual - declared
+                   if not any(isinstance(c.get(k), (list, dict))
+                              for c in nested))
+    if extra:
+        print(f"        payload fields NOT in registry:  {', '.join(extra)}")
 
 
 def main():

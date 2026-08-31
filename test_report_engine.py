@@ -176,6 +176,40 @@ row = plans6[0].to_report_row()
 assert set(row) == {"entity", "mode", "reporting_period", "rows",
                     "date_range", "status", "notes"}
 
+# --- rows discarded for a missing primary key must be REPORTED -----------
+# Several sub-entity keys in the registry are unverified guesses from a spec
+# with known defects. If the live payload uses a different field name, every
+# row is discarded - and a silent zero looks exactly like "there was no data".
+store_drop = ReportStore(":memory:")
+client_drop = FakeClient(rows_by_entity={
+    "activities": [{
+        "activity_id": "a1", "activity_type": "Visit",
+        # surveys keyed on survey_item_id, which this "instance" does not send
+        "surveys": [{"surveyItemRef": "s1", "stock_level": 5},
+                    {"surveyItemRef": "s2", "stock_level": 8}],
+        "visits": [{"activity_id": "a1", "duration_sec": 60}],
+    }]})
+plans_drop = plan_extract(store_drop, ["activities"], "ThisMonth")
+run_extract(client_drop, store_drop, plans_drop)
+plan = plans_drop[0]
+assert plan.status == STATUS_RPT_EXTRACTED, "the run still succeeds"
+assert store_drop.counts()["surveys"] == 0
+assert "WARNING" in plan.notes, plan.notes
+assert "surveys (2 rows)" in plan.notes, plan.notes
+assert "live_check_reporting" in plan.notes, "should point at the fix"
+# the warning reaches the CSV report too
+assert "WARNING" in plan.to_report_row()["notes"]
+# a clean payload produces no warning
+store_ok = ReportStore(":memory:")
+client_ok = FakeClient(rows_by_entity={
+    "activities": [{"activity_id": "a1",
+                    "surveys": [{"survey_item_id": "s1", "stock_level": 5}]}]})
+plans_ok = plan_extract(store_ok, ["activities"], "ThisMonth")
+run_extract(client_ok, store_ok, plans_ok)
+assert "WARNING" not in plans_ok[0].notes
+assert store_ok.counts()["surveys"] == 1
+store_drop.close(); store_ok.close()
+
 # --- the GUI's threading pattern, end to end ----------------------------
 # Regression for "SQLite objects created in a thread can only be used in that
 # same thread": the GUI creates the store on the connect worker, renders labels

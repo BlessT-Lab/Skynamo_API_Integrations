@@ -121,6 +121,10 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
   idempotent, stores nested sub-entity rows, and commits the root **and** its children in one
   transaction; bookmarks keyed `(endpoint, reporting_period)`; `runs` table is the tool's only
   persistent history; `reconcile` soft-deletes via `is_deleted`.
+  `upsert_entity` returns **`(written, skipped)`** — `skipped` counts rows discarded for having no
+  primary key, which is the signature of the registry naming a key field this instance does not
+  send. `run_extract` turns that into a loud WARNING in the notes and CSV; a silent zero is
+  indistinguishable from "there was no data", and several sub-entity keys are unverified guesses.
   **Threading:** one instance is usable from several threads (the GUI creates it on one worker and
   reads it from the main thread and others). Writes serialise on a re-entrant lock; **reads open
   their own short-lived connection and take no lock**, so a label refresh on the main thread can
@@ -205,7 +209,19 @@ never gets a stray database.
 - **Comments and emails have no id in the API.** Keying them on `activity_id` would make each
   overwrite the last, so their registry entries declare `synthetic_key` and `report_store.synthetic_key`
   hashes the identifying columns. Deterministic, so re-extracting the same content does not duplicate.
-  Use the same mechanism for any future keyless sub-entity.
+  Use the same mechanism for any future keyless sub-entity. It treats absent and null identically —
+  the API is inconsistent about which it sends, and hashing `"None"` would duplicate the row.
+- **A guessed primary key fails silently unless you look.** If a sub-entity's declared key is not a
+  field the instance returns, every row of it is discarded. That is why the store counts skipped
+  rows, `run_extract` warns, and `live_check_reporting.py` diffs each **sub-entity**'s columns and
+  key (not just the roots) and names candidate `*_id` fields when the key is missing.
+- **One expanded call is large.** `/v2/activities` with all 11 sub-entities and no paging returns
+  the whole graph in one body, so it uses `REPORTING_TIMEOUT` (much longer than the Public API's
+  `REQUEST_TIMEOUT`) and retries a network failure only `REPORTING_NETWORK_RETRIES` times — each
+  retry re-enters the throttle, so on `AllData` (2 per 10 min) unbounded retries would spend the
+  entire allowance on one failed call.
+- **Dashboard figures are scoped to the store, not the instance.** Quote→order conversion counts
+  only orders whose quote is also in the extract; otherwise a delta or short period yields >100%.
 - **`order` is mandatory whenever `skip`/`limit` are used** — the spec says so twice. `build_filter`
   adds it automatically, and omits paging entirely for entities with no documented sortable field.
 - **A bookmark is scoped to `(endpoint, reportingPeriod)`.** Reusing one across periods returns

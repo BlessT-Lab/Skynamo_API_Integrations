@@ -5,11 +5,12 @@ escapes instance text, and handles an empty store without raising."""
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 
 from skynamo_geo.dashboard import (
-    build_dashboard, _bar_chart, _invoice_totals, _line_chart, _nice_max, _num,
-    _truncate,
+    build_dashboard, _bar_chart, _invoice_totals, _line_chart, _money,
+    _nice_max, _num, _truncate,
 )
 from skynamo_geo.report_store import ReportStore
 
@@ -215,7 +216,7 @@ try:
     assert "Orders" in html_out and "Quotes" in html_out
     assert "Credit requests" in html_out
     # quote -> order conversion: 1 of 2 quotes converted
-    assert "1 of 2 quotes became orders (50%)" in html_out, "conversion line"
+    assert "1 of 2 quotes in this extract became orders (50%)" in html_out
     # document values are shown
     assert "900" in html_out or "1,300" in html_out
     # survey stock level appears
@@ -229,6 +230,110 @@ try:
         untyped, os.path.join(tmp, "untyped.html")), encoding="utf-8").read()
     assert "(unspecified)" in out_untyped
     untyped.close()
+
+    # --- review regressions ---------------------------------------------
+    from skynamo_geo.dashboard import (
+        _activity_types, _document_breakdown, _document_values,
+        _survey_findings,
+    )
+
+    # (a) conversion must never exceed 100%: a short period or a delta holds
+    #     orders raised against quotes from an earlier window.
+    conv = ReportStore(os.path.join(tmp, "conv.db"))
+    conv.upsert_entity("activities", [{
+        "activity_id": "c1",
+        # three orders referencing quotes that are NOT in this extract
+        "orderTotals": [{"order_id": "o1", "quote_id": "old1",
+                         "subtotal_value": 10.0},
+                        {"order_id": "o2", "quote_id": "old2",
+                         "subtotal_value": 10.0},
+                        {"order_id": "o3", "quote_id": "old3",
+                         "subtotal_value": 10.0}],
+        "orders": [{"order_item_id": "oi1", "order_id": "o1"}],
+        # a single quote that was not converted
+        "quoteTotals": [{"quote_id": "q9", "subtotal_value": 99.0}],
+        "quotes": [{"quote_item_id": "qi9", "quote_id": "q9"}],
+    }])
+    out = _document_values(conv)
+    assert "300%" not in out, "must not count quotes absent from the store"
+    assert "0 of 1 quotes in this extract became orders (0%)" in out, out
+    conv.close()
+
+    # (b) surveys: LIMIT must not be applied before NULL stock levels are
+    #     filtered, or a store with results reports "no results".
+    surv = ReportStore(os.path.join(tmp, "surv.db"))
+    nulls = [{"survey_item_id": f"n{i}", "product_id": f"pn{i}",
+              "stock_level": None} for i in range(10)]
+    reals = [{"survey_item_id": f"r{i}", "product_id": "pr1",
+              "product_code": "R1", "stock_level": 42} for i in range(3)]
+    surv.upsert_entity("products", [{"product_id": "pr1", "name": "Real Product"}])
+    surv.upsert_entity("activities", [{"activity_id": "s1",
+                                       "surveys": nulls + reals}])
+    out = _survey_findings(surv, limit=8)
+    assert "No survey" not in out, "results exist and must be shown"
+    assert "Real Product" in out and "42" in out, out
+
+    # (c) distinct products sharing a name must not be merged
+    surv.upsert_entity("products", [
+        {"product_id": "d1", "name": "Cola 500ml"},
+        {"product_id": "d2", "name": "Cola 500ml"}])
+    surv.upsert_entity("activities", [{"activity_id": "s2", "surveys": [
+        {"survey_item_id": "x1", "product_id": "d1", "stock_level": 10},
+        {"survey_item_id": "x2", "product_id": "d2", "stock_level": 90}]}])
+    out = _survey_findings(surv, limit=10)
+    assert out.count("Cola 500ml") == 2, "same-named products stay separate"
+    assert "50.0" not in out, "must not average across distinct products"
+    surv.close()
+
+    # (d) negative values (credit requests are refunds) render inside the track
+    neg = _bar_chart([("Credit requests", -100.0), ("Other", -50.0)],
+                     value_format=_money)
+    widths = [float(w) for w in re.findall(r'<rect [^>]*width="([\d.]+)"', neg)]
+    assert widths and max(widths) <= 490, f"bars must stay in the track: {widths}"
+    assert "-100.00" in neg and "amber" in neg
+    # mixed signs: the negative is not reduced to a sliver
+    mixed = _bar_chart([("Orders", 200.0), ("Credits", -200.0)])
+    bars = [float(w) for w in re.findall(
+        r'<rect [^>]*width="([\d.]+)"[^>]*rx="3"/>', mixed)]
+    assert bars.count(max(bars)) >= 2, "equal magnitudes should be equal bars"
+
+    # (e) zero-count document types are omitted, not drawn as 0 bars
+    only = ReportStore(os.path.join(tmp, "onlyvisits.db"))
+    only.upsert_entity("activities", [{
+        "activity_id": "v1",
+        "visits": [{"activity_id": "v1", "duration_sec": 60}]}])
+    out = _document_breakdown(only)
+    assert "Visits" in out
+    for absent in ("Orders", "Quotes", "Credit requests", "Emails"):
+        assert absent not in out, f"{absent} has no rows and should be omitted"
+    only.close()
+
+    # (f) activity types are capped like the other rankings
+    many = ReportStore(os.path.join(tmp, "many.db"))
+    many.upsert_entity("activities", [
+        {"activity_id": f"m{i}", "activity_type": f"Type {i}"}
+        for i in range(40)])
+    out = _activity_types(many, limit=12)
+    assert out.count("</text>") <= 12 * 2 + 2, "should be capped"
+    assert "Showing the top 12" in out
+    many.close()
+
+    # (g) a read error is reported, not silently dropped from the chart
+    class BrokenStore(ReportStore):
+        def scalar(self, sql, params=(), default=0):
+            if "quote_totals" in sql:
+                raise sqlite3.OperationalError("database is locked")
+            return super().scalar(sql, params, default)
+
+    broken = BrokenStore(os.path.join(tmp, "broken.db"))
+    broken.upsert_entity("activities", [{
+        "activity_id": "b1",
+        "orderTotals": [{"order_id": "o1", "subtotal_value": 5.0}],
+        "orders": [{"order_item_id": "oi1", "order_id": "o1"}]}])
+    out = _document_breakdown(broken)
+    assert "Could not read" in out and "Quotes" in out, \
+        "a failed series must be named, not silently vanish"
+    broken.close()
 
     # --- self-contained: nothing loads from the network ---
     assert "http://" not in dash and "https://" not in dash, \

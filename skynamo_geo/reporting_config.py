@@ -20,6 +20,15 @@ TOKEN_AUDIENCE = "https://integration.skynamo.me/"
 TOKEN_DEFAULT_TTL = 3600
 TOKEN_REFRESH_SKEW = 60  # refresh this many seconds before expiry
 
+# One activities call now returns the whole expanded graph - every order,
+# quote, credit request, survey, form, comment and email for the period, with
+# no paging - so it needs far longer than the Public API's 30s. A timeout here
+# is expensive: the retry re-enters the per-period throttle, so on AllData
+# (2 queries / 10 min) a couple of timeouts consume the entire budget.
+REPORTING_TIMEOUT = 300
+# Retries for a network-level failure. Kept low for the same reason.
+REPORTING_NETWORK_RETRIES = 1
+
 # --- Reporting periods ---------------------------------------------------
 # The 21 values of ReportingPeriodTypeV2, grouped for the UI.
 PERIOD_GROUPS = [

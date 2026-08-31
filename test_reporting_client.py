@@ -252,6 +252,40 @@ t3 = _PeriodThrottle(sleep=sleeper, clock=clock)
 t3.wait("MadeUpPeriod"); t3.wait("MadeUpPeriod"); t3.wait("MadeUpPeriod")
 assert naps and naps[0] > 0
 
+# --- a network failure must not burn the whole rate-limit budget ---------
+# Every retry re-enters the per-period throttle, so on AllData (2 queries per
+# 10 minutes) unbounded retries spend the entire allowance on one failed call.
+import requests as _requests
+from skynamo_geo.reporting_config import (
+    REPORTING_NETWORK_RETRIES, REPORTING_TIMEOUT,
+)
+
+
+class TimingOutSession(FakeSession):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.attempts += 1
+        self.gets.append({"url": url, "params": params, "headers": headers,
+                          "timeout": timeout})
+        raise _requests.Timeout("timed out")
+
+
+timeout_session = TimingOutSession()
+c_to = ReportingClient("id", SECRET, session=timeout_session,
+                       sleep=lambda s: None)
+rows, error, status = c_to._get("/v2/activities", {}, period="AllData")
+assert rows == [] and status is None
+assert timeout_session.attempts == REPORTING_NETWORK_RETRIES + 1, \
+    f"should stop after {REPORTING_NETWORK_RETRIES} retries, " \
+    f"made {timeout_session.attempts} attempts"
+assert "shorter period" in error, error
+assert str(REPORTING_TIMEOUT) in error
+# the generous timeout is actually applied - one call returns the whole graph
+assert timeout_session.gets[0]["timeout"] == REPORTING_TIMEOUT
+
 # --- test_connection happy path ---
 session9 = FakeSession(get_responses=[FakeResponse(200, [{"roleId": 1}])])
 c9 = ReportingClient("id", SECRET, session=session9, sleep=lambda s: None)
