@@ -3,7 +3,8 @@
 Drives skynamo_geolocation.run_image_import / run_manage_images with scripted
 prompt answers and a fake client, asserting the things the engine tests can't:
 that nothing uploads until the user confirms, that deselection is honoured,
-that replace mode demands an extra confirmation, and that the reports land.
+that replace mode demands an extra confirmation, that filing the processed
+files away is opt-in, and that the reports land.
 
 No network, no real credentials; runs in a temp cwd so report CSVs don't
 litter the repo.
@@ -18,6 +19,7 @@ from contextlib import redirect_stdout
 
 import skynamo_geolocation as cli
 from skynamo_geo.config import (
+    IMAGE_FOLDER_FAILED, IMAGE_FOLDER_SUCCESS,
     STATUS_IMG_PENDING, STATUS_IMG_UPLOADED, STATUS_ATT_DELETED,
     STATUS_ATT_LOADED,
 )
@@ -172,6 +174,7 @@ try:
         texts=[folder],
         confirms=[True,     # upload all of these?
                   False,    # replace existing images?
+                  False,    # move processed files into subfolders?
                   True],    # upload N now?
     ))
     assert exc is None, exc
@@ -199,6 +202,7 @@ try:
         texts=[folder],
         confirms=[True,      # upload all
                   False,     # replace? no
+                  False,     # move files? no
                   False],    # upload now? NO
     ))
     assert isinstance(exc, SystemExit) and "Aborted" in str(exc)
@@ -212,6 +216,7 @@ try:
         texts=[folder],
         confirms=[False,     # upload all? no -> choose individually
                   False,     # replace? no
+                  False,     # move files? no
                   True],     # upload now
         checkboxes=[lambda choices: [c for c in choices if c.startswith("XYZ")]],
     ))
@@ -238,6 +243,7 @@ try:
         confirms=[True,      # upload all
                   True,      # replace existing? YES
                   True,      # continue with replace mode?
+                  False,     # move files? no
                   True],     # upload now
     )
     out, exc = run(cli.run_image_import, client, script)
@@ -261,6 +267,47 @@ try:
     ))
     assert isinstance(exc, SystemExit) and "Aborted" in str(exc)
     assert client.uploaded == [], "must abort before any upload"
+
+    # --- import: files stay put unless the move prompt is answered yes ---
+    folder = make_folder(); folders.append(folder)
+    client = FakeClient(make_products())
+    out, exc = run(cli.run_image_import, client, Script(
+        texts=[folder],
+        confirms=[True,      # upload all
+                  False,     # replace? no
+                  False,     # move files? NO
+                  True],     # upload now
+    ))
+    assert exc is None, exc
+    assert sorted(os.listdir(folder)) == ["ABC.png", "NOPE.png", "XYZ.png"], \
+        os.listdir(folder)
+    assert "FILED:" not in out
+
+    # --- import: saying yes files each image by its outcome ---
+    folder = make_folder(); folders.append(folder)
+    client = FakeClient(make_products())
+    script = Script(
+        texts=[folder],
+        confirms=[True,      # upload all
+                  False,     # replace? no
+                  True,      # move files? YES
+                  True],     # upload now
+    )
+    out, exc = run(cli.run_image_import, client, script)
+    assert exc is None, exc
+    assert any("move processed files" in m for m, _a in script.confirm_log), \
+        script.confirm_log
+    good = os.path.join(folder, IMAGE_FOLDER_SUCCESS)
+    bad = os.path.join(folder, IMAGE_FOLDER_FAILED)
+    assert sorted(os.listdir(good)) == ["ABC.png", "XYZ.png"], os.listdir(good)
+    assert sorted(os.listdir(bad)) == ["NOPE.png"], os.listdir(bad)
+    # only the two subfolders are left in the root
+    assert sorted(os.listdir(folder)) == [IMAGE_FOLDER_FAILED,
+                                          IMAGE_FOLDER_SUCCESS]
+    assert "FILED:" in out
+    assert IMAGE_FOLDER_SUCCESS in out and IMAGE_FOLDER_FAILED in out
+    # the per-file progress line reads as a move, not "-> sent"
+    assert "-> moved to" in out
 
     # --- import: no matches at all -> no upload, report still written ---
     folder = make_folder(names=("ZZZ.png",)); folders.append(folder)

@@ -78,8 +78,12 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
   objects (resolves a product's file GUIDs to names, **no writes**) → `delete_selected_images(...)`
   detaches the ticked ones. Same `on_progress`/`should_cancel` contracts, so the GUI drives all of
   it identically to the geo engine. `write_report(rows, path, fieldnames=...)` serves every report.
+  `upload_images(move_processed=True)` finishes by calling `file_processed_images(plans)`, which
+  moves each image into a `Successful/` or `Failed/` subfolder per `IMAGE_FOLDER_BY_STATUS`;
+  `filing_summary(plans)` / `filing_failures(plans)` are what the front-ends report from.
 - `skynamo_geo/products.py` — image/product helpers. `escape_code_to_filename`, `parse_image_stem`,
-  `sequence_sort_key`, `sniff_image_format`, `build_code_index`, `collect_image_files`.
+  `sequence_sort_key`, `sniff_image_format`, `build_code_index`, `collect_image_files`,
+  `unique_destination`.
 - `skynamo_geo/geocoder.py` — `Geocoder` base class; `NominatimGeocoder` (OpenStreetMap: free, no
   key, self-throttled to 1 req/s per usage policy) is the only implementation; front-ends construct
   it directly (`NominatimGeocoder()`). Adding another provider = new `Geocoder` subclass, zero
@@ -90,7 +94,8 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
   `/{id}` routes are GET-only. `upload_file` → `POST /files` with base64 `content`, returns the file GUID.
 - `skynamo_geo/config.py` — all constants (endpoints, `ACCURACY_BY_PRECISION`, `STATUS_*`,
   `STATUS_IMG_*`, `STATUS_ATT_*`, `REPORT_FIELDNAMES`, `IMAGE_REPORT_FIELDNAMES`,
-  `ATTACHED_IMAGE_REPORT_FIELDNAMES`, `ALLOWED_IMAGE_EXTENSIONS`, `WINDOWS_RESERVED_CHARS`).
+  `ATTACHED_IMAGE_REPORT_FIELDNAMES`, `ALLOWED_IMAGE_EXTENSIONS`, `WINDOWS_RESERVED_CHARS`,
+  `IMAGE_FOLDER_SUCCESS`/`IMAGE_FOLDER_FAILED`/`IMAGE_FOLDER_BY_STATUS`).
   Changing statuses/columns/accuracy tiers/image rules happens here.
 - `skynamo_geo/customers.py` — address helpers. `build_query(customer, field_roles)` returns an
   `AddressQuery` (`.text` single-line + `.structured` dict) from an ordered `(field_name, role)`
@@ -184,6 +189,17 @@ never gets a stray database.
   as the **union** of the product's existing GUIDs plus the new ones (don't clobber attached images);
   in **replace mode** (`upload_images(replace_existing=True)`) it's set to only this run's GUIDs.
   Format is gated on extension **and** magic bytes (`sniff_image_format`); PNG/JPEG only.
+- **Filing processed images is a forward-only sweep, and deliberately partial.**
+  `IMAGE_FOLDER_BY_STATUS` is the whole policy: every terminal outcome maps to `Successful/` or
+  `Failed/`, and `STATUS_IMG_PENDING` is **absent on purpose** — an image that matched but was
+  deselected (or that a cancelled run never reached) has not been processed, so it stays put and
+  the folder keeps showing what is outstanding. Three rules the tests pin: a name already taken by
+  an earlier run gets a ` (2)` suffix rather than overwriting it (`products.unique_destination`); a
+  **cancelled run files nothing**, because a half-swept folder is harder to reason about than an
+  untouched one; and a move that fails is a note on the plan, never an exception — the upload has
+  already happened and losing the report over one locked file would be worse. This is also why
+  `collect_image_files` must stay **non-recursive and files-only**: that is the only thing stopping
+  a re-run from re-ingesting `Successful/` and `Failed/`.
 - **Files and products have no DELETE endpoint** — there is no `DELETE /files/{guid}` and no
   `DELETE /products/{id}`. (The Public API *does* have DELETEs for `/invoices`,
   `/invoicesbyexternalid`, `/tasks`, `/scheduledvisits`, `/orderstatuses` and `/dealgroups/{id}` —

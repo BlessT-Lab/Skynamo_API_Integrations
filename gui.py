@@ -34,6 +34,7 @@ from skynamo_geo.reporting_config import (
     STATUS_RPT_PENDING, STATUS_RPT_SKIPPED,
 )
 from skynamo_geo.config import (
+    IMAGE_FOLDER_FAILED, IMAGE_FOLDER_SUCCESS,
     STATUS_UPDATED, STATUS_UPDATED_LOW_CONF, STATUS_SKIPPED_HAS_COORDS,
     STATUS_SKIPPED_NO_ADDRESS, STATUS_GEOCODE_FAILED, STATUS_UPDATE_FAILED,
     STATUS_PENDING, ADDRESS_ROLES, ADDRESS_ROLE_LABELS, DEFAULT_ROLE,
@@ -420,6 +421,7 @@ class App(ctk.CTk):
             self.country_entry.insert(0, cfg["country"])
         self.replace_var.set(bool(cfg.get("replace_existing", False)))
         self.img_replace_var.set(bool(cfg.get("image_replace_existing", False)))
+        self.img_move_var.set(bool(cfg.get("image_move_processed", False)))
         self._saved_fields = cfg.get("address_fields", [])
         self._saved_roles = cfg.get("field_roles", {}) or {}
         # Reporting tab: period + entity selection (never credentials).
@@ -847,7 +849,17 @@ class App(ctk.CTk):
             variable=self.img_replace_var, checkbox_width=20, checkbox_height=20,
             corner_radius=5, border_color=BORDER, fg_color=ACCENT,
             hover_color=ACCENT_HOVER, text_color=TEXT).grid(
-            row=4, column=0, padx=14, pady=(0, 14), sticky="w")
+            row=4, column=0, padx=14, pady=(0, 4), sticky="w")
+
+        self.img_move_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            folder,
+            text=f"After uploading, move processed files into "
+                 f"'{IMAGE_FOLDER_SUCCESS}' and '{IMAGE_FOLDER_FAILED}' subfolders",
+            variable=self.img_move_var, checkbox_width=20, checkbox_height=20,
+            corner_radius=5, border_color=BORDER, fg_color=ACCENT,
+            hover_color=ACCENT_HOVER, text_color=TEXT).grid(
+            row=5, column=0, padx=14, pady=(0, 14), sticky="w")
 
         # ----- Action bar -----
         actions = self._card(parent)
@@ -944,6 +956,7 @@ class App(ctk.CTk):
         cfg = settings.load_config()
         cfg["instance_name"] = self.img_instance_entry.get().strip()
         cfg["image_replace_existing"] = self.img_replace_var.get()
+        cfg["image_move_processed"] = self.img_move_var.get()
         settings.save_config(cfg)  # merge; never persists API keys
 
     # -- Image worker plumbing --------------------------------------------
@@ -1096,16 +1109,21 @@ class App(ctk.CTk):
             self.img_set_status("No images selected to upload.")
             return
         replace = self.img_replace_var.get()
+        move_processed = self.img_move_var.get()
         self._persist_image_settings()
         self.img_log_line(
             f"Uploading {len(to_upload)} images to Skynamo"
             f"{' (replacing existing)' if replace else ''}...")
+        if move_processed:
+            self.img_log_line(
+                f"Processed files will be moved into '{IMAGE_FOLDER_SUCCESS}' "
+                f"and '{IMAGE_FOLDER_FAILED}' under the image folder.")
 
         def work():
             try:
                 report_rows = image_engine.upload_images(
                     self.img_client, self.image_plans,
-                    replace_existing=replace,
+                    replace_existing=replace, move_processed=move_processed,
                     on_progress=lambda ev: self.img_queue.put(("progress", ev)),
                     should_cancel=self.img_cancel_event.is_set)
 
@@ -1115,6 +1133,7 @@ class App(ctk.CTk):
                     counts = image_engine.summarize(self.image_plans)
                     self.img_set_status(
                         self._img_summary_text(counts, preview=False))
+                    self._img_log_filing(move_processed)
                     self.img_log_line("Upload complete. Save the report if needed.")
                     self.img_save_btn.configure(state="normal")
                 self.img_queue.put(("done", finish))
@@ -1146,6 +1165,22 @@ class App(ctk.CTk):
         image_engine.write_report(rows, path)
         self.img_log_line(f"Report saved to: {path}")
         self.img_set_status(f"Report saved to {path}")
+
+    def _img_log_filing(self, requested):
+        """Log where the processed files went (and any that could not move)."""
+        if not requested:
+            return
+        filed = image_engine.filing_summary(self.image_plans)
+        if filed:
+            self.img_log_line("Filed: " + ", ".join(
+                f"{n} into '{name}'" for name, n in sorted(filed.items())))
+        stuck = image_engine.filing_failures(self.image_plans)
+        for plan in stuck:
+            self.img_log_line(f"  NOT moved - {plan.filename}: {plan.notes}")
+        if not filed and not stuck:
+            self.img_log_line(
+                "Nothing to file - the run was cancelled, or no image "
+                "reached an outcome.")
 
     # -- Image tree helpers -----------------------------------------------
 

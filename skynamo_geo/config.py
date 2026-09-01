@@ -6,7 +6,7 @@ REQUEST_TIMEOUT = 30
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Nominatim usage policy: identify your app and stay at/below 1 request/second.
-NOMINATIM_USER_AGENT = "SkynamoGeo/2.9 (Skynamo customer geolocation updater)"
+NOMINATIM_USER_AGENT = "SkynamoGeo/2.10 (Skynamo customer geolocation updater)"
 NOMINATIM_MIN_INTERVAL = 1.0
 # Ask Nominatim for several candidates so we can pick the most precise one
 # instead of blindly trusting the first result.
@@ -97,6 +97,25 @@ STATUS_IMG_BAD_FORMAT = "unsupported-format"
 STATUS_IMG_AMBIGUOUS = "ambiguous-match"
 STATUS_IMG_UPLOAD_FAILED = "upload-failed"
 
+# --- Filing processed images ---------------------------------------------
+# After an upload run the images can be moved out of the folder they came from
+# into these subfolders, leaving the root holding only what the run did not
+# deal with. Off by default: it rearranges the user's own files.
+IMAGE_FOLDER_SUCCESS = "Successful"
+IMAGE_FOLDER_FAILED = "Failed"
+
+# Which subfolder each outcome files into. STATUS_IMG_PENDING is deliberately
+# absent: an image that matched a product but was deselected - or that a
+# cancelled run never reached - has not been processed, so it stays put and the
+# folder keeps showing exactly what is still outstanding.
+IMAGE_FOLDER_BY_STATUS = {
+    STATUS_IMG_UPLOADED: IMAGE_FOLDER_SUCCESS,
+    STATUS_IMG_UPLOAD_FAILED: IMAGE_FOLDER_FAILED,
+    STATUS_IMG_NO_MATCH: IMAGE_FOLDER_FAILED,
+    STATUS_IMG_AMBIGUOUS: IMAGE_FOLDER_FAILED,
+    STATUS_IMG_BAD_FORMAT: IMAGE_FOLDER_FAILED,
+}
+
 # Attached-image (manage/remove) statuses. Skynamo has no delete endpoint, so
 # "removing" an image means detaching its GUID from the product's files list.
 STATUS_ATT_LOADED = "attached"               # currently on the product
@@ -106,7 +125,8 @@ STATUS_ATT_DELETE_FAILED = "remove-failed"
 
 # Product-image report CSV column order
 IMAGE_REPORT_FIELDNAMES = [
-    "filename", "product_code", "matched_product", "sequence", "status", "notes",
+    "filename", "product_code", "matched_product", "sequence", "status",
+    "moved_to", "notes",
 ]
 
 # Attached-image (manage/remove) report CSV column order

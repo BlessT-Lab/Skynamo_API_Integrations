@@ -104,11 +104,29 @@ def build_code_index(products):
     return index
 
 
+def unique_destination(folder, filename):
+    """A path for filename inside folder that no existing file occupies.
+
+    Successive runs file images into the same subfolder, so a name that is
+    already taken belongs to an earlier run's image - never overwrite it.
+    "ABC.png" becomes "ABC (2).png", then "ABC (3).png", and so on.
+    """
+    stem, ext = os.path.splitext(filename)
+    candidate = os.path.join(folder, filename)
+    n = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(folder, f"{stem} ({n}){ext}")
+        n += 1
+    return candidate
+
+
 def collect_image_files(folder):
     """Return full paths of files directly inside folder (non-recursive), sorted.
 
     Every file is returned regardless of extension so unsupported ones can be
-    reported rather than silently skipped.
+    reported rather than silently skipped. Being non-recursive and files-only
+    is what keeps a re-run from picking the Successful/ and Failed/ subfolders
+    back up again (see image_engine.file_processed_images).
     """
     entries = []
     for name in sorted(os.listdir(folder)):

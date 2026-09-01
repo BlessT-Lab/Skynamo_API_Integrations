@@ -3,7 +3,9 @@
 Two phases, mirroring engine.py so any front-end can preview-then-commit:
   1. scan_images(...)   -> builds ImagePlans (matches files to products, no uploads)
   2. upload_images(...) -> POSTs each approved image to /files and attaches the
-                           returned GUID to its product via PATCH /products
+                           returned GUID to its product via PATCH /products,
+                           then optionally files each processed image into a
+                           Successful/ or Failed/ subfolder
 
 The same shape backs managing images already on a product:
   1. list_attached_images(...)   -> resolves a product's file GUIDs to names, no writes
@@ -17,19 +19,21 @@ should_cancel(), the same contracts the GUI worker thread already drives.
 
 import base64
 import os
+import shutil
 
 from . import reports
 from .reports import summarize  # re-exported: callers use image_engine.summarize
 from .config import (
-    ATTACHED_IMAGE_REPORT_FIELDNAMES, IMAGE_REPORT_FIELDNAMES,
-    STATUS_ATT_DELETE_FAILED, STATUS_ATT_DELETED, STATUS_ATT_FETCH_FAILED,
-    STATUS_ATT_LOADED, STATUS_IMG_AMBIGUOUS, STATUS_IMG_BAD_FORMAT,
-    STATUS_IMG_NO_MATCH, STATUS_IMG_PENDING, STATUS_IMG_UPLOAD_FAILED,
-    STATUS_IMG_UPLOADED,
+    ATTACHED_IMAGE_REPORT_FIELDNAMES, IMAGE_FOLDER_BY_STATUS,
+    IMAGE_REPORT_FIELDNAMES, STATUS_ATT_DELETE_FAILED, STATUS_ATT_DELETED,
+    STATUS_ATT_FETCH_FAILED, STATUS_ATT_LOADED, STATUS_IMG_AMBIGUOUS,
+    STATUS_IMG_BAD_FORMAT, STATUS_IMG_NO_MATCH, STATUS_IMG_PENDING,
+    STATUS_IMG_UPLOAD_FAILED, STATUS_IMG_UPLOADED,
 )
 from .products import (
     build_code_index, collect_image_files, has_allowed_extension,
     parse_image_stem, product_code, sequence_sort_key, sniff_image_format,
+    unique_destination,
 )
 
 
@@ -71,6 +75,8 @@ class ImagePlan:
         self.status = ""            # a STATUS_IMG_* value
         self.notes = ""
         self.include = False        # whether upload_images should process it
+        self.moved_to = ""          # "Successful/ABC.png" once filed away
+        self.filing_error = ""      # why the move failed, if it did
 
     @property
     def writable(self):
@@ -88,6 +94,7 @@ class ImagePlan:
             "matched_product": self.product_name,
             "sequence": self.sequence or "",
             "status": self.status,
+            "moved_to": self.moved_to,
             "notes": self.notes,
         }
 
@@ -168,7 +175,7 @@ def _flag_duplicate_sequences(plans):
                     plan.notes += "; duplicate image order for this product"
 
 
-def upload_images(client, plans, replace_existing=False,
+def upload_images(client, plans, replace_existing=False, move_processed=False,
                   on_progress=_noop, should_cancel=_never_cancel):
     """Upload approved images and attach them to their products.
 
@@ -178,6 +185,12 @@ def upload_images(client, plans, replace_existing=False,
     the product's files list is set to ONLY this run's uploads - any images it
     already had are dropped (detached). Returns report rows for every plan
     (skips and failures included).
+
+    When move_processed is True, every image the run reached a verdict on is
+    then filed into a Successful/ or Failed/ subfolder - see
+    file_processed_images. A cancelled run files nothing: cancel means stop
+    touching things, and the half-finished folder a partial filing would leave
+    is harder to reason about than one nobody moved.
     """
     to_upload = [p for p in plans if p.include and p.writable]
 
@@ -238,6 +251,9 @@ def upload_images(client, plans, replace_existing=False,
                 plan.notes = _append_note(plan.notes,
                                           f"uploaded but not attached: {error}")
 
+    if move_processed and not (cancelled or should_cancel()):
+        file_processed_images(plans, on_progress=on_progress)
+
     return [p.to_report_row() for p in plans]
 
 
@@ -253,6 +269,99 @@ def _upload_one(client, plan):
 
 def _append_note(notes, extra):
     return (notes + "; " if notes else "") + extra
+
+
+# ---------------------------------------------------------------------------
+# Filing processed images into Successful/ and Failed/
+# ---------------------------------------------------------------------------
+
+def filing_summary(plans):
+    """{subfolder: count} of the images that were filed away."""
+    counts = {}
+    for plan in plans:
+        if plan.moved_to:
+            subfolder = plan.moved_to.split(os.sep)[0]
+            counts[subfolder] = counts.get(subfolder, 0) + 1
+    return counts
+
+
+def filing_failures(plans):
+    """Plans whose file could not be moved. Empty unless filing was attempted.
+
+    Keyed on an error the mover actually recorded, not on an absent moved_to -
+    a plan that was never filed (the option was off) is not a failure.
+    """
+    return [p for p in plans if p.filing_error]
+
+
+def file_processed_images(plans, on_progress=_noop):
+    """Move each processed image into a subfolder of the folder it came from.
+
+    IMAGE_FOLDER_BY_STATUS decides where each one goes: an uploaded image is
+    filed as successful, and everything the run could not upload - a failed
+    upload, no matching product, an ambiguous code, an unsupported format - as
+    failed. An image still marked STATUS_IMG_PENDING was deselected or never
+    reached, so it is left alone and the folder goes on showing exactly what is
+    outstanding.
+
+    Each plan's `path` is updated to where its file now lives and `moved_to`
+    records the destination relative to the image folder. Already-filed plans
+    are skipped, so running this twice cannot nest the subfolders. A move that
+    fails is recorded in the plan's notes and `filing_error` and never raises:
+    the upload has already happened, and losing the run's report over one locked
+    file would be the worse outcome. Not cancellable - it is local, fast, and
+    stopping half way through would leave the folder in a state no report
+    describes.
+
+    Returns filing_summary(plans).
+    """
+    # `not plan.moved_to` keeps this idempotent: uploading the same plans twice
+    # is allowed (an uploaded plan is still writable), and without the guard the
+    # second pass would move Successful/ABC.png into Successful/Successful/.
+    targets = [p for p in plans
+               if p.status in IMAGE_FOLDER_BY_STATUS and not plan_filed(p)]
+    total = len(targets)
+    for i, plan in enumerate(targets, 1):
+        subfolder = IMAGE_FOLDER_BY_STATUS[plan.status]
+        error = _move_one(plan, subfolder)
+        if error:
+            plan.notes = _append_note(plan.notes, error)
+        on_progress({
+            "phase": "filing", "index": i, "total": total,
+            "name": plan.filename, "status": plan.status,
+            "message": error or f"moved to {plan.moved_to}",
+        })
+    return filing_summary(plans)
+
+
+def plan_filed(plan):
+    """True once this plan's file has been moved into a subfolder."""
+    return bool(plan.moved_to)
+
+
+def _move_one(plan, subfolder):
+    """Move one image into `subfolder` of its own folder. Returns an error, "" if ok."""
+    source = plan.path
+    if not os.path.isfile(source):
+        error = f"could not file the image: {source} is no longer there"
+    else:
+        destination_dir = os.path.join(os.path.dirname(source), subfolder)
+        try:
+            os.makedirs(destination_dir, exist_ok=True)
+            # Pick the name first so an earlier run's image is never overwritten.
+            destination = unique_destination(destination_dir, plan.filename)
+            shutil.move(source, destination)
+        # shutil.Error subclasses OSError, so a move failure lands here too.
+        except OSError as exc:
+            error = f"could not file the image into {subfolder}: {exc}"
+        else:
+            plan.path = destination
+            plan.moved_to = os.path.join(subfolder,
+                                         os.path.basename(destination))
+            plan.filing_error = ""
+            return ""
+    plan.filing_error = error
+    return error
 
 
 def write_report(report_rows, path, fieldnames=IMAGE_REPORT_FIELDNAMES):

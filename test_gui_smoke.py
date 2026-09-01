@@ -1,9 +1,11 @@
 """Construct the GUI, pump the event loop briefly, then close it.
 Verifies the whole widget tree builds without error (no real interaction).
 
-The store path is redirected to a temp location throughout, so this test never
-reads or creates the real %APPDATA% store and gives the same result on a clean
-machine as on one that has already run an extract.
+Both the store path and the saved config are redirected, so this test never
+reads or creates anything in the real %APPDATA% and gives the same result on a
+clean machine as on one that has already run an extract and saved its
+preferences. Asserting a widget's default against whatever the developer last
+ticked would fail on their machine and pass in CI, or the reverse.
 """
 
 import os
@@ -16,10 +18,12 @@ from skynamo_geo.reporting_config import REPORTING_ENTITIES
 
 tmp = tempfile.mkdtemp(prefix="skynamo_gui_smoke_")
 real_default_store_path = gui.default_store_path
+real_load_config = gui.settings.load_config
 try:
-    # ---- Part 1: no store yet -------------------------------------------
+    # ---- Part 1: no store, no saved config ------------------------------
     missing = os.path.join(tmp, "does_not_exist", "reporting.db")
     gui.default_store_path = lambda: missing
+    gui.settings.load_config = lambda: {}
 
     app = gui.App()
     app.update_idletasks()
@@ -42,6 +46,7 @@ try:
     assert app.img_cancel_btn.cget("state") == "disabled"
     assert app.img_tree is not None
     assert app.img_replace_var.get() is False   # replace mode off by default
+    assert app.img_move_var.get() is False      # filing is opt-in
     # Manage Images tab: key widgets exist and start disabled
     assert app.mgmt_delete_btn.cget("state") == "disabled"
     assert app.mgmt_cancel_btn.cget("state") == "disabled"
@@ -84,9 +89,23 @@ try:
     assert "Reporting tab" not in info, "should not nag when a store exists"
     assert "products=1" in app.rpt_store_label.cget("text"), \
         app.rpt_store_label.cget("text")
+    # ---- Part 3: a saved config is honoured -----------------------------
+    # Reload settings into the same app; a second Tk root is needlessly fragile.
+    gui.settings.load_config = lambda: {
+        "instance_name": "acme",
+        "image_replace_existing": True,
+        "image_move_processed": True,
+    }
+    app._load_saved_settings()
+    app.update_idletasks()
+    assert app.img_replace_var.get() is True
+    assert app.img_move_var.get() is True
+    assert app.img_instance_entry.get() == "acme"
+
     app.destroy()
 finally:
     gui.default_store_path = real_default_store_path
+    gui.settings.load_config = real_load_config
     shutil.rmtree(tmp, ignore_errors=True)
 
 print("GUI smoke test passed")

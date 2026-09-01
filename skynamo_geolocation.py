@@ -42,6 +42,7 @@ except ImportError:
 from skynamo_geo import engine, image_engine
 from skynamo_geo.client import SkynamoClient
 from skynamo_geo.config import (
+    IMAGE_FOLDER_FAILED, IMAGE_FOLDER_SUCCESS,
     STATUS_SKIPPED_NO_ADDRESS, STATUS_UPDATED, STATUS_UPDATED_LOW_CONF,
     STATUS_SKIPPED_HAS_COORDS, STATUS_GEOCODE_FAILED, STATUS_UPDATE_FAILED,
     ADDRESS_ROLES, ADDRESS_ROLE_LABELS, DEFAULT_ROLE,
@@ -414,12 +415,27 @@ def run_image_import(client):
             if not ask_confirm("Continue with replace mode?", default=False):
                 sys.exit("Aborted.")
 
+    # --- File the processed images away (moves the user's own files) ---
+    move_processed = ask_confirm(
+        f"Afterwards, move processed files into '{IMAGE_FOLDER_SUCCESS}' and "
+        f"'{IMAGE_FOLDER_FAILED}' subfolders of {folder}? Images that matched "
+        f"but were not selected stay where they are",
+        default=False,
+    )
+
     if not ask_confirm(f"Upload {len(selected)} image(s) to Skynamo now?",
                        default=True):
         sys.exit("Aborted - nothing was uploaded.")
 
     # --- Upload ---
     def on_upload(ev):
+        if ev["phase"] == "filing":
+            if ev["index"] == 1:
+                # the counter restarts here; say so or it reads as a glitch
+                print("\nFiling processed images...\n")
+            print(f"  [{ev['index']}/{ev['total']}] {ev['name']} "
+                  f"-> {ev['message']}")
+            return
         # The engine attaches a product's files in one PATCH after all of its
         # images are POSTed, so at this point the status is still transitional
         # ("pending-upload" = sent, not yet attached). Printing it verbatim
@@ -431,7 +447,7 @@ def run_image_import(client):
     print("\nUploading...\n")
     report_rows = image_engine.upload_images(
         client, plans, replace_existing=replace_existing,
-        on_progress=on_upload)
+        move_processed=move_processed, on_progress=on_upload)
 
     # --- Report ---
     counts = image_engine.summarize(plans)
@@ -449,6 +465,18 @@ def run_image_import(client):
         print("\n  FAILURES:")
         for plan in failed:
             print(f"    - {plan.filename}: {plan.notes}")
+
+    if move_processed:
+        filed = image_engine.filing_summary(plans)
+        if filed:
+            print("\n  FILED:")
+            for name, n in sorted(filed.items()):
+                print(f"    - {n} image(s) into {os.path.join(folder, name)}")
+        stuck = image_engine.filing_failures(plans)
+        if stuck:
+            print("\n  NOT MOVED:")
+            for plan in stuck:
+                print(f"    - {plan.filename}: {plan.notes}")
 
     save_report(image_engine.write_report, report_rows,
                 "product_images_report")

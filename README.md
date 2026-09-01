@@ -319,6 +319,35 @@ files plus the new ones, so images already on the product are preserved.
 *only* this run's uploaded images — anything it had before is dropped (detached).
 The report notes how many existing images were replaced.
 
+### Filing the images away afterwards (optional)
+Tick **"After uploading, move processed files into 'Successful' and 'Failed'
+subfolders"** (CLI: it asks) and the run finishes by moving each image out of
+the folder it came from and into a subfolder of it:
+
+| Outcome | Goes to |
+|---|---|
+| `uploaded` | `Successful/` |
+| `upload-failed` | `Failed/` |
+| `no-matching-product` | `Failed/` |
+| `ambiguous-match` | `Failed/` |
+| `unsupported-format` | `Failed/` |
+| `pending-upload` (matched but you unticked it) | **stays put** |
+
+So what is left loose in the folder is exactly what the run did not deal with.
+Points worth knowing:
+
+- **Off by default** — it rearranges your own files. The setting is remembered
+  between sessions once you tick it.
+- **Nothing is ever overwritten.** A name already used by an earlier run gets a
+  suffix: a second `ABC.png` is filed as `ABC (2).png`.
+- **A cancelled run files nothing** and leaves the folder exactly as it was.
+- **Re-running is safe.** The scan only looks at files sitting directly in the
+  folder, so `Successful/` and `Failed/` are never picked back up.
+- A file that cannot be moved (locked, permissions, vanished) is left where it
+  is and the reason is logged and written to the report — the upload itself is
+  never rolled back or lost over it.
+- The report's `moved_to` column records where each file went.
+
 ### Manage / remove existing images
 The **Manage Images** tab views and removes images already on a product. Enter a
 product code and **Load Images**; the tool resolves each attached file's GUID to
@@ -334,7 +363,7 @@ its filename (`GET /files/{guid}`) and lists them. Tick the ones to remove and
 ### Log & report
 Every outcome shows in the on-screen table and log, and **Save Report CSV**
 writes a report — for uploads: `filename, product_code, matched_product,
-sequence, status, notes` (statuses `pending-upload`, `uploaded`,
+sequence, status, moved_to, notes` (statuses `pending-upload`, `uploaded`,
 `no-matching-product`, `unsupported-format`, `ambiguous-match`, `upload-failed`);
 for removals: `product_code, matched_product, filename, file_guid, status, notes`
 (statuses `attached`, `fetch-failed`, `removed`, `remove-failed`).
@@ -574,6 +603,22 @@ the whole store is empty, the tab tells you to run an extract first.
 ---
 
 ## 14. Change log
+
+- **v2.10.0** (2026-09-01) — **File processed images into `Successful/` and
+  `Failed/`.** After an upload run the images can be moved out of the folder
+  they came from into two subfolders of it, so what stays loose in the folder is
+  exactly what still needs attention. Uploaded images are filed as successful;
+  anything the run could not upload — a failed upload, no matching product, an
+  ambiguous code, an unsupported format — as failed. An image that matched but
+  was left unticked is not touched. **Off by default** (it rearranges your own
+  files) and remembered once ticked; the CLI asks before uploading. An earlier
+  run's image is never overwritten (`ABC.png` → `ABC (2).png`), a cancelled run
+  files nothing, a move that fails leaves the file where it is and says why, and
+  the report gains a `moved_to` column. The scan is non-recursive, so a re-run
+  never picks the two subfolders back up.
+  - Also: the GUI smoke test no longer reads the real saved config. It asserted
+    checkbox defaults that whatever you last ticked would override, so it passed
+    or failed depending on the machine rather than the code.
 
 - **v2.9.1** (2026-08-27) — **Review fixes to the breakdown.**
   - **Discarded rows are now reported.** If a sub-entity's primary key is not a
