@@ -635,6 +635,23 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.10.5** (2026-09-01) — **Fix: link uploaded images to their product with
+  a `transaction_id`.** Images uploaded fine and then could not be attached
+  (`P023: File guid ... not found`), and the file could not be read back by its
+  own GUID either — which looked like the upload storing nothing. It wasn't:
+  an uploaded file is linked to whatever references it by a **transaction id**,
+  sent on the upload *and* on the patch that attaches it. Until that link is
+  made the GUID simply does not resolve. `ProductPatch.transaction_id` is
+  documented as "The transaction id associated with files in order to link
+  files to a product", and the same field is on `CustomerPatch`, `OrderPost`,
+  `QuotePost` and `CreditRequestPost` — it is the standard mechanism, and we
+  had never sent it. One transaction is minted per product, since a patch links
+  "the files of this transaction" and sharing one across products could attach
+  the wrong images.
+  - The engine and CLI fakes now enforce the linkage rather than accepting
+    anything, answering with the real `P023` body when a patch omits the
+    transaction its files came in under.
+
 - **v2.10.4** (2026-09-01) — **Uploads work; the attach now explains itself.**
   With `content_hash` sent, images reach Skynamo and `PATCH /products` answers
   `P023: File guid '...' not found` — the API issuing a GUID and then refusing

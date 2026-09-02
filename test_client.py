@@ -163,6 +163,26 @@ assert sent["content_hash"] == expected, (sent["content_hash"], expected)
 assert sent["content_hash"] != base64.b64encode(
     hashlib.new(FILE_HASH_ALGORITHM, b"Ym9keQ==").digest()).decode("ascii")
 
+# transaction_id is what links an uploaded file to the product that will
+# reference it. Without it the guid never resolves - GET /files/{guid} 404s and
+# the patch answers "P023: File guid ... not found".
+s2 = FakeSession([FakeResponse(200, {"data": [{"id": "g"}]})])
+make_client(s2).upload_file("ABC.png", "Ym9keQ==", transaction_id=99)
+assert body_of(s2.calls[0])["transaction_id"] == 99, body_of(s2.calls[0])
+
+s2 = FakeSession()
+make_client(s2).attach_files("ABC", ["g1"], product_id=7, transaction_id=99)
+assert body_of(s2.calls[0])[0]["transaction_id"] == 99, body_of(s2.calls[0])
+
+# Omitted when there is none, rather than sent as null - it is the mechanism
+# for NEW files, and a detach re-patches an existing list.
+s2 = FakeSession([FakeResponse(200, {"data": [{"id": "g"}]})])
+make_client(s2).upload_file("ABC.png", "Ym9keQ==")
+assert "transaction_id" not in body_of(s2.calls[0])
+s2 = FakeSession()
+make_client(s2).attach_files("ABC", ["g1"], product_id=7)
+assert "transaction_id" not in body_of(s2.calls[0])[0]
+
 # A caller that already has the bytes can pass the hash in, and it is used
 # verbatim rather than recomputed.
 s = FakeSession([FakeResponse(200, {"data": [{"id": "g"}]})])

@@ -147,7 +147,8 @@ class SkynamoClient:
             page_number += 1
         return products
 
-    def upload_file(self, filename, content_b64, content_hash=None):
+    def upload_file(self, filename, content_b64, content_hash=None,
+                    transaction_id=None):
         """POST a base64-encoded file to /files. Returns (guid, error_message).
 
         On success guid is the created file's GUID (from the response's
@@ -157,6 +158,12 @@ class SkynamoClient:
         list it as required - without it every upload fails with "F002:
         Content hash is required." It is derived from the content when the
         caller does not pass one already computed.
+
+        `transaction_id` is how an uploaded file is later linked to a product
+        (or customer, or order): the same id is sent again on the PATCH that
+        attaches it. Until that link is made the file's guid does not resolve -
+        GET /files/{guid} 404s and a patch listing it answers "P023: File guid
+        ... not found" - so an upload meant for a product must carry one.
         """
         if content_hash is None:
             try:
@@ -167,10 +174,13 @@ class SkynamoClient:
                 # to fail one image instead of the whole run.
                 return None, f"Could not hash the file content: {exc}"
         try:
+            body = {"filename": filename, "content": content_b64,
+                    "content_hash": content_hash}
+            if transaction_id is not None:
+                body["transaction_id"] = transaction_id
             resp = self.session.post(
                 f"{API_BASE}/files",
-                json={"filename": filename, "content": content_b64,
-                      "content_hash": content_hash},
+                json=body,
                 timeout=REQUEST_TIMEOUT,
             )
         except requests.RequestException as exc:
@@ -209,7 +219,8 @@ class SkynamoClient:
             return None, "File not found"
         return data[0], ""
 
-    def attach_files(self, product_code, file_guids, product_id=None):
+    def attach_files(self, product_code, file_guids, product_id=None,
+                     transaction_id=None):
         """PATCH a product's `files` list. Returns (ok, error_message).
 
         Mirrors update_location: the API accepts updates only on the collection
@@ -225,10 +236,18 @@ class SkynamoClient:
         GUIDs are sent as strings: `Product.files` items are declared strings
         while `File.id` - what POST /files hands back - is declared an integer,
         so a bare int can otherwise reach a string-typed array.
+
+        `transaction_id` must be the one the files were uploaded under - it is
+        what actually links them to the product ("The transaction id associated
+        with files in order to link files to a product"). Listing the guids
+        without it is rejected with "P023: File guid ... not found", because an
+        unlinked file's guid does not resolve.
         """
         key = ({"id": product_id} if product_id is not None
                else {"code": product_code})
         patch = dict(key, files=[str(g) for g in file_guids])
+        if transaction_id is not None:
+            patch["transaction_id"] = transaction_id
         try:
             resp = self.session.patch(
                 f"{API_BASE}/products",

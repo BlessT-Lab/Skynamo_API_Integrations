@@ -224,6 +224,17 @@ never gets a stray database.
   This survived every offline test because the engine tests' fake client accepts whatever it is
   handed; `test_client.py` exists to pin the actual request bodies, and the fakes now take
   `require_product_id=True` to reproduce the live rejection.
+- **An uploaded file is linked to its product by `transaction_id`, not by listing its guid.**
+  `ProductPatch.transaction_id` is documented as "The transaction id associated with files in order
+  to link files to a product", and `FilePost` takes one too; the same field is on `CustomerPatch`,
+  `OrderPost`, `QuotePost` and `CreditRequestPost`, so it is *the* mechanism for attaching an
+  uploaded file to anything. Until the link is made the file's guid does not resolve, so
+  `GET /files/{guid}` 404s **and** a patch listing it answers `P023: File guid ... not found` — one
+  symptom, and it looks exactly like a file that was never stored. `upload_images` mints **one
+  transaction per product** (`new_transaction_id`) and sends it on every upload in that product's
+  group and on the patch that attaches them. Per product, not per run: the patch links "the files
+  of this transaction", so one id shared across products could attach every product's images to
+  whichever is patched first.
 - **Skynamo has no product-image endpoint.** Upload is generic: `POST /files` (base64 `content`) →
   file GUID → `PATCH /products` with `{code, files:[...]}`. In merge mode the `files` array is sent
   as the **union** of the product's existing GUIDs plus the new ones (don't clobber attached images);

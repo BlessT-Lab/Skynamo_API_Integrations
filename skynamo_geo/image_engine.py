@@ -19,6 +19,7 @@ should_cancel(), the same contracts the GUI worker thread already drives.
 
 import base64
 import os
+import random
 import re
 import shutil
 
@@ -51,6 +52,18 @@ def _product_key(product):
     """Stable identity for grouping plans by product (id, else code)."""
     pid = product.get("id")
     return pid if pid is not None else product_code(product)
+
+
+def new_transaction_id():
+    """A fresh id for linking one product's uploads to that product.
+
+    The API takes an integer and only needs it to be unique enough that two
+    concurrent runs do not collide, so a random 31-bit value is plenty. One per
+    product: the patch links "the files of this transaction" to a single
+    product, so sharing one across products could attach every product's images
+    to whichever is patched first.
+    """
+    return random.randrange(1, 2 ** 31)
 
 
 def _dedupe(seq):
@@ -221,12 +234,14 @@ def upload_images(client, plans, replace_existing=False, move_processed=False,
         product = group[0].product
         existing = _dedupe(list(product.get("files") or []))
         uploaded = []  # (plan, guid) for images that uploaded this round
+        # Uploads and the patch that links them must share this.
+        transaction_id = new_transaction_id()
         for plan in group:
             if should_cancel():
                 cancelled = True
                 break
             done += 1
-            guid, error = _upload_one(client, plan)
+            guid, error = _upload_one(client, plan, transaction_id)
             if guid:
                 plan.file_guid = guid
                 uploaded.append(plan)
@@ -250,7 +265,8 @@ def upload_images(client, plans, replace_existing=False, move_processed=False,
             desired = _dedupe(existing + new_guids)
             dropped = []
         ok, error = client.attach_files(product_code(product), desired,
-                                        product_id=product.get("id"))
+                                        product_id=product.get("id"),
+                                        transaction_id=transaction_id)
         # Probed once per product, not once per image.
         attach_cause = None
         for plan in uploaded:
@@ -275,14 +291,19 @@ def upload_images(client, plans, replace_existing=False, move_processed=False,
     return [p.to_report_row() for p in plans]
 
 
-def _upload_one(client, plan):
-    """Read, base64-encode and POST one image. Returns (guid, error)."""
+def _upload_one(client, plan, transaction_id=None):
+    """Read, base64-encode and POST one image. Returns (guid, error).
+
+    transaction_id ties the upload to the patch that will attach it; without
+    it the returned guid never resolves.
+    """
     try:
         with open(plan.path, "rb") as f:
             content = base64.b64encode(f.read()).decode("ascii")
     except OSError as exc:
         return None, f"Could not read file: {exc}"
-    return client.upload_file(plan.filename, content)
+    return client.upload_file(plan.filename, content,
+                              transaction_id=transaction_id)
 
 
 def _append_note(notes, extra):

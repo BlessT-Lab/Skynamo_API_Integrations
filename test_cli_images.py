@@ -29,11 +29,16 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
 class FakeClient:
     def __init__(self, products, upload_ok=True, attach_ok=True,
-                 files_by_guid=None, require_product_id=False):
+                 files_by_guid=None, require_product_id=False,
+                 require_transaction=False):
         self.products = products
         self.uploaded = []
         self.attached = []
         self.attach_keys = []      # (code, product_id) per attach call
+        self.attach_transactions = []
+        self.upload_transactions = []
+        self.guid_transaction = {}
+        self.require_transaction = require_transaction
         self._n = 0
         self.upload_ok = upload_ok
         self.attach_ok = attach_ok
@@ -49,20 +54,38 @@ class FakeClient:
             on_page(len(self.products), len(self.products))
         return self.products
 
-    def upload_file(self, filename, content_b64):
+    def upload_file(self, filename, content_b64, content_hash=None,
+                    transaction_id=None):
         self.uploaded.append(filename)
+        self.upload_transactions.append(transaction_id)
         if not self.upload_ok:
             return None, "upload boom"
         self._n += 1
-        return f"guid-{self._n}", ""
+        guid = f"guid-{self._n}"
+        self.guid_transaction[guid] = transaction_id
+        return guid, ""
 
-    def attach_files(self, code, files, product_id=None):
+    def attach_files(self, code, files, product_id=None, transaction_id=None):
         self.attached.append((code, list(files)))
         self.attach_keys.append((code, product_id))
+        self.attach_transactions.append(transaction_id)
         if not self.attach_ok:
             return False, "attach boom"
         if self.require_product_id and product_id is None:
             return False, "HTTP 400: id is required"
+        if self.require_transaction:
+            # An uploaded file is only linkable by the transaction it came in
+            # under; otherwise its guid does not resolve. This is the live
+            # failure, verbatim.
+            unlinked = [g for g in files
+                        if g in self.guid_transaction
+                        and self.guid_transaction[g] != transaction_id]
+            if unlinked:
+                detail = ",".join(
+                    f'"P023: File guid \'{g}\' not found."' for g in unlinked)
+                return False, ('HTTP 400: {"message":"Some errors occurred",'
+                               '"errors":[{"index":0,"detail":['
+                               + detail + ']}]}')
         return True, ""
 
     def get_file(self, guid):
@@ -213,6 +236,19 @@ try:
     assert all(pid is not None for _c, pid in client.attach_keys), \
         client.attach_keys
     assert "upload-failed" not in out
+
+    # --- import: uploads are linked to the product by a transaction_id ---
+    folder = make_folder(); folders.append(folder)
+    client = FakeClient(make_products(), require_transaction=True,
+                        require_product_id=True)
+    out, exc = run(cli.run_image_import, client, Script(
+        texts=[folder],
+        confirms=[True, False, False, True],
+    ))
+    assert exc is None, exc
+    assert "P023" not in out, out
+    assert all(t is not None for t in client.upload_transactions)
+    assert all(t is not None for t in client.attach_transactions)
 
     # --- import: declining the final confirm uploads NOTHING ---
     folder = make_folder(); folders.append(folder)

@@ -13,15 +13,16 @@ It runs in three phases and stops before doing anything you have not agreed to:
   2. INSTANCE (read-only). Fetches products, checks the ones your filenames
      match, and confirms they carry the `id` the patch keys on.
   3. WRITE PROBE (asks first, and is skipped unless you say yes). Uploads ONE
-     tiny generated 1x1 PNG, trying each plausible content_hash form - the spec
-     says only "(base64string)" and never names the algorithm - and reads each
-     resulting file back with GET /files/{guid}. A form is only believed when
-     the file can be read back: an upload can return 200 and a GUID while the
-     file was never stored, which then shows up as "P023: File guid not found"
-     on the attach. It then tries the attach several ways, printing every
-     status and body. This is the only part that changes your instance: it
-     creates one small file and attaches it to one product. Both are undoable
-     from the Manage Images tab, and the script tells you exactly what to undo.
+     tiny generated 1x1 PNG under a transaction id, reads it back with
+     GET /files/{guid}, then tries the attach several ways - including one
+     WITHOUT the transaction as a control, which is what "P023: File guid not
+     found" comes from: an unlinked file's guid does not resolve, so it reads
+     as a file that was never stored. Also tries each plausible content_hash
+     form, since the spec says only "(base64string)" and never names the
+     algorithm. Every status and body is printed in full. This is the only part
+     that changes your instance: it creates one small file and attaches it to
+     one product. Both are undoable from the Manage Images tab, and the script
+     tells you exactly what to undo.
 
 The API key is redacted from all output, so this is safe to paste.
 
@@ -31,6 +32,10 @@ Usage:
     py diag_image_upload.py "C:\\path\\to\\images" --offline
                                                   # phase 1 only, no
                                                   # credentials, no network
+    py diag_image_upload.py --probe-only          # skip the folder entirely
+                                                  # and go straight to the
+                                                  # content_hash probe, which
+                                                  # uses its own 1x1 pixel
 """
 
 import base64
@@ -43,6 +48,7 @@ import sys
 import requests
 
 from skynamo_geo.client import SkynamoClient, content_hash_b64
+from skynamo_geo.image_engine import new_transaction_id
 from skynamo_geo.config import (
     ALLOWED_IMAGE_EXTENSIONS, API_BASE, FILE_HASH_ALGORITHM, REQUEST_TIMEOUT,
 )
@@ -226,7 +232,8 @@ def phase_write(client, product):
     print("\n" + "-" * 70)
     print(" WRITE PROBE")
     print("-" * 70)
-    print(f" This uploads ONE 1x1 pixel PNG ({len(TINY_PNG)} bytes) and tries to")
+    print(f" This uploads ONE 1x1 pixel PNG ({len(TINY_PNG)} bytes) under a")
+    print(f" transaction id, and tries to")
     print(f" attach it to product id={product.get('id')!r} "
           f"code={product_code(product)!r}.")
     existing = list(product.get("files") or [])
@@ -238,6 +245,11 @@ def phase_write(client, product):
 
     print("\n  [a] POST /files - which content_hash does it accept?")
     content = base64.b64encode(TINY_PNG).decode("ascii")
+    # An uploaded file is linked to whatever references it by this id. Until
+    # that link is made its guid does not resolve, so the read-back below could
+    # never have succeeded without one.
+    transaction = new_transaction_id()
+    print(f"    transaction_id for this probe: {transaction}")
 
     def b64(digest):
         return base64.b64encode(digest).decode("ascii")
@@ -263,7 +275,7 @@ def phase_write(client, product):
     accepted = None
     for label, value in hash_forms:
         body = {"filename": "skynamo-diag-1x1.png", "content": content,
-                "content_hash": value}
+                "content_hash": value, "transaction_id": transaction}
         try:
             resp = client.session.post(f"{API_BASE}/files", json=body,
                                        timeout=REQUEST_TIMEOUT)
@@ -319,20 +331,24 @@ def phase_write(client, product):
     print(f"    -> file guid {guid!r} (type {type(guid).__name__})")
 
     print("\n  [b] PATCH /products - the same request the tool makes")
+    all_files = [str(g) for g in existing + [guid]]
     variants = [
-        ("by id, guids as strings",
-         {"id": product.get("id"),
-          "files": [str(g) for g in existing + [guid]]}),
-        ("by id, guid left as the API returned it",
-         {"id": product.get("id"), "files": existing + [guid]}),
-        ("by code only",
-         {"code": product_code(product),
-          "files": [str(g) for g in existing + [guid]]}),
-        ("by id and code together",
+        ("by id, with the transaction - what the tool now sends",
+         {"id": product.get("id"), "files": all_files,
+          "transaction_id": transaction}),
+        ("by id, WITHOUT the transaction (the control - expect P023)",
+         {"id": product.get("id"), "files": all_files}),
+        ("by id, transaction but only the new guid",
+         {"id": product.get("id"), "files": [str(guid)],
+          "transaction_id": transaction}),
+        ("by code, with the transaction",
+         {"code": product_code(product), "files": all_files,
+          "transaction_id": transaction}),
+        ("by id and code together, with the transaction",
          {"id": product.get("id"), "code": product_code(product),
-          "files": [str(g) for g in existing + [guid]]}),
-        ("by id, only the new guid (replace)",
-         {"id": product.get("id"), "files": [str(guid)]}),
+          "files": all_files, "transaction_id": transaction}),
+        ("by id, transaction only, no files list at all",
+         {"id": product.get("id"), "transaction_id": transaction}),
     ]
     for label, patch in variants:
         if patch.get("id") is None and "code" not in patch:
@@ -356,15 +372,23 @@ def phase_write(client, product):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if a != "--offline"]
+    flags = {"--offline", "--probe-only"}
+    args = [a for a in sys.argv[1:] if a not in flags]
     offline = "--offline" in sys.argv[1:]
+    probe_only = "--probe-only" in sys.argv[1:]
     given = args[0] if args else None
 
     print("=" * 70)
     print(" Skynamo product images - upload diagnostic")
     print("=" * 70)
-    print("\n[1] The folder (offline)")
-    _folder, images = phase_folder(given)
+
+    if probe_only:
+        print("\n[1] The folder - skipped (--probe-only); the probe uses its")
+        print("    own 1x1 pixel, so no image folder is needed.")
+        images = []
+    else:
+        print("\n[1] The folder (offline)")
+        _folder, images = phase_folder(given)
 
     if offline:
         print("\n--offline: stopping here. Phases 2 and 3 need your API key,")

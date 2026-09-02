@@ -26,11 +26,17 @@ JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
 
 class FakeClient:
     def __init__(self, upload_ok=True, attach_ok=True, files_by_guid=None,
-                 require_product_id=False):
+                 require_product_id=False, require_transaction=False):
         self.uploaded = []   # (filename, content_b64)
         self.attached = []   # (code, [guids])
         self.attach_keys = []  # (code, product_id) per attach call
+        self.attach_transactions = []
+        self.upload_transactions = []
+        self.guid_transaction = {}   # guid -> the transaction it came in under
         self.get_file_calls = []
+        # A live instance will not attach a file that is not linked by its
+        # transaction; set this to hold the engine to that.
+        self.require_transaction = require_transaction
         self._n = 0
         self.upload_ok = upload_ok
         self.attach_ok = attach_ok
@@ -40,20 +46,39 @@ class FakeClient:
         # guid -> filename; a guid absent from the map fails to resolve
         self.files_by_guid = files_by_guid or {}
 
-    def upload_file(self, filename, content_b64):
+    def upload_file(self, filename, content_b64, content_hash=None,
+                    transaction_id=None):
         self.uploaded.append((filename, content_b64))
+        self.upload_transactions.append(transaction_id)
         if not self.upload_ok:
             return None, "upload boom"
         self._n += 1
-        return f"guid-{self._n}", ""
+        guid = f"guid-{self._n}"
+        # Remember which transaction each guid belongs to, the way the API does.
+        self.guid_transaction[guid] = transaction_id
+        return guid, ""
 
-    def attach_files(self, code, files, product_id=None):
+    def attach_files(self, code, files, product_id=None, transaction_id=None):
         self.attached.append((code, list(files)))
         self.attach_keys.append((code, product_id))
+        self.attach_transactions.append(transaction_id)
         if not self.attach_ok:
             return False, "attach boom"
         if self.require_product_id and product_id is None:
             return False, "HTTP 400: id is required"
+        if self.require_transaction:
+            # An uploaded file is only linkable by the transaction it came in
+            # under; otherwise its guid does not resolve. This is the live
+            # failure, verbatim.
+            unlinked = [g for g in files
+                        if g in self.guid_transaction
+                        and self.guid_transaction[g] != transaction_id]
+            if unlinked:
+                detail = ",".join(
+                    f'"P023: File guid \'{g}\' not found."' for g in unlinked)
+                return False, ('HTTP 400: {"message":"Some errors occurred",'
+                               '"errors":[{"index":0,"detail":['
+                               + detail + ']}]}')
         return True, ""
 
     def get_file(self, guid):
@@ -345,6 +370,62 @@ try:
     assert all(e["total"] == 4 for e in events)
 finally:
     shutil.rmtree(f6, ignore_errors=True)
+
+# --- uploads are linked to their product by a shared transaction_id ---
+# "The transaction id associated with files in order to link files to a
+# product". Without it the guid never resolves: GET /files/{guid} 404s and the
+# patch answers "P023: File guid ... not found".
+f_t = make_folder()
+try:
+    strict = FakeClient(require_transaction=True, require_product_id=True)
+    plans_t = image_engine.scan_images(PRODUCTS, f_t)
+    image_engine.upload_images(strict, plans_t)
+    by_t = {p.filename: p for p in plans_t}
+    assert by_t["ABC.png"].status == STATUS_IMG_UPLOADED, by_t["ABC.png"].notes
+    assert by_t["XYZ.jpg"].status == STATUS_IMG_UPLOADED
+
+    # every upload carried one
+    assert strict.upload_transactions, strict.upload_transactions
+    assert all(t is not None for t in strict.upload_transactions)
+    # so did every attach
+    assert all(t is not None for t in strict.attach_transactions)
+
+    # ABC's three images share one transaction, and it is the one its patch used
+    abc_guids = [by_t[n].file_guid for n in ("ABC.png", "ABC_1.png", "ABC_2.png")]
+    abc_txns = {strict.guid_transaction[g] for g in abc_guids}
+    assert len(abc_txns) == 1, abc_txns
+    abc_attach = [(c, t) for (c, _pid), t
+                  in zip(strict.attach_keys, strict.attach_transactions)
+                  if c == "ABC"]
+    assert abc_attach and abc_attach[0][1] == abc_txns.pop(), abc_attach
+
+    # different products do NOT share one: a patch links "the files of this
+    # transaction", so sharing could attach another product's images too
+    assert len(set(strict.attach_transactions)) == \
+        len(strict.attach_transactions), strict.attach_transactions
+
+    # and the ids are plausible integers
+    assert all(isinstance(t, int) and 0 < t < 2 ** 31
+               for t in strict.upload_transactions)
+
+    # regression: an engine that forgets the transaction gets the real P023
+    plans_u = image_engine.scan_images(PRODUCTS, f_t)
+    unlinked = FakeClient(require_transaction=True)
+    for plan in plans_u:
+        if plan.include:
+            plan.include = True
+    # simulate the old behaviour by patching the client call to drop the id
+    real_attach = unlinked.attach_files
+    unlinked.attach_files = (
+        lambda code, files, product_id=None, transaction_id=None:
+        real_attach(code, files, product_id=product_id, transaction_id=None))
+    image_engine.upload_images(unlinked, plans_u)
+    broken = [p for p in plans_u if p.status == STATUS_IMG_UPLOAD_FAILED]
+    assert broken, "dropping the transaction must fail the attach"
+    assert "P023" in broken[0].error, broken[0].error
+    assert len({p.error for p in broken}) == 1     # still one grouped cause
+finally:
+    shutil.rmtree(f_t, ignore_errors=True)
 
 # --- an API error groups by cause, not by the ids it quotes ---
 # The real body from a live run: one message per offending guid, each quoting
