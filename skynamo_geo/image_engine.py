@@ -24,7 +24,8 @@ import shutil
 from . import reports
 from .reports import summarize  # re-exported: callers use image_engine.summarize
 from .config import (
-    ATTACHED_IMAGE_REPORT_FIELDNAMES, IMAGE_FOLDER_BY_STATUS,
+    ATTACHED_IMAGE_REPORT_FIELDNAMES, IMAGE_FAILURE_STATUSES,
+    IMAGE_FOLDER_BY_STATUS,
     IMAGE_REPORT_FIELDNAMES, STATUS_ATT_DELETE_FAILED, STATUS_ATT_DELETED,
     STATUS_ATT_FETCH_FAILED, STATUS_ATT_LOADED, STATUS_IMG_AMBIGUOUS,
     STATUS_IMG_BAD_FORMAT, STATUS_IMG_NO_MATCH, STATUS_IMG_PENDING,
@@ -77,6 +78,9 @@ class ImagePlan:
         self.include = False        # whether upload_images should process it
         self.moved_to = ""          # "Successful/ABC.png" once filed away
         self.filing_error = ""      # why the move failed, if it did
+        # Why this image failed, with no per-image specifics in it, so a bulk
+        # failure groups into one line. The specifics stay in `notes`.
+        self.error = ""
 
     @property
     def writable(self):
@@ -121,9 +125,11 @@ def scan_images(products, folder, on_progress=_noop, should_cancel=_never_cancel
         if not has_allowed_extension(path):
             plan.status = STATUS_IMG_BAD_FORMAT
             plan.notes = "Unsupported file extension (expected .png/.jpg/.jpeg)"
+            plan.error = plan.notes
         elif sniff_image_format(path) is None:
             plan.status = STATUS_IMG_BAD_FORMAT
             plan.notes = "File is not a valid PNG or JPEG"
+            plan.error = plan.notes
         else:
             # Prefer a literal code (the whole stem), then fall back to the
             # base with a stripped sequence marker.
@@ -137,10 +143,13 @@ def scan_images(products, folder, on_progress=_noop, should_cancel=_never_cancel
             if not matches:
                 plan.status = STATUS_IMG_NO_MATCH
                 plan.notes = f"No product with code matching '{stem}'"
+                plan.error = ("No product on this instance has a code matching "
+                              "the filename")
             elif len(matches) > 1:
                 codes = ", ".join(sorted(product_code(p) for p in matches))
                 plan.status = STATUS_IMG_AMBIGUOUS
                 plan.notes = f"Filename matches multiple product codes: {codes}"
+                plan.error = "Filename matches more than one product code"
             else:
                 plan.product = matches[0]
                 plan.product_code = product_code(matches[0])
@@ -223,6 +232,7 @@ def upload_images(client, plans, replace_existing=False, move_processed=False,
             else:
                 plan.status = STATUS_IMG_UPLOAD_FAILED
                 plan.notes = _append_note(plan.notes, error)
+                plan.error = f"upload rejected - {error}"
             on_progress({
                 "phase": "upload", "index": done, "total": total,
                 "name": plan.filename, "status": plan.status,
@@ -251,6 +261,7 @@ def upload_images(client, plans, replace_existing=False, move_processed=False,
                 plan.status = STATUS_IMG_UPLOAD_FAILED
                 plan.notes = _append_note(plan.notes,
                                           f"uploaded but not attached: {error}")
+                plan.error = f"uploaded but not attached - {error}"
 
     if move_processed and not (cancelled or should_cancel()):
         file_processed_images(plans, on_progress=on_progress)
@@ -363,6 +374,28 @@ def _move_one(plan, subfolder):
             return ""
     plan.filing_error = error
     return error
+
+
+def failure_reasons(plans, statuses=IMAGE_FAILURE_STATUSES):
+    """Group failed plans by cause. Returns [(reason, count, example), ...].
+
+    Sorted commonest first, and grouped on `plan.error` - the cause with the
+    per-image specifics stripped out - so a run that fails for one reason
+    collapses to a single entry instead of a thousand near-identical lines
+    nobody reads. `notes` is the fallback for a plan that predates an error
+    being recorded.
+    """
+    groups = {}
+    for plan in plans:
+        if plan.status not in statuses:
+            continue
+        reason = (plan.error or plan.notes
+                  or f"({plan.status}, no reason recorded)")
+        count, example = groups.get(reason, (0, plan.filename))
+        groups[reason] = (count + 1, example)
+    return sorted(((reason, count, example)
+                   for reason, (count, example) in groups.items()),
+                  key=lambda row: (-row[1], row[0]))
 
 
 def write_report(report_rows, path, fieldnames=IMAGE_REPORT_FIELDNAMES):

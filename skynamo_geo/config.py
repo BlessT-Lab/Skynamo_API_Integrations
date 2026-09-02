@@ -83,6 +83,12 @@ ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 JPEG_SIGNATURE = b"\xff\xd8\xff"
 
+# POST /files requires a content_hash ("F002: Content hash is required." if it
+# is missing). The spec describes it only as "(base64string)" and never names
+# the algorithm, so it lives here: base64 of the digest of the file's raw
+# bytes. diag_image_upload.py probes the alternatives against a live instance.
+FILE_HASH_ALGORITHM = "md5"
+
 # A product code may contain characters that can't appear in a filename; each is
 # represented by a hyphen. To match a filename back to its product we apply this
 # same forward transform to every known product code (see products.py).
@@ -96,6 +102,13 @@ STATUS_IMG_NO_MATCH = "no-matching-product"
 STATUS_IMG_BAD_FORMAT = "unsupported-format"
 STATUS_IMG_AMBIGUOUS = "ambiguous-match"
 STATUS_IMG_UPLOAD_FAILED = "upload-failed"
+
+# Every terminal outcome that means "this image did not make it in". Used to
+# group reasons for display, so a bulk failure reads as one line per cause.
+IMAGE_FAILURE_STATUSES = (
+    STATUS_IMG_UPLOAD_FAILED, STATUS_IMG_NO_MATCH, STATUS_IMG_BAD_FORMAT,
+    STATUS_IMG_AMBIGUOUS,
+)
 
 # --- Filing processed images ---------------------------------------------
 # After an upload run the images can be moved out of the folder they came from

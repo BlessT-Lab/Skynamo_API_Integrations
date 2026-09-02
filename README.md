@@ -310,7 +310,9 @@ is flagged **ambiguous** and skipped rather than guessed.
 
 ### Upload
 Skynamo has no dedicated product-image endpoint, so upload is two steps:
-`POST /files` (the image, base64-encoded) returns a file **GUID**, then
+`POST /files` (the image, base64-encoded, **plus a `content_hash`** — the API
+rejects an upload without one, `F002: Content hash is required.`, even though
+the spec lists no required fields) returns a file **GUID**, then
 `PATCH /products` attaches it via `{ "id": 42, "files": [guid, …] }`. The
 product is identified by **id** — a patch keyed only on `code` is rejected, and
 shows up as every image uploading and then failing to attach.
@@ -364,6 +366,29 @@ its filename (`GET /files/{guid}`) and lists them. Tick the ones to remove and
 > re-`PATCH`es the product's `files` list without the ticked GUIDs, so the image
 > no longer shows against the product — but the underlying file may still exist
 > on Skynamo's servers.
+
+### When images fail
+The on-screen table's **Status** column says *what* happened; the **log** below
+it says *why*, grouped by cause, and the **status line** above the log carries
+the commonest cause (it never scrolls away). A run of a thousand images that
+all fail for one reason therefore reads as one line, not a thousand. **Save
+Report CSV** has the per-image detail, including the specific product code or
+API response for each row.
+
+If images fail and the reason is not enough to act on, run:
+
+```
+py diag_image_upload.py
+```
+
+It works in three phases and stops before anything you have not agreed to:
+sizing every image in the folder offline (base64 inflates a request by ~33%, and
+a gateway cap of ~6MB per request means an image over roughly 4.4MB cannot be
+uploaded at all — this alone can explain a whole run failing); then a read-only
+check that your filenames match products and that those products carry the `id`
+the patch needs; then, only if you say yes, one 1x1-pixel test upload and an
+attach tried several ways, printing every status and body in full. The API key
+is redacted, so the output is safe to share.
 
 ### Log & report
 Every outcome shows in the on-screen table and log, and **Save Report CSV**
@@ -609,6 +634,35 @@ the whole store is empty, the tab tells you to run an extract first.
 ---
 
 ## 14. Change log
+
+- **v2.10.3** (2026-09-01) — **Fix: every image upload rejected with "F002:
+  Content hash is required."** `POST /files` needs a `content_hash` alongside
+  `filename` and `content`. The API spec lists no required fields for a file
+  upload and describes the field only as "(base64string)" without naming an
+  algorithm, so we never sent it and every upload failed. It is now sent as
+  base64 of the digest of the file's raw bytes, with the algorithm set in one
+  place (`FILE_HASH_ALGORITHM`); `diag_image_upload.py` probes the plausible
+  alternatives against a live endpoint if that turns out to be the wrong one.
+  Content that cannot be base64-decoded is reported rather than raised, so one
+  bad file cannot abort a whole run.
+
+- **v2.10.2** (2026-09-01) — **You can now see why an image failed.**
+  A 1003-image run failed on every image and the screen showed no reason at
+  all: per-item outcomes went to a status label that the next image
+  immediately overwrote, and the results table has no notes column, so the
+  reason only ever reached the saved CSV. That was half of this feature's
+  original requirement missing.
+  - Reasons are logged **grouped by cause**, commonest first — a thousand
+    images failing one way is one line with a count, not a thousand lines.
+  - The **dominant cause goes to the status line**, which does not scroll, so
+    it is readable without hunting through a four-line log box.
+  - API error bodies in reports widened from 200 to 500 characters; 200 could
+    cut off the part that says why.
+  - New `diag_image_upload.py`: sizes the folder offline (a request-size limit
+    can fail every upload on its own), checks matching and product ids
+    read-only, then — only with your say-so — does one tiny test upload and
+    tries the attach several ways, printing full responses with the API key
+    redacted.
 
 - **v2.10.1** (2026-09-01) — **Fix: product images uploaded but never attached.**
   Against a live instance every image reached Skynamo and then failed with

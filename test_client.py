@@ -8,12 +8,14 @@ whatever it is handed and always says OK, so a wrong request body passes every
 one of them and only fails against a real instance.
 """
 
+import base64
+import hashlib
 import json
 
 import requests
 
-from skynamo_geo.client import SkynamoClient
-from skynamo_geo.config import API_BASE
+from skynamo_geo.client import SkynamoClient, content_hash_b64
+from skynamo_geo.config import API_BASE, FILE_HASH_ALGORITHM
 
 
 class FakeResponse:
@@ -148,24 +150,58 @@ guid, err = make_client(s).upload_file("ABC.png", "Ym9keQ==")
 assert guid == "guid-abc" and err == "", (guid, err)
 method, url, _kw = s.calls[0]
 assert method == "post" and url == f"{API_BASE}/files", url
-assert body_of(s.calls[0]) == {"filename": "ABC.png", "content": "Ym9keQ=="}
+# content_hash is REQUIRED even though FilePost does not list it as required:
+# without it a live instance answers "F002: Content hash is required." and
+# every single upload fails.
+sent = body_of(s.calls[0])
+assert set(sent) == {"filename", "content", "content_hash"}, sent
+assert sent["filename"] == "ABC.png" and sent["content"] == "Ym9keQ=="
+expected = base64.b64encode(
+    hashlib.new(FILE_HASH_ALGORITHM, b"body").digest()).decode("ascii")
+assert sent["content_hash"] == expected, (sent["content_hash"], expected)
+# ...and it is the hash of the decoded bytes, not of the base64 text
+assert sent["content_hash"] != base64.b64encode(
+    hashlib.new(FILE_HASH_ALGORITHM, b"Ym9keQ==").digest()).decode("ascii")
+
+# A caller that already has the bytes can pass the hash in, and it is used
+# verbatim rather than recomputed.
+s = FakeSession([FakeResponse(200, {"data": [{"id": "g"}]})])
+make_client(s).upload_file("ABC.png", "Ym9keQ==", content_hash="PRECOMPUTED")
+assert body_of(s.calls[0])["content_hash"] == "PRECOMPUTED"
+
+# The helper is base64 of the digest of the raw bytes.
+assert content_hash_b64(b"body") == expected
+assert content_hash_b64(b"") == base64.b64encode(
+    hashlib.new(FILE_HASH_ALGORITHM, b"").digest()).decode("ascii")
 
 # Failure modes all report rather than raise.
 s = FakeSession([FakeResponse(413, None, text="too large")])
-guid, err = make_client(s).upload_file("big.png", "x")
+guid, err = make_client(s).upload_file("big.png", "Ym9keQ==")
 assert guid is None and "413" in err and "too large" in err
 
 s = FakeSession([FakeResponse(200, None, text="<html>not json</html>")])
-guid, err = make_client(s).upload_file("ABC.png", "x")
+guid, err = make_client(s).upload_file("ABC.png", "Ym9keQ==")
 assert guid is None and "Malformed response" in err, err
 
 s = FakeSession([FakeResponse(200, {"data": []})])
-guid, err = make_client(s).upload_file("ABC.png", "x")
+guid, err = make_client(s).upload_file("ABC.png", "Ym9keQ==")
 assert guid is None and "No file GUID" in err, err
 
 s = FakeSession(raise_on={"post"})
-guid, err = make_client(s).upload_file("ABC.png", "x")
+guid, err = make_client(s).upload_file("ABC.png", "Ym9keQ==")
 assert guid is None and "Connection error" in err, err
+
+# Content that is not valid base64 is reported, never raised: hashing it means
+# decoding it, and an exception here would abort the run instead of one image.
+s = FakeSession()
+guid, err = make_client(s).upload_file("ABC.png", "x")
+assert guid is None and "Could not hash the file content" in err, err
+assert s.calls == [], "nothing should be sent if the content cannot be hashed"
+
+# A caller-supplied hash skips the decode entirely, so the same content is fine.
+s = FakeSession([FakeResponse(200, {"data": [{"id": "g"}]})])
+guid, err = make_client(s).upload_file("ABC.png", "x", content_hash="H")
+assert guid == "g" and err == "", (guid, err)
 
 # ---------------------------------------------------------------------------
 # test_connection - auth failures are named as such

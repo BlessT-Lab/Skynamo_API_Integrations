@@ -933,6 +933,7 @@ class App(ctk.CTk):
         self.img_progress.grid(row=0, column=0, padx=14, pady=(12, 4),
                                sticky="ew")
         self.img_status_label = ctk.CTkLabel(bottom, text="Ready.", anchor="w",
+                                             wraplength=980, justify="left",
                                              text_color=TEXT)
         self.img_status_label.grid(row=1, column=0, padx=14, pady=2, sticky="ew")
         self.img_log = ctk.CTkTextbox(
@@ -1093,6 +1094,7 @@ class App(ctk.CTk):
                     counts = image_engine.summarize(plans)
                     self.img_set_status(
                         self._img_summary_text(counts, preview=True))
+                    self._img_log_failures("Match problems")
                     self.img_log_line("Preview complete. Review rows, then "
                                       "'Upload Selected to Skynamo'.")
                 self.img_queue.put(("done", finish))
@@ -1133,6 +1135,7 @@ class App(ctk.CTk):
                     counts = image_engine.summarize(self.image_plans)
                     self.img_set_status(
                         self._img_summary_text(counts, preview=False))
+                    self._img_log_failures("Failures")
                     self._img_log_filing(move_processed)
                     self.img_log_line("Upload complete. Save the report if needed.")
                     self.img_save_btn.configure(state="normal")
@@ -1165,6 +1168,34 @@ class App(ctk.CTk):
         image_engine.write_report(rows, path)
         self.img_log_line(f"Report saved to: {path}")
         self.img_set_status(f"Report saved to {path}")
+
+    def _img_log_failures(self, header):
+        """Log why images failed, grouped by reason (commonest first).
+
+        The status label is overwritten by the next progress event and the
+        table has no notes column, so without this the reason only ever
+        reaches the saved CSV.
+        """
+        groups = image_engine.failure_reasons(self.image_plans)
+        if not groups:
+            return
+        total = sum(count for _reason, count, _eg in groups)
+        self.img_log_line(f"{header}: {total} image(s) did not make it in.")
+        for reason, count, example in groups:
+            if count == 1:
+                self.img_log_line(f"  - {example}: {reason}")
+            else:
+                self.img_log_line(f"  - {count} image(s): {reason}")
+                self.img_log_line(f"      e.g. {example}")
+        self.img_log_line("  Save Report CSV for the full per-image list.")
+        # The log shows a few lines and scrolls to the bottom, so on a large
+        # run the reason everything failed would scroll straight out of view.
+        # The status line does not scroll.
+        top_reason, top_count, _eg = groups[0]
+        headline = (f"{total} image(s) failed. "
+                    + (f"Commonest ({top_count}): {top_reason}"
+                       if len(groups) > 1 else top_reason))
+        self.img_set_status(headline)
 
     def _img_log_filing(self, requested):
         """Log where the processed files went (and any that could not move)."""

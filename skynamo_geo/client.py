@@ -1,8 +1,25 @@
 """Skynamo public API client."""
 
+import base64
+import hashlib
+
 import requests
 
-from .config import API_BASE, PAGE_SIZE, REQUEST_TIMEOUT, DEFAULT_ACCURACY
+from .config import (
+    API_BASE, DEFAULT_ACCURACY, FILE_HASH_ALGORITHM, PAGE_SIZE,
+    REQUEST_TIMEOUT,
+)
+
+
+def content_hash_b64(raw_bytes, algorithm=FILE_HASH_ALGORITHM):
+    """The `content_hash` POST /files wants: base64 of the content's digest.
+
+    The spec calls it "(base64string)" without naming an algorithm; see
+    FILE_HASH_ALGORITHM. Omitting the field entirely is rejected with
+    "F002: Content hash is required."
+    """
+    return base64.b64encode(
+        hashlib.new(algorithm, raw_bytes).digest()).decode("ascii")
 
 
 class SkynamoClient:
@@ -27,7 +44,7 @@ class SkynamoClient:
         if resp.status_code in (401, 403):
             return False, "Authentication failed - check your API key and instance name."
         if not resp.ok:
-            return False, f"Unexpected response: HTTP {resp.status_code} - {resp.text[:200]}"
+            return False, f"Unexpected response: HTTP {resp.status_code} - {resp.text[:500]}"
         return True, "Connected."
 
     def fetch_all_customers(self, on_page=None, active_only=True):
@@ -92,7 +109,7 @@ class SkynamoClient:
         )
         if resp.ok:
             return True, ""
-        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return False, f"HTTP {resp.status_code}: {resp.text[:500]}"
 
     def fetch_all_products(self, on_page=None, active_only=True):
         """Paginate through /products (same paging shape as /customers).
@@ -130,22 +147,36 @@ class SkynamoClient:
             page_number += 1
         return products
 
-    def upload_file(self, filename, content_b64):
+    def upload_file(self, filename, content_b64, content_hash=None):
         """POST a base64-encoded file to /files. Returns (guid, error_message).
 
         On success guid is the created file's GUID (from the response's
         data[].id); on failure guid is None and error_message explains why.
+
+        `content_hash` is required by the API even though FilePost does not
+        list it as required - without it every upload fails with "F002:
+        Content hash is required." It is derived from the content when the
+        caller does not pass one already computed.
         """
+        if content_hash is None:
+            try:
+                content_hash = content_hash_b64(base64.b64decode(content_b64))
+            except (ValueError, TypeError) as exc:
+                # binascii.Error subclasses ValueError. Returned, not raised:
+                # every other failure here is, and the engine relies on that
+                # to fail one image instead of the whole run.
+                return None, f"Could not hash the file content: {exc}"
         try:
             resp = self.session.post(
                 f"{API_BASE}/files",
-                json={"filename": filename, "content": content_b64},
+                json={"filename": filename, "content": content_b64,
+                      "content_hash": content_hash},
                 timeout=REQUEST_TIMEOUT,
             )
         except requests.RequestException as exc:
             return None, f"Connection error: {exc}"
         if not resp.ok:
-            return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+            return None, f"HTTP {resp.status_code}: {resp.text[:500]}"
         try:
             data = resp.json().get("data") or []
         except ValueError:
@@ -169,7 +200,7 @@ class SkynamoClient:
         except requests.RequestException as exc:
             return None, f"Connection error: {exc}"
         if not resp.ok:
-            return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+            return None, f"HTTP {resp.status_code}: {resp.text[:500]}"
         try:
             data = resp.json().get("data") or []
         except ValueError:
@@ -210,4 +241,4 @@ class SkynamoClient:
             return True, ""
         keyed = "id" if product_id is not None else "code"
         return False, (f"HTTP {resp.status_code} (patched by {keyed}): "
-                       f"{resp.text[:200]}")
+                       f"{resp.text[:500]}")

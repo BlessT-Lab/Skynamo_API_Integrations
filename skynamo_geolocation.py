@@ -460,11 +460,16 @@ def run_image_import(client):
         ("Unsupported format", STATUS_IMG_BAD_FORMAT),
     ])
 
-    failed = [p for p in plans if p.status == STATUS_IMG_UPLOAD_FAILED]
-    if failed:
-        print("\n  FAILURES:")
-        for plan in failed:
-            print(f"    - {plan.filename}: {plan.notes}")
+    groups = image_engine.failure_reasons(plans)
+    if groups:
+        total = sum(count for _r, count, _e in groups)
+        print(f"\n  FAILURES ({total} image(s), grouped by reason):")
+        for reason, count, example in groups:
+            if count == 1:
+                print(f"    - {example}: {reason}")
+            else:
+                print(f"    - {count} image(s): {reason}")
+                print(f"        e.g. {example}")
 
     if move_processed:
         filed = image_engine.filing_summary(plans)

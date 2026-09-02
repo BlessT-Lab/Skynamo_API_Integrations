@@ -338,6 +338,51 @@ try:
 finally:
     shutil.rmtree(f6, ignore_errors=True)
 
+# --- failure reasons are grouped, so a bulk failure reads as one line ---
+f_r = make_folder()
+try:
+    plans_r2 = image_engine.scan_images(PRODUCTS, f_r)
+    # every upload fails the same way - the 1003-images-all-failed case
+    image_engine.upload_images(FakeClient(upload_ok=False), plans_r2)
+    groups = image_engine.failure_reasons(plans_r2)
+    assert groups, groups
+    # commonest first, and each entry is (reason, count, example)
+    counts = [count for _reason, count, _eg in groups]
+    assert counts == sorted(counts, reverse=True), counts
+    for reason, count, example in groups:
+        assert isinstance(reason, str) and reason
+        assert count >= 1
+        assert example
+    # the shared upload failure collapses into one entry covering 5 images
+    boom = [g for g in groups if "upload boom" in g[0]]
+    assert len(boom) == 1, boom           # one entry, not one per product
+    assert boom[0][1] == 5, boom          # ABC x3, XYZ, A-B
+    # the scan-time problems are grouped too, each with its own reason
+    # each cause is generic - no filename or code inside it, or it would not
+    # group across images
+    reasons = " | ".join(r for r, _c, _e in groups)
+    assert "No product on this instance has a code matching" in reasons
+    assert "not a valid PNG or JPEG" in reasons
+    assert "Unsupported file extension" in reasons
+    assert "more than one product code" in reasons
+    for reason, _count, _eg in groups:
+        for specific in ("NOPE", "ABC.png", "P-Q", "Alpha", "'"):
+            assert specific not in reason, (reason, specific)
+    # a plan with neither cause nor note still names its status, so a failure
+    # can never show up as an empty reason
+    plans_r2[0].notes = ""
+    plans_r2[0].error = ""
+    plans_r2[0].status = STATUS_IMG_UPLOAD_FAILED
+    blank = [g for g in image_engine.failure_reasons(plans_r2)
+             if "no reason recorded" in g[0]]
+    assert blank, "a reasonless failure must still be reported"
+    # a clean run has nothing to report
+    plans_ok = image_engine.scan_images([PRODUCTS[0]], f_r)
+    only_abc = [p for p in plans_ok if p.filename == "ABC.png"]
+    assert image_engine.failure_reasons(only_abc) == []
+finally:
+    shutil.rmtree(f_r, ignore_errors=True)
+
 # --- the attach must identify the product by id, not just by code ---
 # The live API rejected a ProductPatch keyed only on code, so every image
 # uploaded and then failed to attach. A fake that accepts anything hid it.

@@ -52,6 +52,7 @@ py test_report_engine.py                                     # extract plan/run 
 py test_dashboard.py                                         # HTML dashboard render + escaping (offline)
 py test_diag_redaction.py                                    # asserts the auth diagnostic leaks no secrets (offline)
 py test_gui_smoke.py                                         # builds the GUI (all five tabs) and tears it down
+py diag_image_upload.py                                       # diagnose a product-image upload failure (3 phases, asks before writing)
 py diag_reporting_auth.py                                    # diagnose a Reporting API auth failure (read-only, needs creds)
 py live_check_reporting.py                                   # verify entity payloads vs the registry (read-only, needs creds)
 py -m pip install -r requirements-build.txt && build.bat     # -> dist/SkynamoGeo.exe (PyInstaller)
@@ -186,6 +187,27 @@ never gets a stray database.
   product code and match filename stems against that set — trying the whole stem (literal code) first,
   then the stem with a trailing sequence marker stripped. Two codes escaping to the same form → the
   match is flagged **ambiguous**, not guessed.
+- **A failure the user cannot read is a failure they cannot report.** The image tab pushed every
+  per-item outcome into a status label that the next progress event overwrote, and the results
+  table has no notes column, so the *reason* an image failed reached only the saved CSV — half of
+  this feature's original requirement ("a log on display **and** a file to show reason why the
+  image failed to import") was simply absent, and a 1003-image failure was undiagnosable from the
+  screen. Reasons now go to the log grouped by cause, and the dominant cause goes to the status
+  line, which does not scroll. Grouping is on **`plan.error`**, not `plan.notes`: notes carry
+  per-image specifics (`"Matches product 'Alpha'; ..."`, `"No product with code matching 'NOPE'"`)
+  so grouping on them collapses nothing. Any new failure path must set `plan.error` to a cause with
+  no filename, code or product name in it.
+- **`POST /files` requires `content_hash`, and the spec does not say so.**
+  `FilePost` lists no required fields, so we sent only `filename` + `content` and a live
+  instance rejected **every** upload with
+  `HTTP 400 {"errors":["F002: Content hash is required."]}`. The description is just
+  "The content hash of the file (base64string)" — it never names the algorithm, so
+  `FILE_HASH_ALGORITHM` in `config.py` is the single place it is decided (base64 of the digest of
+  the file's **raw bytes**, not of the base64 text) and `diag_image_upload.py` probes the
+  alternatives against a live endpoint. `client.content_hash_b64` computes it;
+  `upload_file` derives it when the caller does not supply one, and a content string that will not
+  base64-decode is **returned** as an error, never raised — the engine relies on that to fail one
+  image rather than the whole run.
 - **Patch a product by `id`, not by `code`.** `ProductPatch` declares `id` required (its `code`
   field only says "required if you do not specify id"), and a live instance rejected a code-only
   patch: every image uploaded and then failed to attach, reported as *uploaded but not attached*.

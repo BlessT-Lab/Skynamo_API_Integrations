@@ -1,14 +1,18 @@
-"""Offline tests that the auth diagnostic never prints a secret.
+"""Offline tests that the diagnostics never print a secret.
 
-The script tells the user its output can be shared, so that claim has to be
+Both scripts tell the user their output can be shared, so that claim has to be
 enforced by a test rather than by a docstring. Every value below is a canary:
 if any of them reaches stdout, the test fails.
+
+Covers diag_reporting_auth.py (OAuth tokens, client id/secret, JWT claims) and
+diag_image_upload.py (the Public API key).
 """
 
 import io
 import json
 from contextlib import redirect_stdout
 
+import diag_image_upload as imgdiag
 import diag_reporting_auth as diag
 
 TOKEN = "eyJhbGciOiJSUzI1NiJ9.SUPERSECRETTOKENPAYLOAD.sig"
@@ -128,5 +132,60 @@ assert decoded["azp"] == CLIENT_ID, "decoding itself is fine"
 assert "sub" in diag._IDENTIFYING_CLAIMS and "azp" in diag._IDENTIFYING_CLAIMS
 assert diag.decode_jwt_claims("not-a-jwt") is None
 assert diag.decode_jwt_claims("a.!!!.c") is None
+
+# ---------------------------------------------------------------------------
+# diag_image_upload.py - the Public API key must never reach stdout
+# ---------------------------------------------------------------------------
+API_KEY = "SkynamoApiKeyCanary0123456789"
+
+
+class ImgResponse:
+    """A response whose body echoes the request - the case that leaks."""
+
+    def __init__(self, status, text, headers=None):
+        self.status_code = status
+        self.ok = 200 <= status < 300
+        self.text = text
+        self.headers = headers or {"content-type": "application/json"}
+
+
+imgdiag._SECRET["value"] = API_KEY
+try:
+    # A gateway that rejects by echoing the request back sends the headers,
+    # and the API key is one of them.
+    echoed = json.dumps({"message": "rejected",
+                         "headers": {"X-API-KEY": API_KEY}})
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        imgdiag.show("POST /files", ImgResponse(400, echoed))
+    out = buf.getvalue()
+    assert API_KEY not in out, out
+    assert "<API-KEY-REDACTED>" in out, out
+    assert "400" in out
+
+    # Non-JSON bodies go through the same redaction, not around it.
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        imgdiag.show("probe", ImgResponse(500, f"<html>{API_KEY}</html>"))
+    assert API_KEY not in buf.getvalue()
+
+    # An empty body must not blow up, and a header we surface is fine.
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        imgdiag.show("probe", ImgResponse(429, "",
+                                          {"retry-after": "30"}))
+    assert "retry-after: 30" in buf.getvalue()
+
+    assert imgdiag.redact(f"a {API_KEY} b") == "a <API-KEY-REDACTED> b"
+    assert imgdiag.redact(None) is None
+finally:
+    imgdiag._SECRET["value"] = ""
+
+# With no key recorded yet, redact is a passthrough rather than an error.
+assert imgdiag.redact("plain text") == "plain text"
+
+# The write probe is opt-in: `ask` must default to NO, so an unattended run
+# (or a bare Enter) never writes to the instance.
+assert imgdiag.ask.__defaults__ == (False,)
 
 print("All diagnostic redaction tests passed")
