@@ -178,19 +178,36 @@ class SkynamoClient:
             return None, "File not found"
         return data[0], ""
 
-    def attach_files(self, product_code, file_guids):
-        """PATCH a product's `files` list by code. Returns (ok, error_message).
+    def attach_files(self, product_code, file_guids, product_id=None):
+        """PATCH a product's `files` list. Returns (ok, error_message).
 
         Mirrors update_location: the API accepts updates only on the collection
         endpoint (PATCH /products) with an array of ProductPatch objects. Pass
         the full desired `files` list (the caller merges with any existing
         GUIDs so nothing already attached is lost).
+
+        **Identify the product by `id` whenever it is known.** ProductPatch
+        declares `id` required, and patching by `code` alone was rejected by a
+        live instance while the identical id-keyed customer patch succeeded.
+        `code` is only a fallback for a product that arrived without an id.
+
+        GUIDs are sent as strings: `Product.files` items are declared strings
+        while `File.id` - what POST /files hands back - is declared an integer,
+        so a bare int can otherwise reach a string-typed array.
         """
-        resp = self.session.patch(
-            f"{API_BASE}/products",
-            json=[{"code": product_code, "files": file_guids}],
-            timeout=REQUEST_TIMEOUT,
-        )
+        key = ({"id": product_id} if product_id is not None
+               else {"code": product_code})
+        patch = dict(key, files=[str(g) for g in file_guids])
+        try:
+            resp = self.session.patch(
+                f"{API_BASE}/products",
+                json=[patch],
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            return False, f"Connection error: {exc}"
         if resp.ok:
             return True, ""
-        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        keyed = "id" if product_id is not None else "code"
+        return False, (f"HTTP {resp.status_code} (patched by {keyed}): "
+                       f"{resp.text[:200]}")

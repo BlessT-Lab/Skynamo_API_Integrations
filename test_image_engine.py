@@ -25,12 +25,17 @@ JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 16
 
 
 class FakeClient:
-    def __init__(self, upload_ok=True, attach_ok=True, files_by_guid=None):
+    def __init__(self, upload_ok=True, attach_ok=True, files_by_guid=None,
+                 require_product_id=False):
         self.uploaded = []   # (filename, content_b64)
         self.attached = []   # (code, [guids])
+        self.attach_keys = []  # (code, product_id) per attach call
         self._n = 0
         self.upload_ok = upload_ok
         self.attach_ok = attach_ok
+        # A live instance rejects a ProductPatch with no id (it is the declared
+        # required field). Set this to hold the engine to that.
+        self.require_product_id = require_product_id
         # guid -> filename; a guid absent from the map fails to resolve
         self.files_by_guid = files_by_guid or {}
 
@@ -41,10 +46,13 @@ class FakeClient:
         self._n += 1
         return f"guid-{self._n}", ""
 
-    def attach_files(self, code, files):
+    def attach_files(self, code, files, product_id=None):
         self.attached.append((code, list(files)))
+        self.attach_keys.append((code, product_id))
         if not self.attach_ok:
             return False, "attach boom"
+        if self.require_product_id and product_id is None:
+            return False, "HTTP 400: id is required"
         return True, ""
 
     def get_file(self, guid):
@@ -329,6 +337,39 @@ try:
     assert all(e["total"] == 4 for e in events)
 finally:
     shutil.rmtree(f6, ignore_errors=True)
+
+# --- the attach must identify the product by id, not just by code ---
+# The live API rejected a ProductPatch keyed only on code, so every image
+# uploaded and then failed to attach. A fake that accepts anything hid it.
+f_id = make_folder()
+try:
+    strict = FakeClient(require_product_id=True)
+    plans_id = image_engine.scan_images(PRODUCTS, f_id)
+    image_engine.upload_images(strict, plans_id)
+    by_id = {p.filename: p for p in plans_id}
+    assert by_id["ABC.png"].status == STATUS_IMG_UPLOADED, by_id["ABC.png"].notes
+    assert by_id["XYZ.jpg"].status == STATUS_IMG_UPLOADED
+    # every attach carried the product's id
+    assert all(pid is not None for _code, pid in strict.attach_keys), \
+        strict.attach_keys
+    assert ("ABC", 1) in strict.attach_keys, strict.attach_keys
+    assert ("A/B", 3) in strict.attach_keys, strict.attach_keys
+
+    # a product that genuinely has no id still attaches, by code
+    no_id = [{"code": "NOID", "name": "Idless"}]
+    folder_noid = tempfile.mkdtemp(prefix="skynamo_noid_")
+    try:
+        with open(os.path.join(folder_noid, "NOID.png"), "wb") as f:
+            f.write(PNG)
+        lax = FakeClient()
+        plans_noid = image_engine.scan_images(no_id, folder_noid)
+        image_engine.upload_images(lax, plans_noid)
+        assert lax.attach_keys == [("NOID", None)], lax.attach_keys
+        assert plans_noid[0].status == STATUS_IMG_UPLOADED
+    finally:
+        shutil.rmtree(folder_noid, ignore_errors=True)
+finally:
+    shutil.rmtree(f_id, ignore_errors=True)
 
 # --- filing twice must not nest the subfolders ---
 f8 = make_folder()

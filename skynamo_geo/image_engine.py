@@ -238,7 +238,8 @@ def upload_images(client, plans, replace_existing=False, move_processed=False,
         else:
             desired = _dedupe(existing + new_guids)
             dropped = []
-        ok, error = client.attach_files(product_code(product), desired)
+        ok, error = client.attach_files(product_code(product), desired,
+                                        product_id=product.get("id"))
         for plan in uploaded:
             if ok:
                 plan.status = STATUS_IMG_UPLOADED
@@ -442,7 +443,8 @@ def delete_selected_images(client, product, images, on_progress=_noop,
         return [img.to_report_row() for img in images]
 
     keep = _dedupe([img.guid for img in images if not img.delete])
-    ok, error = client.attach_files(product_code(product), keep)
+    ok, error = client.attach_files(product_code(product), keep,
+                                    product_id=(product or {}).get("id"))
     total = len(to_delete)
     for i, img in enumerate(to_delete, 1):
         if ok:

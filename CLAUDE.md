@@ -44,6 +44,7 @@ py test_cli_images.py                                         # CLI image flows 
 py test_engine.py                                            # geolocation engine smoke tests (mocked, no network/keys)
 py test_geocoder.py                                          # OSM precision mapping + query building (offline)
 py test_products.py                                          # image filename parsing/escaping/matching (offline)
+py test_client.py                                             # Public API request bodies (fake session, offline)
 py test_image_engine.py                                      # image engine preview/commit (mocked client, offline)
 py test_reporting_client.py                                  # OAuth/token/throttle/filter building (fake session)
 py test_report_store.py                                      # SQLite schema/upsert/bookmarks (in-memory)
@@ -90,7 +91,8 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
   engine changes.
 - `skynamo_geo/client.py` — `SkynamoClient`. `fetch_all_customers`/`fetch_all_products`
   (`active_only=True` skips inactive). Writes go to the **collection** endpoint with an **array**
-  body: `update_location` → `PATCH /customers`, `attach_files` → `PATCH /products` (by `code`);
+  body: `update_location` → `PATCH /customers`, `attach_files` → `PATCH /products` (by **`id`**,
+  falling back to `code` only when the product has none);
   `/{id}` routes are GET-only. `upload_file` → `POST /files` with base64 `content`, returns the file GUID.
 - `skynamo_geo/config.py` — all constants (endpoints, `ACCURACY_BY_PRECISION`, `STATUS_*`,
   `STATUS_IMG_*`, `STATUS_ATT_*`, `REPORT_FIELDNAMES`, `IMAGE_REPORT_FIELDNAMES`,
@@ -184,6 +186,14 @@ never gets a stray database.
   product code and match filename stems against that set — trying the whole stem (literal code) first,
   then the stem with a trailing sequence marker stripped. Two codes escaping to the same form → the
   match is flagged **ambiguous**, not guessed.
+- **Patch a product by `id`, not by `code`.** `ProductPatch` declares `id` required (its `code`
+  field only says "required if you do not specify id"), and a live instance rejected a code-only
+  patch: every image uploaded and then failed to attach, reported as *uploaded but not attached*.
+  `attach_files` keys on `id` and falls back to `code` only for a product that arrived without one
+  — the same shape as `update_location`, which is the write path that was already known to work.
+  This survived every offline test because the engine tests' fake client accepts whatever it is
+  handed; `test_client.py` exists to pin the actual request bodies, and the fakes now take
+  `require_product_id=True` to reproduce the live rejection.
 - **Skynamo has no product-image endpoint.** Upload is generic: `POST /files` (base64 `content`) →
   file GUID → `PATCH /products` with `{code, files:[...]}`. In merge mode the `files` array is sent
   as the **union** of the product's existing GUIDs plus the new ones (don't clobber attached images);

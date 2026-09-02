@@ -29,13 +29,16 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
 
 class FakeClient:
     def __init__(self, products, upload_ok=True, attach_ok=True,
-                 files_by_guid=None):
+                 files_by_guid=None, require_product_id=False):
         self.products = products
         self.uploaded = []
         self.attached = []
+        self.attach_keys = []      # (code, product_id) per attach call
         self._n = 0
         self.upload_ok = upload_ok
         self.attach_ok = attach_ok
+        # a live instance rejects a ProductPatch with no id
+        self.require_product_id = require_product_id
         self.files_by_guid = files_by_guid or {}
 
     def test_connection(self):
@@ -53,10 +56,13 @@ class FakeClient:
         self._n += 1
         return f"guid-{self._n}", ""
 
-    def attach_files(self, code, files):
+    def attach_files(self, code, files, product_id=None):
         self.attached.append((code, list(files)))
+        self.attach_keys.append((code, product_id))
         if not self.attach_ok:
             return False, "attach boom"
+        if self.require_product_id and product_id is None:
+            return False, "HTTP 400: id is required"
         return True, ""
 
     def get_file(self, guid):
@@ -194,6 +200,19 @@ try:
     # a report landed in cwd
     reports = [f for f in os.listdir(work) if f.startswith("product_images_report")]
     assert reports, os.listdir(work)
+
+    # --- import: the attach identifies the product by id ---
+    folder = make_folder(); folders.append(folder)
+    client = FakeClient(make_products(), require_product_id=True)
+    out, exc = run(cli.run_image_import, client, Script(
+        texts=[folder],
+        confirms=[True, False, False, True],
+    ))
+    assert exc is None, exc
+    assert "Uploaded" in out
+    assert all(pid is not None for _c, pid in client.attach_keys), \
+        client.attach_keys
+    assert "upload-failed" not in out
 
     # --- import: declining the final confirm uploads NOTHING ---
     folder = make_folder(); folders.append(folder)

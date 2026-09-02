@@ -75,6 +75,7 @@ GeoLocation_Script/
   test_engine.py            # geolocation engine smoke tests (mocked client + geocoder)
   test_geocoder.py          # OSM precision mapping + query building (offline)
   test_products.py          # image filename parsing/escaping/matching (offline)
+  test_client.py            # Public API request bodies (fake session, offline)
   test_image_engine.py      # image engine preview/commit (mocked client, offline)
   test_cli_images.py        # CLI image flows: scripted prompts, fake client (offline)
   test_reporting_client.py  # OAuth/token/throttle/filter building (fake session, offline)
@@ -192,7 +193,9 @@ earlier version saved to the Windows Credential Manager are purged on startup.
 - **Upload a file:** `POST /files` with `{ "filename": "...", "content": "<base64>" }`.
   The response's `data[].id` is the created file's **GUID**.
 - **Attach a file to a product:** `PATCH /products` (collection endpoint, array
-  body) with `[{ "code": "ABC", "files": ["<guid>", …] }]` — matched by `code`.
+  body) with `[{ "id": 42, "files": ["<guid>", …] }]` — matched by **`id`**
+  (`ProductPatch` declares it required; `code` is only a fallback when the
+  product has no id).
   Send the full desired `files` list; this same call is used to attach (merge),
   replace, and detach — it just sets the product's `files` to exactly what you send.
 - **Read a file:** `GET /files/{guid}` returns the file's metadata (incl.
@@ -308,7 +311,9 @@ is flagged **ambiguous** and skipped rather than guessed.
 ### Upload
 Skynamo has no dedicated product-image endpoint, so upload is two steps:
 `POST /files` (the image, base64-encoded) returns a file **GUID**, then
-`PATCH /products` attaches it via `{ "code": "...", "files": [guid, …] }`.
+`PATCH /products` attaches it via `{ "id": 42, "files": [guid, …] }`. The
+product is identified by **id** — a patch keyed only on `code` is rejected, and
+shows up as every image uploading and then failing to attach.
 Images for one product upload in sequence order. The preview table shows an
 **Existing** column (how many images the matched product already has).
 
@@ -413,6 +418,7 @@ during preview, before committing).
 py test_engine.py        # geolocation engine: plan statuses, no-write-in-preview, accuracy
 py test_geocoder.py      # OSM precision mapping + query building
 py test_products.py      # image filename parsing/escaping/matching/format sniff
+py test_client.py        # Public API: exact PATCH/POST bodies, error and network paths
 py test_image_engine.py  # image engine: match/upload, replace mode, list/remove attached images
 py test_cli_images.py    # CLI image flows: confirmation gating, deselection, replace warning
 py test_reporting_client.py  # OAuth token cache/refresh, 401 retry, 429 backoff, throttle, filters
@@ -603,6 +609,22 @@ the whole store is empty, the tab tells you to run an extract first.
 ---
 
 ## 14. Change log
+
+- **v2.10.1** (2026-09-01) — **Fix: product images uploaded but never attached.**
+  Against a live instance every image reached Skynamo and then failed with
+  *"uploaded but not attached"*. `PATCH /products` was identifying the product
+  by `code`; `ProductPatch` declares **`id`** required, and the customer patch
+  that already worked keys on `id`. It now does the same, falling back to `code`
+  only for a product with no id, and sends file GUIDs as strings (`File.id` is
+  declared an integer while `Product.files` holds strings). A network error
+  during the attach is also returned like every other client error instead of
+  aborting the whole run.
+  - **Root cause of the class, not just the bug:** `SkynamoClient` — the only
+    module that writes to the live API — had no tests at all. The engine tests
+    use a fake client that accepts whatever it is handed and says OK, so a wrong
+    request body passed every one of them. New `test_client.py` pins the actual
+    URLs and JSON bodies against a fake session, and the engine/CLI fakes take
+    `require_product_id=True` to reproduce the live rejection.
 
 - **v2.10.0** (2026-09-01) — **File processed images into `Successful/` and
   `Failed/`.** After an upload run the images can be moved out of the folder
