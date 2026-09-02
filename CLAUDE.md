@@ -196,7 +196,15 @@ never gets a stray database.
   line, which does not scroll. Grouping is on **`plan.error`**, not `plan.notes`: notes carry
   per-image specifics (`"Matches product 'Alpha'; ..."`, `"No product with code matching 'NOPE'"`)
   so grouping on them collapses nothing. Any new failure path must set `plan.error` to a cause with
-  no filename, code or product name in it.
+  no filename, code or product name in it. An API body is not such a cause on its own: it repeats
+  one message per offending item and quotes each item's id, which is why a live run reported 51
+  failures as 17 problems. Pass it through `image_engine.stable_cause` first - it extracts
+  Skynamo's coded messages (`F002`, `P023`), de-duplicates them and blanks quoted values.
+- **`P023: File guid ... not found` is two different bugs.** Either the upload never stored the file
+  (`POST /files` answers 200 with a guid even so) or `PATCH /products` will not accept a guid that
+  does exist. Opposite fixes, so `_attach_failure_cause` spends **one** `GET /files/{guid}` per
+  failed product to say which, and folds the answer into the cause. It only ever runs after a
+  failure, so a healthy run costs nothing.
 - **`POST /files` requires `content_hash`, and the spec does not say so.**
   `FilePost` lists no required fields, so we sent only `filename` + `content` and a live
   instance rejected **every** upload with

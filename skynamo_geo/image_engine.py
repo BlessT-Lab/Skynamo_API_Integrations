@@ -19,6 +19,7 @@ should_cancel(), the same contracts the GUI worker thread already drives.
 
 import base64
 import os
+import re
 import shutil
 
 from . import reports
@@ -232,7 +233,7 @@ def upload_images(client, plans, replace_existing=False, move_processed=False,
             else:
                 plan.status = STATUS_IMG_UPLOAD_FAILED
                 plan.notes = _append_note(plan.notes, error)
-                plan.error = f"upload rejected - {error}"
+                plan.error = f"upload rejected - {stable_cause(error)}"
             on_progress({
                 "phase": "upload", "index": done, "total": total,
                 "name": plan.filename, "status": plan.status,
@@ -250,6 +251,8 @@ def upload_images(client, plans, replace_existing=False, move_processed=False,
             dropped = []
         ok, error = client.attach_files(product_code(product), desired,
                                         product_id=product.get("id"))
+        # Probed once per product, not once per image.
+        attach_cause = None
         for plan in uploaded:
             if ok:
                 plan.status = STATUS_IMG_UPLOADED
@@ -258,10 +261,13 @@ def upload_images(client, plans, replace_existing=False, move_processed=False,
                         plan.notes,
                         f"replaced {len(dropped)} existing image(s)")
             else:
+                if attach_cause is None:
+                    attach_cause = _attach_failure_cause(client, error,
+                                                         new_guids)
                 plan.status = STATUS_IMG_UPLOAD_FAILED
                 plan.notes = _append_note(plan.notes,
                                           f"uploaded but not attached: {error}")
-                plan.error = f"uploaded but not attached - {error}"
+                plan.error = attach_cause
 
     if move_processed and not (cancelled or should_cancel()):
         file_processed_images(plans, on_progress=on_progress)
@@ -281,6 +287,56 @@ def _upload_one(client, plan):
 
 def _append_note(notes, extra):
     return (notes + "; " if notes else "") + extra
+
+
+# Anything the API quoted back at us - a file guid, a code - is per-item, so it
+# must not reach a grouping key.
+_QUOTED = re.compile(r"'[^']*'")
+# Skynamo prefixes each validation message with a code: "F002: ...", "P023: ...".
+_API_CODE = re.compile(r'([A-Z]\d{3}:[^"\\\]]*)')
+
+
+def stable_cause(text, limit=200):
+    """An API error with the per-item values stripped out, so it groups.
+
+    A body repeats one message per offending item and quotes each item's id, so
+    grouping on it verbatim gives every product its own "cause" - a live run
+    reported 51 failures as 17 different problems. The coded messages are
+    extracted, de-duplicated and unquoted; failing that, quoted values are
+    blanked and the text truncated.
+    """
+    text = text or ""
+    codes = _API_CODE.findall(text)
+    if codes:
+        unique = sorted({_QUOTED.sub("'..'", c).strip().rstrip(".").strip()
+                         for c in codes})
+        return "; ".join(unique)[:limit]
+    return _QUOTED.sub("'..'", text)[:limit]
+
+
+def _attach_failure_cause(client, error, guids):
+    """Why an attach failed, as a cause that groups, having checked the file.
+
+    "File guid not found" means either that the upload did not really store the
+    file or that the patch will not take a guid that does exist. These need
+    opposite fixes, so one GET settles it - only ever after a failure, so a
+    healthy run costs nothing.
+    """
+    cause = f"uploaded but not attached - {stable_cause(error)}"
+    if not guids:
+        return cause
+    try:
+        file_obj, get_error = client.get_file(guids[0])
+    except Exception:       # a probe must never turn a failure into a crash
+        return cause
+    if file_obj is None:
+        # The status is generic, so it can live in the grouped cause - and 404
+        # (never stored) means something quite different from 403 or 500.
+        return (cause + f" [and the uploaded file cannot be read back either"
+                        f" ({stable_cause(get_error, limit=60)}), so the"
+                        f" upload did not store it]")
+    return (cause + " [but the uploaded file does exist, so the patch is "
+                    "rejecting a valid file guid]")
 
 
 # ---------------------------------------------------------------------------

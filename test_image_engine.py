@@ -30,6 +30,7 @@ class FakeClient:
         self.uploaded = []   # (filename, content_b64)
         self.attached = []   # (code, [guids])
         self.attach_keys = []  # (code, product_id) per attach call
+        self.get_file_calls = []
         self._n = 0
         self.upload_ok = upload_ok
         self.attach_ok = attach_ok
@@ -56,10 +57,17 @@ class FakeClient:
         return True, ""
 
     def get_file(self, guid):
+        self.get_file_calls.append(guid)
         name = self.files_by_guid.get(guid)
         if name is None:
             return None, "file not found"
         return {"id": guid, "filename": name}, ""
+
+
+def _product_key_of(plan):
+    """The product a plan attached to, for counting probes per product."""
+    pid = (plan.product or {}).get("id")
+    return pid if pid is not None else (plan.product or {}).get("code")
 
 
 PRODUCTS = [
@@ -337,6 +345,77 @@ try:
     assert all(e["total"] == 4 for e in events)
 finally:
     shutil.rmtree(f6, ignore_errors=True)
+
+# --- an API error groups by cause, not by the ids it quotes ---
+# The real body from a live run: one message per offending guid, each quoting
+# the guid. Grouping on it verbatim reported 51 failures as 17 problems.
+REAL_P023 = ('{"message":"Some errors occurred","errors":[{"index":0,"detail":'
+             '["P023: File guid \'0102553e-f36b-1410-8567-009b0ab1b62b\' not '
+             'found.","P023: File guid \'0802553e-f36b-1410-8567-009b0ab1b62b\''
+             ' not found.","P023: File guid \'0f02553e-f36b-1410-8567-'
+             '009b0ab1b62b\' not found."]}]}')
+ONE_P023 = ('{"errors":[{"index":0,"detail":["P023: File guid '
+            '\'aa02553e-f36b-1410-8567-009b0ab1b62b\' not found."]}]}')
+
+three = image_engine.stable_cause(REAL_P023)
+one = image_engine.stable_cause(ONE_P023)
+assert three == one, (three, one)          # scale must not create new causes
+assert "P023" in three and "not found" in three
+for guid_part in ("0102553e", "0802553e", "0f02553e", "aa02553e"):
+    assert guid_part not in three, three
+assert image_engine.stable_cause(
+    '{"errors":["F002: Content hash is required."]}') == \
+    "F002: Content hash is required"
+# no coded message: quoted values still go, and the text is capped
+assert image_engine.stable_cause("timeout for 'ABC.png'") == "timeout for '..'"
+assert len(image_engine.stable_cause("x" * 500)) == 200
+assert image_engine.stable_cause(None) == ""
+
+# --- an attach failure says whether the uploaded file actually exists ---
+# "File guid not found" means either the upload did not store the file or the
+# patch rejects a guid that does exist. These need opposite fixes.
+f_p = make_folder()
+try:
+    # (a) the file cannot be read back -> the upload did not store it
+    lost = FakeClient(attach_ok=False)          # nothing in files_by_guid
+    plans_a = image_engine.scan_images(PRODUCTS, f_p)
+    image_engine.upload_images(lost, plans_a)
+    failed_a = [p for p in plans_a if p.status == STATUS_IMG_UPLOAD_FAILED]
+    assert failed_a
+    assert all("cannot be read back" in p.error for p in failed_a), \
+        failed_a[0].error
+    # every product's failure collapses to one cause
+    causes = {p.error for p in failed_a}
+    assert len(causes) == 1, causes
+    # probed once per product, not once per image
+    assert len(lost.get_file_calls) == len({_product_key_of(p) for p in failed_a})
+
+    # (b) the file does exist -> the patch is rejecting a valid guid
+    present = FakeClient(attach_ok=False,
+                         files_by_guid={f"guid-{n}": f"f{n}.png"
+                                        for n in range(1, 12)})
+    plans_b = image_engine.scan_images(PRODUCTS, f_p)
+    image_engine.upload_images(present, plans_b)
+    failed_b = [p for p in plans_b if p.status == STATUS_IMG_UPLOAD_FAILED]
+    assert failed_b
+    assert all("does exist" in p.error for p in failed_b), failed_b[0].error
+    assert len({p.error for p in failed_b}) == 1
+
+    # the specifics stay in notes, where they belong
+    assert "attach boom" in failed_b[0].notes
+
+    # a probe that raises must not turn a failure into a crash
+    class Exploding(FakeClient):
+        def get_file(self, guid):
+            raise RuntimeError("boom")
+
+    plans_c = image_engine.scan_images(PRODUCTS, f_p)
+    image_engine.upload_images(Exploding(attach_ok=False), plans_c)
+    failed_c = [p for p in plans_c if p.status == STATUS_IMG_UPLOAD_FAILED]
+    assert failed_c and all("uploaded but not attached" in p.error
+                            for p in failed_c)
+finally:
+    shutil.rmtree(f_p, ignore_errors=True)
 
 # --- failure reasons are grouped, so a bulk failure reads as one line ---
 f_r = make_folder()

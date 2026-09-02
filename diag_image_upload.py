@@ -13,12 +13,15 @@ It runs in three phases and stops before doing anything you have not agreed to:
   2. INSTANCE (read-only). Fetches products, checks the ones your filenames
      match, and confirms they carry the `id` the patch keys on.
   3. WRITE PROBE (asks first, and is skipped unless you say yes). Uploads ONE
-     tiny generated 1x1 PNG, trying each plausible content_hash form until one
-     is accepted - the spec says only "(base64string)" and never names the
-     algorithm - then tries the attach several ways, printing every status and
-     body. This is the only part that changes your instance: it creates one
-     small file and attaches it to one product. Both are undoable from the
-     Manage Images tab, and the script tells you exactly what to undo.
+     tiny generated 1x1 PNG, trying each plausible content_hash form - the spec
+     says only "(base64string)" and never names the algorithm - and reads each
+     resulting file back with GET /files/{guid}. A form is only believed when
+     the file can be read back: an upload can return 200 and a GUID while the
+     file was never stored, which then shows up as "P023: File guid not found"
+     on the attach. It then tries the attach several ways, printing every
+     status and body. This is the only part that changes your instance: it
+     creates one small file and attaches it to one product. Both are undoable
+     from the Manage Images tab, and the script tells you exactly what to undo.
 
 The API key is redacted from all output, so this is safe to paste.
 
@@ -41,7 +44,7 @@ import requests
 
 from skynamo_geo.client import SkynamoClient, content_hash_b64
 from skynamo_geo.config import (
-    ALLOWED_IMAGE_EXTENSIONS, API_BASE, REQUEST_TIMEOUT,
+    ALLOWED_IMAGE_EXTENSIONS, API_BASE, FILE_HASH_ALGORITHM, REQUEST_TIMEOUT,
 )
 from skynamo_geo.products import (
     build_code_index, collect_image_files, has_allowed_extension,
@@ -239,23 +242,28 @@ def phase_write(client, product):
     def b64(digest):
         return base64.b64encode(digest).decode("ascii")
 
+    md5 = hashlib.md5(TINY_PNG)
     hash_forms = [
-        ("omitted (reproduces F002)", None),
-        (f"base64 {content_hash_b64.__defaults__[0]} - what the tool sends",
+        (f"base64 {FILE_HASH_ALGORITHM} of the bytes - what the tool sends",
          content_hash_b64(TINY_PNG)),
-        ("md5 hex", hashlib.md5(TINY_PNG).hexdigest()),
+        ("md5 hex, lowercase", md5.hexdigest()),
+        ("md5 hex, uppercase", md5.hexdigest().upper()),
+        ("base64 of the md5 hex TEXT", b64(md5.hexdigest().encode("ascii"))),
+        ("sha1 base64", b64(hashlib.sha1(TINY_PNG).digest())),
+        ("sha1 hex", hashlib.sha1(TINY_PNG).hexdigest()),
         ("sha256 base64", b64(hashlib.sha256(TINY_PNG).digest())),
         ("sha256 hex", hashlib.sha256(TINY_PNG).hexdigest()),
-        ("sha1 base64", b64(hashlib.sha1(TINY_PNG).digest())),
-        ("base64 md5 of the base64 content, not the bytes",
+        ("sha512 base64", b64(hashlib.sha512(TINY_PNG).digest())),
+        ("base64 md5 of the base64 text, not the bytes",
          b64(hashlib.md5(content.encode("ascii")).digest())),
     ]
+    print(f"    {len(hash_forms)} forms to try; stopping at the first whose")
+    print(f"    file can be read back afterwards.")
     guid = None
     accepted = None
     for label, value in hash_forms:
-        body = {"filename": "skynamo-diag-1x1.png", "content": content}
-        if value is not None:
-            body["content_hash"] = value
+        body = {"filename": "skynamo-diag-1x1.png", "content": content,
+                "content_hash": value}
         try:
             resp = client.session.post(f"{API_BASE}/files", json=body,
                                        timeout=REQUEST_TIMEOUT)
@@ -265,23 +273,50 @@ def phase_write(client, product):
         show(f"content_hash: {label}", resp)
         if not resp.ok:
             continue
+        candidate = None
         try:
             data = resp.json().get("data") or []
-            guid = data[0].get("id") if data else None
         except ValueError:
-            guid = None
-        accepted = label
-        # Stop at the first accepted form: each success creates a real file on
-        # the instance, and there is no DELETE for files.
+            data = []
+        if data and isinstance(data[0], dict):
+            # Print every field, in case the identifier products want is not
+            # the one we read (`id`), which is what P023 would mean.
+            print(f"      fields returned: {sorted(data[0].keys())}")
+            for key, val in data[0].items():
+                if key != "content":
+                    print(f"        {key} = {val!r}")
+            candidate = data[0].get("id")
+        if candidate is None:
+            print("      no id in the response - nothing to attach")
+            continue
+
+        # An accepted upload is not a stored file. Read it back before
+        # believing it; "not found" here is the same failure the attach hits.
+        # Raw GET, so the status and body are visible in full - "cannot be read
+        # back" is only evidence if the read itself is sound.
+        try:
+            got = client.session.get(f"{API_BASE}/files/{candidate}",
+                                     timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            print(f"      GET /files/{candidate} failed: {exc}")
+            continue
+        show(f"GET /files/{candidate}", got)
+        if not got.ok:
+            print(f"      !! ACCEPTED but the file is not readable back, so it"
+                  f" was not stored under this guid.")
+            continue
+        guid, accepted = candidate, label
+        # Stop at the first form that really stores a file: each success
+        # creates a real file and there is no DELETE for files.
         break
 
     if guid is None:
-        print("\n  No form of content_hash was accepted, so the upload itself")
-        print("  is the failure and nothing was attached. The bodies above are")
-        print("  the answer - the F002 line names the field it wants.")
+        print("\n  No form of content_hash produced a file that can be read")
+        print("  back, so the upload - not the attach - is still the problem.")
+        print("  The bodies above say what each attempt was told.")
         return
-    print(f"\n  ACCEPTED content_hash form: {accepted}")
-    print(f"    -> file id {guid!r} (type {type(guid).__name__})")
+    print(f"\n  WORKING content_hash form: {accepted}")
+    print(f"    -> file guid {guid!r} (type {type(guid).__name__})")
 
     print("\n  [b] PATCH /products - the same request the tool makes")
     variants = [

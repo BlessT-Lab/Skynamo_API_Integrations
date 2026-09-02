@@ -635,6 +635,29 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.10.4** (2026-09-01) — **Uploads work; the attach now explains itself.**
+  With `content_hash` sent, images reach Skynamo and `PATCH /products` answers
+  `P023: File guid '...' not found` — the API issuing a GUID and then refusing
+  it. That has two opposite causes (the file was never really stored, or the
+  patch rejects a valid GUID), so a failed attach now spends one
+  `GET /files/{guid}` per product to say which, in the reported reason.
+  - **Grouping actually groups now.** A run of 51 failures reported "Commonest
+    (3)" because the cause included the API's body, which quotes each
+    offending GUID — so every product looked like a different problem. Coded
+    messages are extracted and de-duplicated, and quoted values blanked, so one
+    underlying problem is one line at any scale.
+  - The read-back's own status is reported too (404 means never stored; 403 or
+    500 mean something else entirely), and `diag_image_upload.py` now probes
+    ten `content_hash` forms, reading each resulting file back with a raw GET
+    so the full status and body are visible.
+
+  > **Where this got to:** with this build a live run reports that the uploaded
+  > file *cannot be read back*, i.e. `POST /files` accepts the request, returns
+  > a GUID, and stores nothing — the signature of a `content_hash` that passes
+  > the presence check but is wrong for the bytes. The algorithm is not in the
+  > spec, so it needs either the diagnostic's probe or an answer from whoever
+  > owns the API.
+
 - **v2.10.3** (2026-09-01) — **Fix: every image upload rejected with "F002:
   Content hash is required."** `POST /files` needs a `content_hash` alongside
   `filename` and `content`. The API spec lists no required fields for a file
