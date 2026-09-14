@@ -23,7 +23,9 @@ from tkinter import ttk, filedialog
 
 import customtkinter as ctk
 
-from skynamo_geo import engine, image_engine, report_engine, settings
+from skynamo_geo import (
+    __version__, engine, image_engine, report_engine, settings,
+)
 from skynamo_geo.client import SkynamoClient
 from skynamo_geo.dashboard import build_dashboard
 from skynamo_geo.report_store import ReportStore, default_store_path
@@ -51,18 +53,31 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 # ----- Palette (base background is rgb(26,26,26)) -----
-BG = "#1a1a1a"            # window background
-CARD = "#232323"          # panel/card surfaces
-FIELD = "#2b2b2b"         # entry/input surfaces
-BORDER = "#3a3a3a"
-ACCENT = "#4f8cff"
-ACCENT_HOVER = "#3b74e0"
-GREEN = "#2ea36b"
-GREEN_HOVER = "#238053"
-RED = "#d64545"
-RED_HOVER = "#aa3535"
-TEXT = "#e8e8e8"
-TEXT_MUTED = "#9a9a9a"
+BG = "#131721"            # window background
+SIDEBAR = "#1a1f2b"       # navigation rail
+CARD = "#1a1f2b"          # panel/card surfaces
+FIELD = "#212736"         # entry/input surfaces
+BORDER = "#2a3142"
+ACCENT = "#6c8cff"
+ACCENT_HOVER = "#5878e8"
+GREEN = "#3fb37f"
+GREEN_HOVER = "#349a6c"
+RED = "#e06c6c"
+RED_HOVER = "#c65a5a"
+TEXT = "#e8eaf0"
+TEXT_MUTED = "#8b93a7"
+TABLE_BG = "#171b25"      # treeview surface
+TABLE_HEAD = "#212736"
+FONT_FAMILY = "Segoe UI"
+
+# Treeview row states. Mixed against TABLE_BG, not against pure black - a tint
+# tuned for one ground looks muddy on another.
+ROW_WARN_BG = "#332c17"   # low confidence / needs a human look
+ROW_WARN_FG = "#e8bd6b"
+ROW_FAIL_BG = "#33202a"   # failed
+ROW_FAIL_FG = "#f09a9a"
+ROW_MUTED_FG = TEXT_MUTED  # skipped - not a problem, just not acted on
+ROW_OK_FG = "#7fc7a5"      # done / removed
 
 CHECK_ON = "☑"   # ballot box with check
 CHECK_OFF = "☐"  # empty ballot box
@@ -78,6 +93,157 @@ PERIOD_LABELS = [f"{group} - {period}"
 PERIOD_BY_LABEL = {f"{group} - {period}": period
                    for group, periods in PERIOD_GROUPS for period in periods}
 PERIOD_LABEL_BY_KEY = {v: k for k, v in PERIOD_BY_LABEL.items()}
+
+
+class SidebarNav(ctk.CTkFrame):
+    """A left navigation rail plus a content area.
+
+    Exposes the slice of CTkTabview's API this app uses - add(), tab(), set(),
+    get() - so swapping the tab strip for a rail is a change in _build_ui and
+    nowhere else.
+    """
+
+    def __init__(self, master, title="Skynamo", subtitle="Toolkit",
+                 footer="", width=206):
+        super().__init__(master, fg_color="transparent")
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        rail = ctk.CTkFrame(self, fg_color=SIDEBAR, corner_radius=0,
+                            width=width)
+        rail.grid(row=0, column=0, sticky="nsw")
+        rail.grid_propagate(False)
+        ctk.CTkLabel(rail, text=title, text_color=TEXT, anchor="w",
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=17,
+                                      weight="bold")).pack(
+            anchor="w", padx=20, pady=(22, 0))
+        ctk.CTkLabel(rail, text=subtitle, text_color=TEXT_MUTED, anchor="w",
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=12)).pack(
+            anchor="w", padx=20, pady=(0, 16))
+        if footer:
+            ctk.CTkLabel(rail, text=footer, text_color=TEXT_MUTED, anchor="w",
+                         font=ctk.CTkFont(family=FONT_FAMILY, size=11)).pack(
+                side="bottom", anchor="w", padx=20, pady=14)
+
+        self._rail = rail
+        self._body = ctk.CTkFrame(self, fg_color="transparent")
+        self._body.grid(row=0, column=1, sticky="nsew")
+        self._body.grid_columnconfigure(0, weight=1)
+        self._body.grid_rowconfigure(0, weight=1)
+        self._pages = {}
+        self._items = {}
+        self._current = None
+
+    def add(self, name):
+        """Create a page and its nav item; returns the page frame."""
+        page = ctk.CTkFrame(self._body, fg_color="transparent")
+        page.grid(row=0, column=0, sticky="nsew")
+        page.grid_remove()
+        self._pages[name] = page
+
+        item = ctk.CTkButton(
+            self._rail, text=name, anchor="w", height=38, corner_radius=8,
+            fg_color="transparent", hover_color=FIELD, text_color=TEXT_MUTED,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13),
+            command=lambda n=name: self.set(n))
+        item.pack(fill="x", padx=12, pady=2)
+        self._items[name] = item
+
+        if self._current is None:
+            self.set(name)
+        return page
+
+    def tab(self, name):
+        """The page frame for a name (CTkTabview compatibility)."""
+        return self._pages[name]
+
+    def get(self):
+        return self._current
+
+    def set(self, name):
+        if name not in self._pages or name == self._current:
+            return
+        if self._current is not None:
+            self._pages[self._current].grid_remove()
+            self._items[self._current].configure(
+                fg_color="transparent", text_color=TEXT_MUTED,
+                font=ctk.CTkFont(family=FONT_FAMILY, size=13))
+        self._pages[name].grid()
+        self._items[name].configure(
+            fg_color=ACCENT, text_color="#ffffff",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"))
+        self._current = name
+
+
+class LogPanel(ctk.CTkFrame):
+    """A run log that stays collapsed until something needs reading.
+
+    The log box occupied ~140px on every tab while nearly always empty. It is
+    now behind a toggle - but a failure opens it by itself, because the reason
+    an operation failed lives here and a reason nobody sees is no reason at
+    all.
+
+    insert() and see() are delegated so existing callers need no changes.
+    """
+
+    def __init__(self, parent, label="Log"):
+        super().__init__(parent, fg_color="transparent")
+        self.grid_columnconfigure(0, weight=1)
+        self._label = label
+        self._open = False
+        self._lines = 0
+
+        self._toggle = ctk.CTkButton(
+            self, text=self._toggle_text(), command=self.toggle,
+            height=26, width=110, corner_radius=6, anchor="w",
+            fg_color="transparent", hover_color=FIELD, text_color=TEXT_MUTED,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11))
+        self._toggle.grid(row=0, column=0, sticky="w")
+
+        self._text = ctk.CTkTextbox(
+            self, height=120, fg_color=TABLE_BG, text_color=TEXT_MUTED,
+            corner_radius=8, border_width=1, border_color=BORDER,
+            font=ctk.CTkFont(family="Consolas", size=12))
+        self._text.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._text.grid_remove()
+
+    def _toggle_text(self):
+        arrow = "\u25be" if self._open else "\u25b8"
+        count = f" ({self._lines})" if self._lines and not self._open else ""
+        return f"{arrow}  {self._label}{count}"
+
+    def toggle(self):
+        self.collapse() if self._open else self.expand()
+
+    def expand(self):
+        if not self._open:
+            self._open = True
+            self._text.grid()
+        self._toggle.configure(text=self._toggle_text())
+
+    def collapse(self):
+        if self._open:
+            self._open = False
+            self._text.grid_remove()
+        self._toggle.configure(text=self._toggle_text())
+
+    # -- what callers use --------------------------------------------------
+
+    def insert(self, index, text):
+        self._text.insert(index, text)
+        self._lines += text.count("\n")
+        if not self._open:
+            self._toggle.configure(text=self._toggle_text())
+
+    def see(self, index):
+        self._text.see(index)
+
+    def alert(self, text=None):
+        """Open the log because something failed."""
+        if text is not None:
+            self.insert("end", text + "\n")
+            self.see("end")
+        self.expand()
 
 
 class App(ctk.CTk):
@@ -149,14 +315,8 @@ class App(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
         self._style_treeview()
 
-        self.tabview = ctk.CTkTabview(
-            self, fg_color=BG, segmented_button_fg_color=CARD,
-            segmented_button_selected_color=ACCENT,
-            segmented_button_selected_hover_color=ACCENT_HOVER,
-            segmented_button_unselected_color=CARD,
-            segmented_button_unselected_hover_color=BORDER,
-            text_color=TEXT, corner_radius=10)
-        self.tabview.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        self.tabview = SidebarNav(self, footer=f"v{__version__}")
+        self.tabview.grid(row=0, column=0, sticky="nsew")
         self._build_geo_tab(self.tabview.add("Customer Geolocation"))
         self._build_image_tab(self.tabview.add("Product Images"))
         self._build_manage_tab(self.tabview.add("Manage Images"))
@@ -188,7 +348,7 @@ class App(ctk.CTk):
         # Connection panel
         conn = self._card(top)
         conn.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="nsew")
-        self._section_title(conn, "1", "Connection").grid(
+        self._section_title(conn, "Connection").grid(
             row=0, column=0, columnspan=2, padx=14, pady=(12, 6), sticky="w")
 
         self.instance_entry = self._labeled_entry(conn, "Instance name", 1)
@@ -217,7 +377,7 @@ class App(ctk.CTk):
         mapping.grid(row=0, column=1, padx=(8, 0), pady=0, sticky="nsew")
         mapping.grid_rowconfigure(1, weight=1)
         mapping.grid_columnconfigure(0, weight=1)
-        self._section_title(mapping, "2", "Map address field(s)").grid(
+        self._section_title(mapping, "Map address field(s)").grid(
             row=0, column=0, padx=14, pady=(12, 6), sticky="w")
 
         # Fixed-height container so the scrollable frame's large natural size
@@ -253,7 +413,7 @@ class App(ctk.CTk):
         actions.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
         self.preview_btn = self._button(
             actions, "Preview (geocode only)", self.on_preview,
-            state="disabled")
+            state="disabled", fg_color=FIELD, hover_color=BORDER)
         self.preview_btn.pack(side="left", padx=(12, 6), pady=10)
         self.write_btn = self._button(
             actions, "Write Selected to Skynamo", self.on_write,
@@ -298,11 +458,11 @@ class App(ctk.CTk):
             self.tree.heading(col, text=text)
             anchor = "center" if col in ("include", "lat", "lng") else "w"
             self.tree.column(col, width=width, anchor=anchor)
-        self.tree.tag_configure("low", background="#3a2f12",
-                                foreground="#f0c453")
-        self.tree.tag_configure("skip", foreground="#7a7a7a")
-        self.tree.tag_configure("fail", background="#3a1717",
-                                foreground="#f08c8c")
+        self.tree.tag_configure("low", background=ROW_WARN_BG,
+                                foreground=ROW_WARN_FG)
+        self.tree.tag_configure("skip", foreground=ROW_MUTED_FG)
+        self.tree.tag_configure("fail", background=ROW_FAIL_BG,
+                                foreground=ROW_FAIL_FG)
         self.tree.grid(row=0, column=0, padx=(10, 0), pady=10, sticky="nsew")
         yscroll = ttk.Scrollbar(table_frame, orient="vertical",
                                 command=self.tree.yview,
@@ -324,27 +484,23 @@ class App(ctk.CTk):
         self.status_label = ctk.CTkLabel(bottom, text="Ready.", anchor="w",
                                          text_color=TEXT)
         self.status_label.grid(row=1, column=0, padx=14, pady=2, sticky="ew")
-        self.log = ctk.CTkTextbox(
-            bottom, height=90, fg_color="#151515", text_color="#b8b8b8",
-            corner_radius=10, border_width=1, border_color=BORDER,
-            font=ctk.CTkFont(family="Consolas", size=12))
-        self.log.grid(row=2, column=0, padx=14, pady=(4, 14), sticky="ew")
+        self.log = LogPanel(bottom)
+        self.log.grid(row=2, column=0, padx=14, pady=(2, 12), sticky="ew")
 
     # -- Styled widget helpers --------------------------------------------
 
     def _card(self, parent):
-        return ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14,
-                            border_width=1, border_color="#2e2e2e")
+        return ctk.CTkFrame(parent, fg_color=CARD, corner_radius=12,
+                            border_width=1, border_color=BORDER)
 
-    def _section_title(self, parent, number, text):
+    def _section_title(self, parent, text):
+        """A quiet uppercase label. The old numbered circles implied a wizard
+        the app does not actually enforce."""
         frame = ctk.CTkFrame(parent, fg_color="transparent")
-        ctk.CTkLabel(frame, text=number, width=24, height=24,
-                     fg_color=ACCENT, corner_radius=12, text_color="#ffffff",
-                     font=ctk.CTkFont(size=12, weight="bold")).pack(
-            side="left")
-        ctk.CTkLabel(frame, text=text, text_color=TEXT,
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(
-            side="left", padx=(8, 0))
+        ctk.CTkLabel(frame, text=text.upper(), text_color=TEXT_MUTED,
+                     anchor="w",
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=11,
+                                      weight="bold")).pack(side="left")
         return frame
 
     def _entry(self, parent, show=None):
@@ -355,12 +511,29 @@ class App(ctk.CTk):
 
     def _button(self, parent, text, command, state="normal", width=None,
                 fg_color=ACCENT, hover_color=ACCENT_HOVER):
+        """A button whose weight follows the intent the caller already states.
+
+        Callers signal intent through fg_color - FIELD for a secondary, RED for
+        cancel, ACCENT/GREEN for the action of the screen - so the hierarchy is
+        derived here rather than at 32 call sites. Only the primary is filled;
+        a wall of equally loud buttons tells the user nothing about which one
+        they came here to press.
+        """
         kwargs = {"width": width} if width else {}
+        if fg_color == FIELD:                      # secondary
+            style = dict(fg_color="transparent", hover_color=FIELD,
+                         text_color=TEXT, border_width=1, border_color=BORDER)
+        elif fg_color == RED:                      # cancel / destructive
+            style = dict(fg_color="transparent", hover_color=FIELD,
+                         text_color=RED, border_width=1, border_color=BORDER)
+        else:                                      # primary
+            style = dict(fg_color=fg_color, hover_color=hover_color,
+                         text_color="#ffffff", border_width=0)
         return ctk.CTkButton(parent, text=text, command=command, state=state,
-                             height=34, corner_radius=8, fg_color=fg_color,
-                             hover_color=hover_color, text_color=TEXT,
-                             font=ctk.CTkFont(size=13, weight="bold"),
-                             **kwargs)
+                             height=34, corner_radius=8,
+                             font=ctk.CTkFont(family=FONT_FAMILY, size=13,
+                                              weight="bold"),
+                             **style, **kwargs)
 
     def _labeled_entry(self, parent, label, row, show=None):
         ctk.CTkLabel(parent, text=label, anchor="w", text_color=TEXT).grid(
@@ -373,23 +546,23 @@ class App(ctk.CTk):
     def _style_treeview(self):
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("Dark.Treeview", background="#202020",
-                        fieldbackground="#202020", foreground=TEXT,
-                        borderwidth=0, rowheight=26,
-                        font=("Segoe UI", 10))
+        style.configure("Dark.Treeview", background=TABLE_BG,
+                        fieldbackground=TABLE_BG, foreground=TEXT,
+                        borderwidth=0, rowheight=30,
+                        font=(FONT_FAMILY, 10))
         # Drop clam's light outer border - keep only the tree area.
         style.layout("Dark.Treeview",
                      [("Dark.Treeview.treearea", {"sticky": "nswe"})])
-        style.configure("Dark.Treeview.Heading", background=FIELD,
-                        foreground=TEXT, relief="flat", padding=(8, 6),
-                        borderwidth=0, font=("Segoe UI", 10, "bold"))
+        style.configure("Dark.Treeview.Heading", background=TABLE_HEAD,
+                        foreground=TEXT_MUTED, relief="flat", padding=(10, 8),
+                        borderwidth=0, font=(FONT_FAMILY, 9, "bold"))
         style.map("Dark.Treeview",
                   background=[("selected", ACCENT)],
                   foreground=[("selected", "#ffffff")])
         style.map("Dark.Treeview.Heading",
                   background=[("active", BORDER)])
         style.configure("Dark.Vertical.TScrollbar", background=FIELD,
-                        troughcolor="#202020", borderwidth=0,
+                        troughcolor=TABLE_BG, borderwidth=0,
                         arrowcolor=TEXT_MUTED)
         style.map("Dark.Vertical.TScrollbar",
                   background=[("active", BORDER)])
@@ -476,6 +649,7 @@ class App(ctk.CTk):
                     return
                 elif kind == "error":
                     self.log_line(f"ERROR: {payload}")
+                    self.log.expand()
                     self.set_status("Error - see log.")
                     self._set_busy(False)
                     return
@@ -811,7 +985,7 @@ class App(ctk.CTk):
 
         conn = self._card(top)
         conn.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="nsew")
-        self._section_title(conn, "1", "Connection").grid(
+        self._section_title(conn, "Connection").grid(
             row=0, column=0, columnspan=2, padx=14, pady=(12, 6), sticky="w")
         self.img_instance_entry = self._labeled_entry(conn, "Instance name", 1)
         self.img_skynamo_entry = self._labeled_entry(
@@ -824,7 +998,7 @@ class App(ctk.CTk):
         folder = self._card(top)
         folder.grid(row=0, column=1, padx=(8, 0), pady=0, sticky="nsew")
         folder.grid_columnconfigure(0, weight=1)
-        self._section_title(folder, "2", "Image folder").grid(
+        self._section_title(folder, "Image folder").grid(
             row=0, column=0, padx=14, pady=(12, 6), sticky="w")
         self.img_folder_label = ctk.CTkLabel(
             folder, text="No folder selected.", anchor="w",
@@ -866,7 +1040,7 @@ class App(ctk.CTk):
         actions.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
         self.img_preview_btn = self._button(
             actions, "Preview (match only)", self.on_img_preview,
-            state="disabled")
+            state="disabled", fg_color=FIELD, hover_color=BORDER)
         self.img_preview_btn.pack(side="left", padx=(12, 6), pady=10)
         self.img_upload_btn = self._button(
             actions, "Upload Selected to Skynamo", self.on_img_upload,
@@ -909,11 +1083,11 @@ class App(ctk.CTk):
             self.img_tree.heading(col, text=text)
             anchor = "center" if col in ("include", "seq", "existing") else "w"
             self.img_tree.column(col, width=width, anchor=anchor)
-        self.img_tree.tag_configure("low", background="#3a2f12",
-                                    foreground="#f0c453")
-        self.img_tree.tag_configure("skip", foreground="#7a7a7a")
-        self.img_tree.tag_configure("fail", background="#3a1717",
-                                    foreground="#f08c8c")
+        self.img_tree.tag_configure("low", background=ROW_WARN_BG,
+                                    foreground=ROW_WARN_FG)
+        self.img_tree.tag_configure("skip", foreground=ROW_MUTED_FG)
+        self.img_tree.tag_configure("fail", background=ROW_FAIL_BG,
+                                    foreground=ROW_FAIL_FG)
         self.img_tree.grid(row=0, column=0, padx=(10, 0), pady=10, sticky="nsew")
         yscroll = ttk.Scrollbar(table_frame, orient="vertical",
                                 command=self.img_tree.yview,
@@ -936,11 +1110,8 @@ class App(ctk.CTk):
                                              wraplength=980, justify="left",
                                              text_color=TEXT)
         self.img_status_label.grid(row=1, column=0, padx=14, pady=2, sticky="ew")
-        self.img_log = ctk.CTkTextbox(
-            bottom, height=90, fg_color="#151515", text_color="#b8b8b8",
-            corner_radius=10, border_width=1, border_color=BORDER,
-            font=ctk.CTkFont(family="Consolas", size=12))
-        self.img_log.grid(row=2, column=0, padx=14, pady=(4, 14), sticky="ew")
+        self.img_log = LogPanel(bottom)
+        self.img_log.grid(row=2, column=0, padx=14, pady=(2, 12), sticky="ew")
 
     # -- Image logging / status -------------------------------------------
 
@@ -985,6 +1156,7 @@ class App(ctk.CTk):
                     return
                 elif kind == "error":
                     self.img_log_line(f"ERROR: {payload}")
+                    self.img_log.expand()
                     self.img_set_status("Error - see log.")
                     self._img_set_busy(False)
                     return
@@ -1180,6 +1352,7 @@ class App(ctk.CTk):
         if not groups:
             return
         total = sum(count for _reason, count, _eg in groups)
+        self.img_log.expand()        # the reasons are the point of this panel
         self.img_log_line(f"{header}: {total} image(s) did not make it in.")
         for reason, count, example in groups:
             if count == 1:
@@ -1312,7 +1485,7 @@ class App(ctk.CTk):
         top = self._card(parent)
         top.grid(row=1, column=0, padx=16, pady=(6, 6), sticky="ew")
         top.grid_columnconfigure(1, weight=1)
-        self._section_title(top, "1", "Find product").grid(
+        self._section_title(top, "Find product").grid(
             row=0, column=0, columnspan=3, padx=14, pady=(12, 6), sticky="w")
         ctk.CTkLabel(top, text="Product code", anchor="w",
                      text_color=TEXT).grid(row=1, column=0, padx=(14, 6),
@@ -1373,10 +1546,10 @@ class App(ctk.CTk):
             self.mgmt_tree.heading(col, text=text)
             anchor = "center" if col == "remove" else "w"
             self.mgmt_tree.column(col, width=width, anchor=anchor)
-        self.mgmt_tree.tag_configure("skip", foreground="#7a7a7a")
-        self.mgmt_tree.tag_configure("fail", background="#3a1717",
-                                     foreground="#f08c8c")
-        self.mgmt_tree.tag_configure("gone", foreground="#6fae8f")
+        self.mgmt_tree.tag_configure("skip", foreground=ROW_MUTED_FG)
+        self.mgmt_tree.tag_configure("fail", background=ROW_FAIL_BG,
+                                     foreground=ROW_FAIL_FG)
+        self.mgmt_tree.tag_configure("gone", foreground=ROW_OK_FG)
         self.mgmt_tree.grid(row=0, column=0, padx=(10, 0), pady=10,
                             sticky="nsew")
         yscroll = ttk.Scrollbar(table_frame, orient="vertical",
@@ -1400,11 +1573,8 @@ class App(ctk.CTk):
                                               text_color=TEXT)
         self.mgmt_status_label.grid(row=1, column=0, padx=14, pady=2,
                                     sticky="ew")
-        self.mgmt_log = ctk.CTkTextbox(
-            bottom, height=90, fg_color="#151515", text_color="#b8b8b8",
-            corner_radius=10, border_width=1, border_color=BORDER,
-            font=ctk.CTkFont(family="Consolas", size=12))
-        self.mgmt_log.grid(row=2, column=0, padx=14, pady=(4, 14), sticky="ew")
+        self.mgmt_log = LogPanel(bottom)
+        self.mgmt_log.grid(row=2, column=0, padx=14, pady=(2, 12), sticky="ew")
 
     # -- Manage logging / status ------------------------------------------
 
@@ -1440,6 +1610,7 @@ class App(ctk.CTk):
                     return
                 elif kind == "error":
                     self.mgmt_log_line(f"ERROR: {payload}")
+                    self.mgmt_log.expand()
                     self.mgmt_set_status("Error - see log.")
                     self._mgmt_set_busy(False)
                     return
@@ -1672,7 +1843,7 @@ class App(ctk.CTk):
 
         conn = self._card(top)
         conn.grid(row=0, column=0, padx=(0, 8), pady=0, sticky="nsew")
-        self._section_title(conn, "1", "Reporting API credentials").grid(
+        self._section_title(conn, "Reporting API credentials").grid(
             row=0, column=0, columnspan=2, padx=14, pady=(12, 6), sticky="w")
         self.rpt_id_entry = self._labeled_entry(conn, "Client ID", 1, show="*")
         self.rpt_secret_entry = self._labeled_entry(
@@ -1692,7 +1863,7 @@ class App(ctk.CTk):
         opts = self._card(top)
         opts.grid(row=0, column=1, padx=(8, 0), pady=0, sticky="nsew")
         opts.grid_columnconfigure(0, weight=1)
-        self._section_title(opts, "2", "What to extract").grid(
+        self._section_title(opts, "What to extract").grid(
             row=0, column=0, padx=14, pady=(12, 6), sticky="w")
 
         period_row = ctk.CTkFrame(opts, fg_color="transparent")
@@ -1712,14 +1883,21 @@ class App(ctk.CTk):
 
         entities_row = ctk.CTkFrame(opts, fg_color="transparent")
         entities_row.grid(row=2, column=0, padx=14, pady=4, sticky="ew")
-        for entity in REPORTING_ENTITIES:
+        # Wrapped, not packed in one line: five entities already overflowed the
+        # card and clipped the last one, and the registry can declare more.
+        columns = 3
+        for col in range(columns):
+            entities_row.grid_columnconfigure(col, weight=1, uniform="ent")
+        for i, entity in enumerate(REPORTING_ENTITIES):
             var = ctk.BooleanVar(value=True)
             var.trace_add("write", lambda *_: self._rpt_update_hint())
             ctk.CTkCheckBox(entities_row, text=entity, variable=var,
                             checkbox_width=18, checkbox_height=18,
                             corner_radius=4, border_color=BORDER,
                             fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                            text_color=TEXT).pack(side="left", padx=(0, 10))
+                            text_color=TEXT).grid(
+                row=i // columns, column=i % columns, sticky="w",
+                padx=(0, 10), pady=3)
             self.rpt_entity_vars[entity] = var
 
         self.rpt_hint_label = ctk.CTkLabel(
@@ -1738,7 +1916,7 @@ class App(ctk.CTk):
         actions.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
         self.rpt_plan_btn = self._button(
             actions, "Plan Extract (no calls)", self.on_rpt_plan,
-            state="disabled")
+            state="disabled", fg_color=FIELD, hover_color=BORDER)
         self.rpt_plan_btn.pack(side="left", padx=(12, 6), pady=10)
         self.rpt_run_btn = self._button(
             actions, "Run Extract", self.on_rpt_run, state="disabled",
@@ -1779,11 +1957,11 @@ class App(ctk.CTk):
             self.rpt_tree.heading(col, text=text)
             anchor = "center" if col in ("include", "rows") else "w"
             self.rpt_tree.column(col, width=width, anchor=anchor)
-        self.rpt_tree.tag_configure("low", background="#3a2f12",
-                                    foreground="#f0c453")
-        self.rpt_tree.tag_configure("skip", foreground="#7a7a7a")
-        self.rpt_tree.tag_configure("fail", background="#3a1717",
-                                    foreground="#f08c8c")
+        self.rpt_tree.tag_configure("low", background=ROW_WARN_BG,
+                                    foreground=ROW_WARN_FG)
+        self.rpt_tree.tag_configure("skip", foreground=ROW_MUTED_FG)
+        self.rpt_tree.tag_configure("fail", background=ROW_FAIL_BG,
+                                    foreground=ROW_FAIL_FG)
         self.rpt_tree.grid(row=0, column=0, padx=(10, 0), pady=10,
                            sticky="nsew")
         yscroll = ttk.Scrollbar(table_frame, orient="vertical",
@@ -1807,11 +1985,8 @@ class App(ctk.CTk):
                                              text_color=TEXT)
         self.rpt_status_label.grid(row=1, column=0, padx=14, pady=2,
                                    sticky="ew")
-        self.rpt_log = ctk.CTkTextbox(
-            bottom, height=90, fg_color="#151515", text_color="#b8b8b8",
-            corner_radius=10, border_width=1, border_color=BORDER,
-            font=ctk.CTkFont(family="Consolas", size=12))
-        self.rpt_log.grid(row=2, column=0, padx=14, pady=(4, 14), sticky="ew")
+        self.rpt_log = LogPanel(bottom)
+        self.rpt_log.grid(row=2, column=0, padx=14, pady=(2, 12), sticky="ew")
 
         self._rpt_update_hint()
         self._rpt_refresh_store_label()
@@ -1909,6 +2084,7 @@ class App(ctk.CTk):
                     return
                 elif kind == "error":
                     self.rpt_log_line(f"ERROR: {payload}")
+                    self.rpt_log.expand()
                     self.rpt_set_status("Error - see log.")
                     self._rpt_set_busy(False)
                     return
@@ -2167,7 +2343,7 @@ class App(ctk.CTk):
         card = self._card(parent)
         card.grid(row=1, column=0, padx=16, pady=(6, 6), sticky="ew")
         card.grid_columnconfigure(1, weight=1)
-        self._section_title(card, "1", "Dashboard options").grid(
+        self._section_title(card, "Dashboard options").grid(
             row=0, column=0, columnspan=2, padx=14, pady=(12, 6), sticky="w")
         self.dash_title_entry = self._labeled_entry(card, "Title", 1)
         self.dash_title_entry.insert(0, "Skynamo Dashboard")
@@ -2201,7 +2377,7 @@ class App(ctk.CTk):
                      text_color=TEXT).grid(row=0, column=0, padx=14,
                                            pady=(12, 4), sticky="w")
         self.dash_info = ctk.CTkTextbox(
-            info, fg_color="#151515", text_color="#b8b8b8", corner_radius=10,
+            info, fg_color=TABLE_BG, text_color=TEXT_MUTED, corner_radius=10,
             border_width=1, border_color=BORDER,
             font=ctk.CTkFont(family="Consolas", size=12))
         self.dash_info.grid(row=1, column=0, padx=14, pady=(0, 6), sticky="nsew")

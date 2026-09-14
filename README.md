@@ -635,6 +635,21 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.11.0** (2026-09-14) — **Redesigned interface.** Left navigation rail in
+  place of the tab strip, a slate palette, and a clearer hierarchy throughout.
+  - **The log is collapsed by default** behind a `▸ Log` toggle that shows a
+    line count while shut — about 140px back on every tab, which took the
+    Product Images table from 6 visible rows to around 11. It **opens itself**
+    when anything fails, so failure reasons stay in front of you.
+  - **One filled button per screen.** Preview/Plan are outlined (they are the
+    first step, not the point of the screen), Cancel is outlined with red text
+    so a disabled button is no longer the loudest thing on display.
+  - Numbered step circles replaced with quiet section labels — they implied a
+    wizard the app does not enforce.
+  - Reporting's entity checkboxes wrap instead of running off the card and
+    clipping the last one.
+  - Taller table rows and a quieter table header.
+
 - **v2.10.5** (2026-09-01) — **Fix: link uploaded images to their product with
   a `transaction_id`.** Images uploaded fine and then could not be attached
   (`P023: File guid ... not found`), and the file could not be read back by its

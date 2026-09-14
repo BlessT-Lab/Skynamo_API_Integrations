@@ -147,8 +147,12 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
   external requests. Everything from the instance goes through `html.escape`.
 
 ### GUI threading model (gui.py)
-The GUI is a `CTkTabview` with five tabs, one `_build_*_tab` method each: **Customer Geolocation**,
-**Product Images**, **Manage Images**, **Reporting**, **Dashboards**. Tkinter is not thread-safe.
+The GUI is a **`SidebarNav`** (a left navigation rail plus a content area) with five pages, one
+`_build_*_tab` method each: **Customer Geolocation**, **Product Images**, **Manage Images**,
+**Reporting**, **Dashboards**. `SidebarNav` deliberately exposes the slice of `CTkTabview`'s API the
+app used — `add()`, `tab()`, `set()`, `get()` — so swapping the navigation was a change in
+`_build_ui` and nowhere else; `self.tabview` is still the attribute name, and `test_gui_smoke`
+needed no change. Tkinter is not thread-safe.
 Each tab runs its engine on its own `threading.Thread`, pushes events onto its own `queue.Queue`,
 and the main thread drains it via `self.after(100, ...)` — the **only** place widgets are touched.
 Cancel is a per-tab `threading.Event` passed in as `should_cancel`. Tabs keep fully separate
@@ -163,6 +167,15 @@ state/queues/workers, distinguished by attribute prefix:
 | Dashboards | `dash_*` / `_dash_*` | reads the store (no client, no thread needed) |
 
 Any new long-running work must follow this pattern — never update a widget from a worker thread.
+
+**The log is a `LogPanel`, collapsed by default.** It delegates `insert()`/`see()` to an inner
+textbox, so the ~25 `X_log_line` callers were untouched, and it adds `expand()`/`alert()`. It stays
+shut until it matters: every tab's `error` branch and the image tab's grouped failure summary open
+it, because the reason an operation failed lives there and a reason nobody sees is no reason at all.
+Any new failure path must open it too. **Button weight is derived, not specified**: `_button` reads
+the `fg_color` the caller already passes (`FIELD` → outlined secondary, `RED` → outlined with red
+text, anything else → filled primary), so hierarchy lives in one place instead of 32 call sites. A
+screen should have exactly one filled button.
 Note the Dashboards tab and the Reporting tab's store label deliberately **do not create** the
 SQLite file just to render; they check `os.path.exists` first, so a user who never opens Reporting
 never gets a stray database.
