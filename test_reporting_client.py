@@ -116,9 +116,22 @@ assert set(f4["entities"]) == {"visits"}
 f5 = build_filter(REPORTING_ENTITIES["products"])
 assert "entities" not in f5
 
-# An entity with no sortable field documented gets no order (so no paging)
+# An entity with no sortable field documented gets no order AND no paging.
+# This assertion used to require limit to be sent anyway, which is precisely
+# what a live instance rejected: the server builds OFFSET/FETCH NEXT SQL that
+# needs an ORDER BY and answered
+#   HTTP 424 {"message":"Incorrect syntax near 'OFFSET'. Invalid usage of the
+#             option NEXT in the FETCH statement."}
+# so /v2/invoices could never be extracted at all. Unpaged is also the right
+# shape against these rate limits - one big call beats many small ones.
 f6 = build_filter(REPORTING_ENTITIES["invoices"], limit=10)
-assert "order" not in f6 and f6["limit"] == 10
+assert "order" not in f6, f6
+assert "limit" not in f6 and "skip" not in f6, f6
+
+# An entity that does declare one still pages normally.
+f6b = build_filter(REPORTING_ENTITIES["products"], limit=10, skip=20)
+assert f6b["order"] == {"code": "ASC"}
+assert f6b["limit"] == 10 and f6b["skip"] == 20
 
 # --- _rows_from: tolerate the undocumented envelope shapes ---
 assert _rows_from([{"a": 1}]) == [{"a": 1}]

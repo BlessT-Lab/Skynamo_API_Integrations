@@ -640,6 +640,29 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.12.0** (2026-09-14) — **Reporting registry corrected against a live
+  instance.** It had been written from a spec that declares the wrong response
+  schema for two endpoints and leaves seven undocumented, so its columns were
+  educated guesses until now.
+  - **The keys are fine.** All six sub-entity primary keys that were guesses
+    are present in the payload — that was the failure that silently discards
+    every row of a table, and it is not happening. Four sub-entities had no
+    rows in the sample and remain unverified.
+  - **`/v2/invoices` could never be extracted.** It declares no sortable
+    field, we sent a `limit` anyway, and the server answered HTTP 424 with a
+    SQL syntax error — `OFFSET`/`FETCH NEXT` needs an `ORDER BY`. Paging is
+    now omitted when there is nothing to sort by.
+  - **A dozen declared columns are never sent** (and were always null):
+    `comment` on activities, `latitude`/`longitude` on customers,
+    `last_sync_time` on users, `description` on products, `product_code` and
+    `product_name` on surveys, and six on document totals.
+  - **Fields we were discarding are now captured** — every document and
+    sub-entity row repeats its `customer_id`, `user_id` and `date`, so they
+    can be joined without going back through activities.
+  - **Quote→order conversion is withheld, not guessed.** An order does not
+    carry the quote it came from, so the dashboard says the figure is
+    unavailable instead of showing `0%`.
+
 - **v2.11.1** (2026-09-14) — **Fixes to the redesign**, found by reviewing it.
   - **Disabled buttons were unreadable.** Nothing set `text_color_disabled`,
     and CustomTkinter keeps a button's fill when it is disabled, so the default

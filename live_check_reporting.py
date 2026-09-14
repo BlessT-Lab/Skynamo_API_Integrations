@@ -17,8 +17,9 @@ the offline tests cannot, because they depend on the live payloads:
 The Reporting API is read-only - all 11 endpoints are GET - so nothing here can
 change your instance. Nothing is written to the local store either.
 
-Credentials are read from the environment if set, else prompted (not echoed),
-and are never written to disk.
+Neither credential is echoed or printed - only a length-plus-digest
+fingerprint, so the output stays shareable - and neither is written to disk.
+They are read from the environment if set, else prompted.
 
     SKYNAMO_CLIENT_ID, SKYNAMO_CLIENT_SECRET
 
@@ -26,6 +27,7 @@ Usage:  py live_check_reporting.py
 """
 
 import getpass
+import hashlib
 import json
 import os
 import sys
@@ -47,7 +49,7 @@ def _credentials():
         print("Client ID:     (from SKYNAMO_CLIENT_ID)")
     else:
         try:
-            client_id = input("Client ID: ").strip()
+            client_id = getpass.getpass("Client ID (not echoed): ").strip()
         except EOFError:
             sys.exit("No input available. Set SKYNAMO_CLIENT_ID / "
                      "SKYNAMO_CLIENT_SECRET, or run this in a terminal.")
@@ -61,7 +63,17 @@ def _credentials():
             sys.exit("No input available for the Client Secret.")
     if not (client_id and client_secret):
         sys.exit("Both a Client ID and a Client Secret are required.")
+    # Enough to tell two credentials apart in a pasted log, without putting
+    # either in it. The Client ID identifies the integration, so it is withheld
+    # for the same reason diag_reporting_auth.py withholds the JWT sub/azp.
+    print(f"    credential: {_fingerprint(client_id)}")
     return client_id, client_secret
+
+
+def _fingerprint(value):
+    """Length plus a short digest - identifies a value without revealing it."""
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return f"length {len(value)}, sha256:{digest}"
 
 
 def _describe(rows, spec):
@@ -83,8 +95,9 @@ def _describe(rows, spec):
     missing = sorted(declared - actual)
     if missing:
         print(f"      registry columns NOT in payload: {', '.join(missing)}")
+    by_norm = {normalise_key(k): v for k, v in sample.items()}
     extra = sorted(k for k in actual - declared
-                   if not isinstance(sample.get(k), (list, dict)))
+                   if not isinstance(by_norm.get(k), (list, dict)))
     if extra:
         print(f"      payload fields NOT in registry:  {', '.join(extra)}")
     if not missing and not extra:
@@ -135,9 +148,11 @@ def _describe_sub(rows, api_name, sub):
     missing = sorted(declared - actual - {pk})
     if missing:
         print(f"        registry columns NOT in payload: {', '.join(missing)}")
+    nested_by_norm = [{normalise_key(k): v for k, v in c.items()}
+                      for c in nested]
     extra = sorted(k for k in actual - declared
                    if not any(isinstance(c.get(k), (list, dict))
-                              for c in nested))
+                              for c in nested_by_norm))
     if extra:
         print(f"        payload fields NOT in registry:  {', '.join(extra)}")
 

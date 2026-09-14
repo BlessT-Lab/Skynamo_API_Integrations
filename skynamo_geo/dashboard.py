@@ -15,7 +15,9 @@ import html
 import os
 from datetime import datetime
 
-from .reporting_config import DOCUMENT_TABLES
+from .reporting_config import (
+    DOCUMENT_TABLES, DOCUMENT_TOTALS_HAVE_QUOTE_ID,
+)
 
 # Palette chosen to stay legible printed and in both light and dark viewers.
 _INK = "#1f2933"
@@ -204,7 +206,8 @@ def _panel(title, body, note=""):
 # Panel data (one aggregate each)
 # ---------------------------------------------------------------------------
 # Customer attribution goes through activities rather than trusting the
-# denormalised customer_name on order_totals, which can come back empty.
+# customer_id on order_totals joined to customers, since a live instance
+# sends no denormalised name on the document row.
 
 _LIVE = "is_deleted=0"
 
@@ -343,21 +346,33 @@ def _document_values(store):
         return _errors_note(errors) + _no_data()
     body = _errors_note(errors) + _bar_chart(pairs, value_format=_money)
 
-    # Quote -> order conversion. Only count orders whose quote is actually in
-    # the store: a delta or short period routinely holds orders raised against
-    # quotes from an earlier window, which otherwise gives percentages >100%.
-    quotes, err_q = _read(
-        store, f"SELECT COUNT(*) FROM quote_totals WHERE {_LIVE}")
-    converted, err_c = _read(
-        store,
-        "SELECT COUNT(DISTINCT o.quote_id) FROM order_totals o "
-        f"WHERE o.{_LIVE} AND o.quote_id IS NOT NULL AND o.quote_id != '' "
-        "AND o.quote_id IN (SELECT quote_id FROM quote_totals "
-        f"                  WHERE {_LIVE})")
-    if not (err_q or err_c) and quotes:
-        pct = converted / quotes * 100
-        body += (f'<p class="note">{_num(converted)} of {_num(quotes)} quotes '
-                 f'in this extract became orders ({pct:.0f}%).</p>')
+    # Quote -> order conversion needs an order to name the quote it came from,
+    # and a live instance does not send that field. Say so: a panel reading
+    # "0%" would be read as "nothing converts", which is a different and much
+    # more alarming claim than "we cannot see this".
+    if DOCUMENT_TOTALS_HAVE_QUOTE_ID:
+        # Only count orders whose quote is actually in the store: a delta or
+        # short period routinely holds orders raised against quotes from an
+        # earlier window, which otherwise gives percentages >100%.
+        quotes, err_q = _read(
+            store, f"SELECT COUNT(*) FROM quote_totals WHERE {_LIVE}")
+        converted, err_c = _read(
+            store,
+            "SELECT COUNT(DISTINCT o.quote_id) FROM order_totals o "
+            f"WHERE o.{_LIVE} AND o.quote_id IS NOT NULL AND o.quote_id != '' "
+            "AND o.quote_id IN (SELECT quote_id FROM quote_totals "
+            f"                  WHERE {_LIVE})")
+        if not (err_q or err_c) and quotes:
+            pct = converted / quotes * 100
+            body += (f'<p class="note">{_num(converted)} of {_num(quotes)} '
+                     f'quotes in this extract became orders ({pct:.0f}%).</p>')
+    else:
+        quotes, err_q = _read(
+            store, f"SELECT COUNT(*) FROM quote_totals WHERE {_LIVE}")
+        if not err_q and quotes:
+            body += (f'<p class="note">{_num(quotes)} quote(s) in this extract. '
+                     f'Quote-to-order conversion is not shown: the Reporting '
+                     f'API does not return the quote an order came from.</p>')
     return body
 
 
@@ -370,12 +385,12 @@ def _survey_findings(store, limit=8):
     try:
         rows = store.query(
             "SELECT COALESCE(MIN(NULLIF(p.name, '')), "
-            "                MIN(NULLIF(s.product_code, '')), 'Unknown') AS what, "
+            "                'Product ' || s.product_id) AS what, "
             "       AVG(s.stock_level) AS stock, COUNT(*) AS n "
             "FROM surveys s "
             "LEFT JOIN products p ON p.product_id = s.product_id "
             f"WHERE s.{_LIVE} AND s.stock_level IS NOT NULL "
-            "GROUP BY s.product_id, s.product_code "
+            "GROUP BY s.product_id "
             "ORDER BY n DESC LIMIT ?", (limit,))
     except Exception as exc:                      # noqa: BLE001 - reported
         return _no_data(f"Could not read survey data: {exc}")
@@ -396,11 +411,12 @@ def _orders_over_time(store):
 def _top_customers(store, limit=8):
     rows = store.query(
         "SELECT COALESCE(NULLIF(a.customer_name, ''), "
-        "                NULLIF(ot.customer_name, ''), "
+        "                NULLIF(c.name, ''), "
         "                'Unattributed') AS who, "
         "       SUM(ot.subtotal_value) AS v "
         "FROM order_totals ot "
         "LEFT JOIN activities a ON a.activity_id = ot.activity_id "
+        "LEFT JOIN customers c ON c.customer_id = ot.customer_id "
         f"WHERE ot.{_LIVE} "
         "GROUP BY who ORDER BY v DESC LIMIT ?", (limit,))
     return _bar_chart([(r[0], r[1]) for r in rows], value_format=_money)
@@ -408,8 +424,8 @@ def _top_customers(store, limit=8):
 
 def _top_products(store, limit=8):
     rows = store.query(
-        "SELECT COALESCE(NULLIF(p.name, ''), NULLIF(oi.product_code, ''), "
-        "                'Unknown') AS what, "
+        "SELECT COALESCE(NULLIF(p.name, ''), "
+        "                'Product ' || oi.product_id, 'Unknown') AS what, "
         "       SUM(oi.item_subtotal_value) AS v "
         "FROM order_items oi "
         "LEFT JOIN products p ON p.product_id = oi.product_id "
@@ -459,9 +475,10 @@ def _targets(store, limit=12):
         actual = store.scalar(
             "SELECT SUM(ot.subtotal_value) FROM order_totals ot "
             "LEFT JOIN activities a ON a.activity_id = ot.activity_id "
+            "LEFT JOIN users u ON u.user_id = ot.user_id "
             f"WHERE ot.{_LIVE} AND substr(ot.date, 1, 7) = substr(?, 1, 7) "
             "AND COALESCE(NULLIF(a.display_name,''), "
-            "             NULLIF(ot.display_name,'')) = ?",
+            "             NULLIF(u.display_name,'')) = ?",
             (month or "", who), default=0)
         target = float(target or 0)
         pct = f"{(actual / target * 100):.0f}%" if target else "-"

@@ -337,6 +337,26 @@ never gets a stray database.
 - **Log the `x-date-range` response header.** It is the only proof of which window the server
   actually computed, and financial-period arithmetic (year start, month start day, week start) has
   real off-by-one risk. The Reporting tab prints it per entity after every run.
+- **The registry is now verified against a live instance** (2026-09-14, `trainingblessings`,
+  `Prev30Days`). The headline: all six sub-entity primary keys that were unverified guesses
+  (`survey_item_id`, `completed_form_id`, `order_id`, `order_item_id`, `credit_request_id`,
+  `credit_request_item_id`) are **present**, so the silent-discard failure mode is not happening.
+  Four sub-entities (`comments`, `emails`, `quoteTotals`, `quotes`) had no rows in the sample and
+  remain unverified. What the check did find: a dozen declared columns the API never sends (removed),
+  several it does send that were being thrown away (added — every document row repeats its
+  `customer_id`, `user_id` and `date`), and `/v2/invoices` failing outright.
+- **A document row does not name the quote it came from.** `quote_id` is declared on order totals
+  but a live instance does not send it, so quote→order conversion is **not computable**.
+  `DOCUMENT_TOTALS_HAVE_QUOTE_ID` gates it: the column is kept (it is the only field that could ever
+  carry this, and deleting it would delete the code too) and the dashboard says the conversion is
+  unavailable rather than printing a confident `0%` — which reads as "nothing converts", a very
+  different and more alarming claim than "we cannot see this".
+- **Sending `limit`/`skip` without an `order` is a server-side SQL error, not a soft failure.**
+  `/v2/invoices` declares no sortable field, `build_filter` sent `limit` anyway, and the instance
+  answered `HTTP 424 "Incorrect syntax near 'OFFSET'. Invalid usage of the option NEXT in the FETCH
+  statement."` — the entity could never be extracted. `build_filter` now omits paging entirely when
+  no `order_by` is declared, which is what this file already claimed it did. `test_reporting_client`
+  had asserted the broken behaviour while its own comment described the correct one.
 - **Two response schemas in the spec are wrong** (`/v2/products` declares `CustomerExtended`,
   `/v2/yearonyearsales` declares `UserTimeSegment`) and 7 of 11 endpoints have empty descriptions.
   The registry's column lists are therefore **unverified against a live instance** — confirm before

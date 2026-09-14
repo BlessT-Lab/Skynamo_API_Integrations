@@ -72,29 +72,58 @@ DEFAULT_RATE_LIMIT = _LIMIT_2_PER_10MIN
 # them rather than repeating four near-identical literals.
 
 def _document_total_columns(doc_id):
-    """Header/total row of a sales document (one per document)."""
+    """Header/total row of a sales document (one per document).
+
+    Verified against a live instance: `reference`, `quote_id`, `customer_name`,
+    `display_name`, `summary_tax_note` and `summary_reporting_note` were
+    declared here but are not sent, so they are gone. `quote_id` mattered -
+    see DOCUMENT_TOTALS_HAVE_QUOTE_ID below.
+    """
     return {
         doc_id: "TEXT", "activity_id": "TEXT", "date": "TEXT",
-        "reference": "TEXT", "discount": "REAL",
+        "discount": "REAL",
         "prices_include_tax": "INTEGER", "discount_value": "REAL",
-        "subtotal_value": "REAL", "tax_value": "REAL", "quote_id": "TEXT",
-        "customer_id": "TEXT", "customer_name": "TEXT",
-        "user_id": "TEXT", "display_name": "TEXT",
-        "summary_tax_note": "TEXT", "summary_reporting_note": "TEXT",
+        "subtotal_value": "REAL", "tax_value": "REAL",
+        "customer_id": "TEXT", "user_id": "TEXT",
+        # Not sent by the instance checked, so it is always null there - kept
+        # because it is the only field that could ever tie an order back to
+        # its quote, and dropping the column would delete the code that uses
+        # it. DOCUMENT_TOTALS_HAVE_QUOTE_ID gates whether it is trusted.
+        "quote_id": "TEXT",
     }
 
 
 def _document_item_columns(item_id, doc_id):
-    """Line-item row of a sales document (many per document)."""
+    """Line-item row of a sales document (many per document).
+
+    Verified live: `product_code` and `quote_id` are not sent (join through
+    `product_id` for the code), and each item repeats its document's
+    `customer_id`, `user_id`, `date`, `discount` and `prices_include_tax`,
+    which were being discarded.
+
+    `list_price`, `item_discount` and `item_discount_value` are kept even
+    though credit-request items do not carry them: order items do, and the two
+    share this shape. An always-null column for one document type is waste, not
+    a fault - unlike a missing primary key, which loses the row.
+    """
     return {
         item_id: "TEXT", doc_id: "TEXT", "activity_id": "TEXT",
-        "product_id": "TEXT", "product_code": "TEXT", "quantity": "REAL",
+        "product_id": "TEXT", "quantity": "REAL",
         "unit_name": "TEXT", "unit_multiplier": "REAL",
         "list_price": "REAL", "unit_price": "REAL",
         "item_discount": "REAL", "item_discount_value": "REAL",
         "item_subtotal_value": "REAL", "tax_rate": "REAL",
-        "item_tax_value": "REAL", "quote_id": "TEXT",
+        "item_tax_value": "REAL",
+        "customer_id": "TEXT", "user_id": "TEXT", "date": "TEXT",
+        "discount": "REAL", "prices_include_tax": "INTEGER",
     }
+
+
+# Whether a document's totals row carries the id of the quote it came from.
+# The dashboard's quote-to-order conversion is only computable when it does,
+# and a live instance does not send it - so the panel says so rather than
+# reporting a confident zero. Flip this if an instance is found that does.
+DOCUMENT_TOTALS_HAVE_QUOTE_ID = False
 
 
 def _document_pair(api_total, api_items, table_prefix, doc_id, item_id):
@@ -126,6 +155,7 @@ _ACTIVITY_SUB_ENTITIES = {
             "activity_id": "TEXT", "start_time": "TEXT", "end_time": "TEXT",
             "duration_sec": "INTEGER", "is_scheduled": "INTEGER",
             "is_onsite": "INTEGER",
+            "customer_id": "TEXT", "user_id": "TEXT",
         },
     },
     "surveys": {
@@ -135,8 +165,8 @@ _ACTIVITY_SUB_ENTITIES = {
         "columns": {
             "survey_item_id": "TEXT", "survey_id": "TEXT",
             "activity_id": "TEXT", "product_id": "TEXT",
-            "product_code": "TEXT", "product_name": "TEXT",
             "stock_level": "REAL", "facings": "REAL", "retail_price": "REAL",
+            "customer_id": "TEXT", "user_id": "TEXT", "date": "TEXT",
         },
     },
     "forms": {
@@ -147,6 +177,7 @@ _ACTIVITY_SUB_ENTITIES = {
             "completed_form_id": "TEXT", "activity_id": "TEXT",
             "completed_date": "TEXT", "form_type": "TEXT",
             "json_view": "TEXT",
+            "customer_id": "TEXT", "user_id": "TEXT",
         },
     },
     # No unique field in the spec for these two, so the store derives a
@@ -224,7 +255,8 @@ REPORTING_ENTITIES = {
             "user_id": "TEXT", "display_name": "TEXT",
             "user_is_active": "INTEGER",
             "start_time": "TEXT", "end_time": "TEXT",
-            "longitude": "REAL", "latitude": "REAL", "comment": "TEXT",
+            "longitude": "REAL", "latitude": "REAL",
+            "row_version": "TEXT",
         },
         # All 11 documented sub-entities - they arrive in the same request, so
         # this is what turns a vague "activity" into "an order / a quote / a
@@ -243,10 +275,10 @@ REPORTING_ENTITIES = {
         "extra_fields": ["added_by_user_id", "display_name", "user_is_active"],
         "columns": {
             "customer_id": "TEXT", "name": "TEXT", "code": "TEXT",
-            "is_active": "INTEGER", "longitude": "REAL", "latitude": "REAL",
+            "is_active": "INTEGER",
             "added_date": "TEXT", "added_by_user_id": "TEXT",
             "display_name": "TEXT", "user_is_active": "INTEGER",
-            "json_view": "TEXT",
+            "json_view": "TEXT", "row_version": "TEXT",
         },
         "sub_entities": {
             "invoices": {
@@ -285,7 +317,7 @@ REPORTING_ENTITIES = {
         "columns": {
             "user_id": "TEXT", "login_name": "TEXT", "display_name": "TEXT",
             "is_active": "INTEGER", "role": "TEXT", "email": "TEXT",
-            "cell_phone": "TEXT", "last_sync_time": "TEXT",
+            "cell_phone": "TEXT",
         },
         "sub_entities": {
             "userTargets": {
@@ -308,8 +340,8 @@ REPORTING_ENTITIES = {
         "order_by": "code",
         "columns": {
             "product_id": "TEXT", "name": "TEXT", "code": "TEXT",
-            "description": "TEXT", "is_active": "INTEGER",
-            "json_view": "TEXT",
+            "is_active": "INTEGER",
+            "json_view": "TEXT", "row_version": "TEXT",
         },
         "sub_entities": {},      # `entities` is the empty base schema here
     },

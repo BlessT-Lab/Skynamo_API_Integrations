@@ -13,6 +13,7 @@ from skynamo_geo.dashboard import (
     _nice_max, _num, _truncate,
 )
 from skynamo_geo.report_store import ReportStore
+from skynamo_geo import dashboard as dashboard_module
 
 # --- formatting helpers ---
 assert _num(1234567) == "1,234,567"
@@ -215,12 +216,29 @@ try:
     # 2 quotes, 1 order, 1 credit request, 1 visit, 1 survey, 1 comment
     assert "Orders" in html_out and "Quotes" in html_out
     assert "Credit requests" in html_out
-    # quote -> order conversion: 1 of 2 quotes converted
-    assert "1 of 2 quotes in this extract became orders (50%)" in html_out
+    # Quote -> order conversion is NOT claimed: a live instance sends no
+    # quote_id on an order, and a panel reading 0% would be read as "nothing
+    # converts" rather than "we cannot see this".
+    assert "conversion is not shown" in html_out
+    assert "became orders" not in html_out
     # document values are shown
     assert "900" in html_out or "1,300" in html_out
     # survey stock level appears
     assert "Widget" in html_out
+    # If an instance ever does send quote_id, the arithmetic still works: the
+    # column is kept and only its display is gated, so flipping the flag runs
+    # exactly the code that would run there.
+    real_flag = dashboard_module.DOCUMENT_TOTALS_HAVE_QUOTE_ID
+    try:
+        dashboard_module.DOCUMENT_TOTALS_HAVE_QUOTE_ID = True
+        converted_html = open(build_dashboard(
+            br, os.path.join(tmp, "conversion.html")), encoding="utf-8").read()
+        assert ("1 of 2 quotes in this extract became orders (50%)"
+                in converted_html), "conversion maths broke while gated off"
+        assert "conversion is not shown" not in converted_html
+    finally:
+        dashboard_module.DOCUMENT_TOTALS_HAVE_QUOTE_ID = real_flag
+
     br.close()
 
     # an activity with no type falls back rather than vanishing
@@ -254,9 +272,21 @@ try:
         "quoteTotals": [{"quote_id": "q9", "subtotal_value": 99.0}],
         "quotes": [{"quote_item_id": "qi9", "quote_id": "q9"}],
     }])
-    out = _document_values(conv)
+    # Exercised with the flag on: this is about the arithmetic, which is the
+    # same code an instance that does send quote_id would run.
+    real_flag = dashboard_module.DOCUMENT_TOTALS_HAVE_QUOTE_ID
+    try:
+        dashboard_module.DOCUMENT_TOTALS_HAVE_QUOTE_ID = True
+        out = _document_values(conv)
+    finally:
+        dashboard_module.DOCUMENT_TOTALS_HAVE_QUOTE_ID = real_flag
     assert "300%" not in out, "must not count quotes absent from the store"
     assert "0 of 1 quotes in this extract became orders (0%)" in out, out
+
+    # ...and with the flag off (the live shape) the claim is withheld entirely
+    off = _document_values(conv)
+    assert "became orders" not in off
+    assert "conversion is not shown" in off
     conv.close()
 
     # (b) surveys: LIMIT must not be applied before NULL stock levels are

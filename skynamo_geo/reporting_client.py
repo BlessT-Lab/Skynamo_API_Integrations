@@ -124,8 +124,14 @@ def build_filter(entity_spec, sub_entities=None, limit=None, skip=None,
 
     if limit is not None or skip is not None:
         order_by = entity_spec.get("order_by")
-        if order_by:
-            filter_obj["order"] = {order_by: "ASC"}
+        if not order_by:
+            # No sortable field declared, so paging is impossible: the server
+            # builds OFFSET/FETCH NEXT SQL that requires an ORDER BY, and
+            # answers HTTP 424 "Incorrect syntax near 'OFFSET'" - which is what
+            # /v2/invoices did. Returning the whole result unpaged is the right
+            # answer anyway against these rate limits; see the module docstring.
+            return filter_obj
+        filter_obj["order"] = {order_by: "ASC"}
         if limit is not None:
             filter_obj["limit"] = limit
         if skip is not None:
