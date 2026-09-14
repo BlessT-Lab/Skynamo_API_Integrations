@@ -175,7 +175,18 @@ it, because the reason an operation failed lives there and a reason nobody sees 
 Any new failure path must open it too. **Button weight is derived, not specified**: `_button` reads
 the `fg_color` the caller already passes (`FIELD` → outlined secondary, `RED` → outlined with red
 text, anything else → filled primary), so hierarchy lives in one place instead of 32 call sites. A
-screen should have exactly one filled button.
+screen should have exactly one filled button. Colour alone cannot carry every intent, so `kind`
+overrides the inference — a **destructive primary** (Manage Images' Remove) is red *and* the point
+of its screen, and inferring from `RED` alone rendered it as a Cancel and left that screen with no
+primary at all. Every branch must set `text_color_disabled`: CustomTkinter does not change a
+button's fill when disabled, so the default grey on a saturated fill is all but invisible.
+
+**A label's wraplength must be measured from the window, never from its own container**
+(`_wrap_to_width`). A card is sized by its children, so a long label inflates the card and reading
+that card back returns a width the label itself caused — the card grew to 1128px inside an 894px
+content area and the text was clipped by the window edge instead of wrapping. Convert for DPI too:
+`winfo_width()` is physical pixels while a CTk widget's `wraplength` is logical, a 25% error on a
+1.25-scaled display.
 Note the Dashboards tab and the Reporting tab's store label deliberately **do not create** the
 SQLite file just to render; they check `os.path.exists` first, so a user who never opens Reporting
 never gets a stray database.

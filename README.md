@@ -635,6 +635,20 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.11.1** (2026-09-14) — **Fixes to the redesign**, found by reviewing it.
+  - **Disabled buttons were unreadable.** Nothing set `text_color_disabled`,
+    and CustomTkinter keeps a button's fill when it is disabled, so the default
+    grey label sat on a saturated green/blue fill at about 1:1 contrast.
+  - **Manage Images had no primary button.** Its Remove action is red *and* the
+    point of the screen, but the styling inferred "red means Cancel" and
+    outlined it, making the destructive action look like a Cancel.
+  - **Long helper text was clipped**, not wrapped — wraplengths were tuned for
+    a window without the 206px rail. They now follow the window width (and
+    account for display scaling), so they are right at any size.
+  - `hover_color` was silently ignored on outlined buttons; it is honoured for
+    secondaries, and the Cancel buttons no longer pass one that cannot be used.
+  - Stale wording: four on-screen messages still sent you to a "tab".
+
 - **v2.11.0** (2026-09-14) — **Redesigned interface.** Left navigation rail in
   place of the tab strip, a slate palette, and a clearer hierarchy throughout.
   - **The log is collapsed by default** behind a `▸ Log` toggle that shows a

@@ -62,8 +62,8 @@ try:
     # Dashboards tab: build available, open disabled until something is built
     assert app.dash_build_btn.cget("state") == "normal"
     assert app.dash_open_btn.cget("state") == "disabled"
-    # with no store, both panels say so and point at the Reporting tab
-    assert "Reporting tab" in app.dash_info.get("1.0", "end")
+    # with no store, both panels say so and point at the Reporting section
+    assert "Go to Reporting" in app.dash_info.get("1.0", "end")
     assert "created on the first extract" in app.rpt_store_label.cget("text")
     # ...and nothing was created just to render those labels
     assert not os.path.exists(missing), "must not create the store to render"
@@ -86,7 +86,7 @@ try:
 
     info = app.dash_info.get("1.0", "end")
     assert "products" in info and "Last extract per entity" in info, info
-    assert "Reporting tab" not in info, "should not nag when a store exists"
+    assert "Go to Reporting" not in info, "should not nag when a store exists"
     assert "products=1" in app.rpt_store_label.cget("text"), \
         app.rpt_store_label.cget("text")
     # ---- Part 3: a saved config is honoured -----------------------------

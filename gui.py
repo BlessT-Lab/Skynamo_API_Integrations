@@ -1,7 +1,8 @@
 """
 Skynamo Toolkit - desktop GUI
 =============================
-A CustomTkinter front-end over the skynamo_geo core, with four tabs:
+A CustomTkinter front-end over the skynamo_geo core. Five sections, reached
+from the navigation rail down the left:
 
   Customer Geolocation - geocode customer addresses and write coordinates.
   Product Images       - match local image files to products by code and upload.
@@ -52,7 +53,7 @@ from skynamo_geo.geocoder import NominatimGeocoder, GeocodeError
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-# ----- Palette (base background is rgb(26,26,26)) -----
+# ----- Palette (slate; the ground everything is mixed against is BG) -----
 BG = "#131721"            # window background
 SIDEBAR = "#1a1f2b"       # navigation rail
 CARD = "#1a1f2b"          # panel/card surfaces
@@ -69,6 +70,7 @@ TEXT_MUTED = "#8b93a7"
 TABLE_BG = "#171b25"      # treeview surface
 TABLE_HEAD = "#212736"
 FONT_FAMILY = "Segoe UI"
+NAV_WIDTH = 206           # the navigation rail
 
 # Treeview row states. Mixed against TABLE_BG, not against pure black - a tint
 # tuned for one ground looks muddy on another.
@@ -98,13 +100,14 @@ PERIOD_LABEL_BY_KEY = {v: k for k, v in PERIOD_BY_LABEL.items()}
 class SidebarNav(ctk.CTkFrame):
     """A left navigation rail plus a content area.
 
-    Exposes the slice of CTkTabview's API this app uses - add(), tab(), set(),
-    get() - so swapping the tab strip for a rail is a change in _build_ui and
-    nowhere else.
+    Exposes the slice of CTkTabview's API the app needs - add() and set() build
+    and drive it, tab() is what test_gui_smoke reaches for - so swapping the tab
+    strip for a rail was a change in _build_ui and nowhere else. get() is kept
+    for parity with CTkTabview rather than because anything calls it.
     """
 
     def __init__(self, master, title="Skynamo", subtitle="Toolkit",
-                 footer="", width=206):
+                 footer="", width=NAV_WIDTH):
         super().__init__(master, fg_color="transparent")
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -421,7 +424,7 @@ class App(ctk.CTk):
         self.write_btn.pack(side="left", padx=6, pady=10)
         self.cancel_btn = self._button(
             actions, "Cancel", self.on_cancel, state="disabled",
-            fg_color=RED, hover_color=RED_HOVER, width=90)
+            fg_color=RED, width=90)
         self.cancel_btn.pack(side="left", padx=6, pady=10)
         self.save_btn = self._button(
             actions, "Save Report CSV", self.on_save_report,
@@ -489,6 +492,36 @@ class App(ctk.CTk):
 
     # -- Styled widget helpers --------------------------------------------
 
+    def _wrap_to_width(self, label, chrome=72):
+        """Keep a label's wraplength in step with the width it actually has.
+
+        Measured from the WINDOW, deliberately - not from the label's own
+        container. A card is sized by its children, so a long label inflates it
+        and then reading that card back gives a width the label itself caused:
+        the card grew to 1128px inside a 894px content area and the text was
+        clipped by the window edge rather than wrapped.
+
+        `chrome` covers the card's padding plus the label's own, so the value
+        stays inside the card at every window size.
+        """
+        def resize(_event=None):
+            # winfo_width() is physical pixels; a CTk widget's wraplength is in
+            # logical units, which CTk then scales. On this machine's 1.25 DPI
+            # display that is a 25% error, so convert before comparing.
+            try:
+                scaling = ctk.ScalingTracker.get_widget_scaling(self)
+            except Exception:
+                scaling = 1.0
+            logical = self.winfo_width() / (scaling or 1.0)
+            width = int(max(220, logical - NAV_WIDTH - chrome))
+            # Only on a real change: configure() inside a <Configure> handler
+            # would otherwise re-enter.
+            if abs(int(label.cget("wraplength")) - width) > 8:
+                label.configure(wraplength=width)
+        self.bind("<Configure>", resize, add="+")
+        self.after(50, resize)
+        return label
+
     def _card(self, parent):
         return ctk.CTkFrame(parent, fg_color=CARD, corner_radius=12,
                             border_width=1, border_color=BORDER)
@@ -510,7 +543,7 @@ class App(ctk.CTk):
                             text_color=TEXT)
 
     def _button(self, parent, text, command, state="normal", width=None,
-                fg_color=ACCENT, hover_color=ACCENT_HOVER):
+                fg_color=ACCENT, hover_color=None, kind=None):
         """A button whose weight follows the intent the caller already states.
 
         Callers signal intent through fg_color - FIELD for a secondary, RED for
@@ -518,17 +551,40 @@ class App(ctk.CTk):
         derived here rather than at 32 call sites. Only the primary is filled;
         a wall of equally loud buttons tells the user nothing about which one
         they came here to press.
+
+        Colour alone cannot express every intent: a *destructive primary* (the
+        Remove button on Manage Images) is red but is the point of its screen,
+        so `kind` overrides the inference. Pass "danger" for that; everything
+        else infers.
+
+        Every branch sets text_color_disabled. CustomTkinter does not change a
+        button's fill when it is disabled, so leaving the default grey put an
+        almost invisible label on a saturated fill, and left a disabled outline
+        button looking livelier than an enabled one.
         """
         kwargs = {"width": width} if width else {}
-        if fg_color == FIELD:                      # secondary
+        kind = kind or ("secondary" if fg_color == FIELD
+                        else "cancel" if fg_color == RED else "primary")
+        if kind == "secondary":
+            style = dict(fg_color="transparent", hover_color=hover_color or FIELD,
+                         text_color=TEXT, text_color_disabled=TEXT_MUTED,
+                         border_width=1, border_color=BORDER)
+        elif kind == "cancel":
+            # Deliberately not the caller's hover_color: this button's label is
+            # red, a red fill underneath it would be unreadable, and CTkButton
+            # has no text_color_hover to compensate.
             style = dict(fg_color="transparent", hover_color=FIELD,
-                         text_color=TEXT, border_width=1, border_color=BORDER)
-        elif fg_color == RED:                      # cancel / destructive
-            style = dict(fg_color="transparent", hover_color=FIELD,
-                         text_color=RED, border_width=1, border_color=BORDER)
-        else:                                      # primary
-            style = dict(fg_color=fg_color, hover_color=hover_color,
-                         text_color="#ffffff", border_width=0)
+                         text_color=RED, text_color_disabled=TEXT_MUTED,
+                         border_width=1, border_color=BORDER)
+        elif kind == "danger":
+            style = dict(fg_color=RED, hover_color=RED_HOVER,
+                         text_color="#ffffff", text_color_disabled=BG,
+                         border_width=0)
+        else:
+            style = dict(fg_color=fg_color,
+                         hover_color=hover_color or ACCENT_HOVER,
+                         text_color="#ffffff", text_color_disabled=BG,
+                         border_width=0)
         return ctk.CTkButton(parent, text=text, command=command, state=state,
                              height=34, corner_radius=8,
                              font=ctk.CTkFont(family=FONT_FAMILY, size=13,
@@ -648,8 +704,7 @@ class App(ctk.CTk):
                     self._set_busy(False)
                     return
                 elif kind == "error":
-                    self.log_line(f"ERROR: {payload}")
-                    self.log.expand()
+                    self.log.alert(f"ERROR: {payload}")
                     self.set_status("Error - see log.")
                     self._set_busy(False)
                     return
@@ -1048,7 +1103,7 @@ class App(ctk.CTk):
         self.img_upload_btn.pack(side="left", padx=6, pady=10)
         self.img_cancel_btn = self._button(
             actions, "Cancel", self.on_img_cancel, state="disabled",
-            fg_color=RED, hover_color=RED_HOVER, width=90)
+            fg_color=RED, width=90)
         self.img_cancel_btn.pack(side="left", padx=6, pady=10)
         self.img_save_btn = self._button(
             actions, "Save Report CSV", self.on_img_save_report,
@@ -1106,9 +1161,9 @@ class App(ctk.CTk):
         self.img_progress.set(0)
         self.img_progress.grid(row=0, column=0, padx=14, pady=(12, 4),
                                sticky="ew")
-        self.img_status_label = ctk.CTkLabel(bottom, text="Ready.", anchor="w",
-                                             wraplength=980, justify="left",
-                                             text_color=TEXT)
+        self.img_status_label = self._wrap_to_width(ctk.CTkLabel(
+            bottom, text="Ready.", anchor="w", wraplength=980,
+            justify="left", text_color=TEXT))
         self.img_status_label.grid(row=1, column=0, padx=14, pady=2, sticky="ew")
         self.img_log = LogPanel(bottom)
         self.img_log.grid(row=2, column=0, padx=14, pady=(2, 12), sticky="ew")
@@ -1155,8 +1210,7 @@ class App(ctk.CTk):
                     self._img_set_busy(False)
                     return
                 elif kind == "error":
-                    self.img_log_line(f"ERROR: {payload}")
-                    self.img_log.expand()
+                    self.img_log.alert(f"ERROR: {payload}")
                     self.img_set_status("Error - see log.")
                     self._img_set_busy(False)
                     return
@@ -1496,21 +1550,21 @@ class App(ctk.CTk):
         self.mgmt_load_btn = self._button(top, "Load Images",
                                           self.on_mgmt_load, width=140)
         self.mgmt_load_btn.grid(row=1, column=2, padx=(0, 14), pady=4)
-        ctk.CTkLabel(
+        self._wrap_to_width(ctk.CTkLabel(
             top,
-            text="Connect & load products on the Product Images tab first. "
+            text="Connect & load products in Product Images first. "
                  "Removing an image detaches it from this product (Skynamo has "
                  "no delete); the file itself may remain on the server.",
             anchor="w", wraplength=900, justify="left",
-            text_color=TEXT_MUTED).grid(row=2, column=0, columnspan=3,
-                                        padx=14, pady=(2, 6), sticky="ew")
+            text_color=TEXT_MUTED)).grid(row=2, column=0, columnspan=3,
+                                         padx=14, pady=(2, 6), sticky="ew")
 
         actions = ctk.CTkFrame(top, fg_color="transparent")
         actions.grid(row=3, column=0, columnspan=3, padx=10, pady=(0, 10),
                      sticky="ew")
         self.mgmt_delete_btn = self._button(
             actions, "Remove Selected from Product", self.on_mgmt_delete,
-            state="disabled", fg_color=RED, hover_color=RED_HOVER)
+            state="disabled", kind="danger")
         self.mgmt_delete_btn.pack(side="left", padx=(4, 6), pady=4)
         self.mgmt_cancel_btn = self._button(
             actions, "Cancel", self.on_mgmt_cancel, state="disabled",
@@ -1609,8 +1663,7 @@ class App(ctk.CTk):
                     self._mgmt_set_busy(False)
                     return
                 elif kind == "error":
-                    self.mgmt_log_line(f"ERROR: {payload}")
-                    self.mgmt_log.expand()
+                    self.mgmt_log.alert(f"ERROR: {payload}")
                     self.mgmt_set_status("Error - see log.")
                     self._mgmt_set_busy(False)
                     return
@@ -1645,7 +1698,7 @@ class App(ctk.CTk):
     def on_mgmt_load(self):
         if self.img_client is None or not self.products:
             self.mgmt_set_status(
-                "Connect & load products on the Product Images tab first.")
+                "Connect & load products in Product Images first.")
             return
         code = self.mgmt_code_entry.get().strip()
         if not code:
@@ -1924,7 +1977,7 @@ class App(ctk.CTk):
         self.rpt_run_btn.pack(side="left", padx=6, pady=10)
         self.rpt_cancel_btn = self._button(
             actions, "Cancel", self.on_rpt_cancel, state="disabled",
-            fg_color=RED, hover_color=RED_HOVER, width=90)
+            fg_color=RED, width=90)
         self.rpt_cancel_btn.pack(side="left", padx=6, pady=10)
         self.rpt_save_btn = self._button(
             actions, "Save Report CSV", self.on_rpt_save_report,
@@ -2083,8 +2136,7 @@ class App(ctk.CTk):
                     self._rpt_set_busy(False)
                     return
                 elif kind == "error":
-                    self.rpt_log_line(f"ERROR: {payload}")
-                    self.rpt_log.expand()
+                    self.rpt_log.alert(f"ERROR: {payload}")
                     self.rpt_set_status("Error - see log.")
                     self._rpt_set_busy(False)
                     return
@@ -2403,7 +2455,7 @@ class App(ctk.CTk):
             self.dash_info.insert(
                 "end",
                 "No local store yet.\n\n"
-                "Go to the Reporting tab, connect with your Reporting API\n"
+                "Go to Reporting, connect with your Reporting API\n"
                 "client credentials and run an extract first - the dashboard\n"
                 "is built from whatever that puts in the store.\n\n"
                 f"Store will be created at:\n  {path}\n")
@@ -2441,7 +2493,7 @@ class App(ctk.CTk):
         path = default_store_path()
         if self.rpt_store is None and not os.path.exists(path):
             self.dash_status_label.configure(
-                text="No store yet - run an extract on the Reporting tab first.")
+                text="No store yet - run an extract in Reporting first.")
             return
         title = self.dash_title_entry.get().strip() or "Skynamo Dashboard"
         period_label = self.dash_label_entry.get().strip()
