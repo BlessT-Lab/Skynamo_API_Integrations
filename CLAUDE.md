@@ -259,6 +259,18 @@ never gets a stray database.
   group and on the patch that attaches them. Per product, not per run: the patch links "the files
   of this transaction", so one id shared across products could attach every product's images to
   whichever is patched first.
+- **An uploaded file expires if nothing links it — about 15 minutes.** `POST /files` returns an
+  `expire_time` roughly a quarter of an hour ahead (`File.expire_time` exists in the spec but
+  nothing says it is short, or that it applies to a file awaiting a transaction link). Two
+  consequences. It is why a failed run leaves **no** orphan build-up: unattached files clean
+  themselves up, so retrying is cheap and there is nothing to go and delete — which is just as well,
+  since there is no `DELETE /files/{guid}`. And it puts a clock on the gap between a product's
+  uploads and its `PATCH`: `upload_images` uploads one product's images and patches immediately, so
+  the exposure is one product's worth of uploads, but a product with very many images on a slow link
+  could in principle have its earliest uploads expire before the patch lands. If that ever shows up,
+  it appears as `P023` on the *earliest* images of a large product only.
+  **Verified live** (2026-09-14, instance `trainingblessings`): upload 200 + `GET /files/{guid}` 200
+  + `PATCH /products` 200 with base64-MD5 `content_hash`, `id`, and a shared `transaction_id`.
 - **Skynamo has no product-image endpoint.** Upload is generic: `POST /files` (base64 `content`) →
   file GUID → `PATCH /products` with `{code, files:[...]}`. In merge mode the `files` array is sent
   as the **union** of the product's existing GUIDs plus the new ones (don't clobber attached images);

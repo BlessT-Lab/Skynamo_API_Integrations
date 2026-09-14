@@ -326,6 +326,11 @@ files plus the new ones, so images already on the product are preserved.
 *only* this run's uploaded images — anything it had before is dropped (detached).
 The report notes how many existing images were replaced.
 
+> **Uploaded files expire in about 15 minutes if nothing attaches them.** The
+> upshot is that a failed run leaves nothing behind to clean up — unattached
+> files disappear on their own, so retrying costs you nothing and there are no
+> orphans accumulating on the instance.
+
 ### Filing the images away afterwards (optional)
 Tick **"After uploading, move processed files into 'Successful' and 'Failed'
 subfolders"** (CLI: it asks) and the run finishes by moving each image out of
