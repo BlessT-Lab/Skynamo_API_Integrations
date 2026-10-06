@@ -14,6 +14,7 @@ from contextlib import redirect_stdout
 
 import diag_image_upload as imgdiag
 import diag_reporting_auth as diag
+import diag_route_planning as routediag
 
 TOKEN = "eyJhbGciOiJSUzI1NiJ9.SUPERSECRETTOKENPAYLOAD.sig"
 REFRESH = "REFRESHCANARY123456"
@@ -187,5 +188,21 @@ assert imgdiag.redact("plain text") == "plain text"
 # The write probe is opt-in: `ask` must default to NO, so an unattended run
 # (or a bare Enter) never writes to the instance.
 assert imgdiag.ask.__defaults__ == (False,)
+
+# ---------------------------------------------------------------------------
+# diag_route_planning.py - same promise, same canary
+# ---------------------------------------------------------------------------
+routediag._SECRET["value"] = API_KEY
+try:
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        routediag.show("POST /scheduledvisits", ImgResponse(400, echoed))
+    assert API_KEY not in buf.getvalue(), buf.getvalue()
+    assert "<API-KEY-REDACTED>" in buf.getvalue()
+    assert routediag.redact(f"x{API_KEY}y") == "x<API-KEY-REDACTED>y"
+finally:
+    routediag._SECRET["value"] = ""
+# The write probe is opt-in: a bare Enter must never mean yes.
+assert routediag.ask.__defaults__ == (False,)
 
 print("All diagnostic redaction tests passed")

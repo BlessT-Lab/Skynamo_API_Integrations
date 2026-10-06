@@ -2,12 +2,14 @@
 
 import base64
 import hashlib
+import json
+import time
 
 import requests
 
 from .config import (
     API_BASE, DEFAULT_ACCURACY, FILE_HASH_ALGORITHM, PAGE_SIZE,
-    REQUEST_TIMEOUT,
+    PUBLIC_API_BACKOFF_SECONDS, PUBLIC_API_MAX_RETRIES, REQUEST_TIMEOUT,
 )
 
 
@@ -20,6 +22,35 @@ def content_hash_b64(raw_bytes, algorithm=FILE_HASH_ALGORITHM):
     """
     return base64.b64encode(
         hashlib.new(algorithm, raw_bytes).digest()).decode("ascii")
+
+
+def create_date_filter(since):
+    """The `filters` value for "created on or after `since`" (a date).
+
+    GET /scheduledvisits, /visitfrequencies and /tasks filter only on id,
+    create_date and row_version - never on due date, user or customer. The
+    spec's own examples disagree on whether a space follows the comma
+    ("less_than(id,5)" vs "greater_than_equals(create_date, 2026-01-01)"), so
+    this sends none; diag_route_planning.py checks both against a live API.
+    """
+    return json.dumps([f"greater_than_equals(create_date,{since.isoformat()})"])
+
+
+def _envelope_items(body):
+    """The list of objects in a response, whichever shape it arrived in.
+
+    Collection reads answer {data: [...], page: {...}}; a few single-object
+    reads answer {data: [obj]}, {data: obj} or the bare object.
+    """
+    if isinstance(body, list):
+        return body
+    if isinstance(body, dict):
+        data = body.get("data", body)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return [data]
+    return []
 
 
 class SkynamoClient:
@@ -85,6 +116,144 @@ class SkynamoClient:
                 break
             page_number += 1
         return customers
+
+    # -- Generic reads (route planning) ------------------------------------
+    #
+    # These return (value, error) and never raise, unlike the older
+    # fetch_all_customers/fetch_all_products: a route plan reads five
+    # endpoints, and one failing must be reportable rather than fatal.
+
+    def _get(self, path, params=None, sleep=time.sleep):
+        """GET with backoff on 429/503. Returns (body, error, status)."""
+        attempt = 0
+        while True:
+            try:
+                resp = self.session.get(f"{API_BASE}{path}", params=params,
+                                        timeout=REQUEST_TIMEOUT)
+            except requests.RequestException as exc:
+                return None, f"Connection error: {exc}", None
+            if resp.status_code in (429, 503) and attempt < PUBLIC_API_MAX_RETRIES:
+                attempt += 1
+                try:
+                    wait = float(resp.headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    wait = PUBLIC_API_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                sleep(max(0.0, wait))
+                continue
+            if not resp.ok:
+                return (None, f"HTTP {resp.status_code}: {resp.text[:500]}",
+                        resp.status_code)
+            try:
+                return resp.json(), "", resp.status_code
+            except ValueError:
+                return None, f"Malformed response from {path}", resp.status_code
+
+    def _fetch_all(self, path, filters=None, on_page=None, should_cancel=None,
+                   sleep=time.sleep):
+        """Page through a collection. Returns (items, error).
+
+        Stops on an empty page, a short page, or once total_item_count rows
+        have been seen. Rows are de-duplicated by id, since a row inserted
+        while paging shifts every later page by one. On error or cancel the
+        rows read so far are returned alongside the reason.
+        """
+        items, seen = [], set()
+        raw = 0
+        page_number = 1
+        while True:
+            if should_cancel and should_cancel():
+                return items, "Cancelled"
+            params = {"page_number": page_number, "page_size": PAGE_SIZE}
+            if filters:
+                params["filters"] = filters
+            body, error, _status = self._get(path, params, sleep=sleep)
+            if error:
+                return items, error
+            page_items = _envelope_items(body)
+            if not page_items:
+                break
+            raw += len(page_items)
+            for item in page_items:
+                key = item.get("id") if isinstance(item, dict) else None
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                items.append(item)
+            total = ((body.get("page") or {}).get("total_item_count")
+                     if isinstance(body, dict) else None)
+            if on_page:
+                on_page(len(items), total)
+            if total and raw >= total:
+                break
+            if len(page_items) < PAGE_SIZE:
+                break
+            page_number += 1
+        return items, ""
+
+    def fetch_users(self, on_page=None, sleep=time.sleep):
+        """All users. Returns (users, error). /users takes no filters."""
+        return self._fetch_all("/users", on_page=on_page, sleep=sleep)
+
+    def fetch_visit_frequencies(self, on_page=None, should_cancel=None,
+                                sleep=time.sleep):
+        """All visit-frequency records. Returns (records, error).
+
+        Each is {customer_id, user_id, frequency, cycle, period}: "frequency
+        visits every cycle periods", e.g. 1 / 2 / week = once every 2 weeks.
+        """
+        return self._fetch_all("/visitfrequencies", on_page=on_page,
+                               should_cancel=should_cancel, sleep=sleep)
+
+    def fetch_scheduled_visits(self, created_since=None, on_page=None,
+                               should_cancel=None, sleep=time.sleep):
+        """Scheduled visits, optionally only those created since a date.
+
+        Returns (visits, error). The API cannot filter by due date, rep or
+        customer, so the caller filters those locally.
+        """
+        filters = create_date_filter(created_since) if created_since else None
+        return self._fetch_all("/scheduledvisits", filters=filters,
+                               on_page=on_page, should_cancel=should_cancel,
+                               sleep=sleep)
+
+    def fetch_interactions_page(self, page_number, sleep=time.sleep):
+        """One page of /interactions. Returns (items, page_info, error).
+
+        GET /interactions accepts no filter whatsoever, so the last visit per
+        customer can only be found by walking pages. The engine decides which
+        pages and in what order; this only fetches one.
+        """
+        body, error, _status = self._get(
+            "/interactions",
+            {"page_number": page_number, "page_size": PAGE_SIZE}, sleep=sleep)
+        if error:
+            return [], {}, error
+        page = body.get("page") if isinstance(body, dict) else None
+        return _envelope_items(body), page or {}, ""
+
+    def get_configuration(self, sleep=time.sleep):
+        """The instance configuration (time zone, distance unit, ...).
+
+        Returns (config_dict, error). Accepts a bare object or an envelope.
+        """
+        body, error, _status = self._get("/configurations", sleep=sleep)
+        if error:
+            return {}, error
+        items = _envelope_items(body)
+        return (items[0] if items else {}), ""
+
+    def get_scheduled_visit(self, visit_id, sleep=time.sleep):
+        """One scheduled visit. Returns (visit_or_None, error, status).
+
+        The status lets a caller tell "gone" (404) from "could not ask".
+        """
+        body, error, status = self._get(f"/scheduledvisits/{visit_id}",
+                                        sleep=sleep)
+        if error:
+            return None, error, status
+        items = _envelope_items(body)
+        return (items[0] if items else None), "", status
 
     def update_location(self, customer_id, latitude, longitude,
                         accuracy=DEFAULT_ACCURACY, is_approximate=False):

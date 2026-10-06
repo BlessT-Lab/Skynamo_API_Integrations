@@ -14,16 +14,23 @@ import json
 
 import requests
 
-from skynamo_geo.client import SkynamoClient, content_hash_b64
-from skynamo_geo.config import API_BASE, FILE_HASH_ALGORITHM
+from datetime import date
+
+from skynamo_geo.client import (
+    SkynamoClient, content_hash_b64, create_date_filter,
+)
+from skynamo_geo.config import (
+    API_BASE, FILE_HASH_ALGORITHM, PAGE_SIZE, PUBLIC_API_MAX_RETRIES,
+)
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, body=None, text=None):
+    def __init__(self, status_code=200, body=None, text=None, headers=None):
         self.status_code = status_code
         self.ok = 200 <= status_code < 300
         self._body = body
         self.text = text if text is not None else json.dumps(body or {})
+        self.headers = headers or {}
 
     def json(self):
         if self._body is None:
@@ -235,6 +242,115 @@ ok, msg = make_client(s).test_connection()
 assert ok is True and msg == "Connected."
 
 # Credentials go in headers, and are not in any URL or body.
+
+# ---------------------------------------------------------------------------
+# Route-planning reads: (value, error), never raise
+# ---------------------------------------------------------------------------
+
+def page(items, total=None):
+    body = {"data": items}
+    if total is not None:
+        body["page"] = {"total_item_count": total}
+    return FakeResponse(200, body)
+
+
+def params_of(call):
+    return call[2].get("params") or {}
+
+
+# The filter string is exact: one predicate, ISO date, no space after the comma.
+assert create_date_filter(date(2026, 4, 9)) == \
+    '["greater_than_equals(create_date,2026-04-09)"]'
+
+# Paging: a full page then a short one; page_number advances, page_size is max.
+full = [{"id": i} for i in range(PAGE_SIZE)]
+short = [{"id": PAGE_SIZE + i} for i in range(5)]
+s = FakeSession([page(full), page(short)])
+users, err = make_client(s).fetch_users()
+assert err == "" and len(users) == PAGE_SIZE + 5, (err, len(users))
+assert [params_of(c)["page_number"] for c in s.calls] == [1, 2]
+assert all(params_of(c)["page_size"] == PAGE_SIZE for c in s.calls)
+assert s.calls[0][1] == f"{API_BASE}/users"
+assert "filters" not in params_of(s.calls[0]), "/users takes no filters"
+
+# Stops once total_item_count is reached, without asking for an empty page.
+s = FakeSession([page(full, total=PAGE_SIZE)])
+_items, err = make_client(s).fetch_visit_frequencies()
+assert err == "" and len(s.calls) == 1, len(s.calls)
+
+# A row inserted mid-walk shifts the next page by one; de-duplicate by id.
+s = FakeSession([page(full), page([{"id": PAGE_SIZE - 1}, {"id": 999}])])
+items, _err = make_client(s).fetch_visit_frequencies()
+assert sum(1 for i in items if i["id"] == PAGE_SIZE - 1) == 1
+assert len(items) == PAGE_SIZE + 1
+
+# An error mid-walk returns what was read so far, plus the reason.
+s = FakeSession([page(full), FakeResponse(500, None, text="boom")])
+items, err = make_client(s).fetch_users()
+assert len(items) == PAGE_SIZE and "500" in err, err
+
+# Cancel is honoured between pages.
+s = FakeSession([page(full), page(short)])
+calls = {"n": 0}
+def cancel_after_first():
+    calls["n"] += 1
+    return calls["n"] > 1
+items, err = make_client(s).fetch_visit_frequencies(
+    should_cancel=cancel_after_first)
+assert err == "Cancelled" and len(items) == PAGE_SIZE
+
+# 429 backs off for Retry-After seconds, then succeeds.
+slept = []
+s = FakeSession([FakeResponse(429, None, text="slow down",
+                              headers={"Retry-After": "7"}),
+                 page(short)])
+items, err = make_client(s).fetch_users(sleep=slept.append)
+assert err == "" and len(items) == 5 and slept == [7.0], (err, slept)
+
+# ...and gives up after the retry cap rather than looping forever.
+slept = []
+s = FakeSession([FakeResponse(503, None, text="busy")
+                 for _ in range(PUBLIC_API_MAX_RETRIES + 1)])
+items, err = make_client(s).fetch_users(sleep=slept.append)
+assert "503" in err and len(slept) == PUBLIC_API_MAX_RETRIES, (err, slept)
+
+# Network errors are returned, not raised.
+s = FakeSession(raise_on={"get"})
+items, err = make_client(s).fetch_users()
+assert items == [] and "Connection error" in err
+
+# Scheduled visits send exactly the create_date filter and nothing else.
+s = FakeSession([page(short)])
+make_client(s).fetch_scheduled_visits(created_since=date(2026, 4, 9))
+assert s.calls[0][1] == f"{API_BASE}/scheduledvisits"
+assert params_of(s.calls[0])["filters"] == \
+    '["greater_than_equals(create_date,2026-04-09)"]'
+s = FakeSession([page(short)])
+make_client(s).fetch_scheduled_visits()
+assert "filters" not in params_of(s.calls[0])
+
+# Interactions: one page per call, never a filter (the API takes none).
+s = FakeSession([page(short, total=1234)])
+items, info, err = make_client(s).fetch_interactions_page(7)
+assert err == "" and len(items) == 5 and info["total_item_count"] == 1234
+assert params_of(s.calls[0]) == {"page_number": 7, "page_size": PAGE_SIZE}
+
+# Configuration arrives bare or in an envelope; both read the same.
+for body in ({"time_zone": {"utc_offset": "+02:00"}},
+             {"data": {"time_zone": {"utc_offset": "+02:00"}}},
+             {"data": [{"time_zone": {"utc_offset": "+02:00"}}]}):
+    s = FakeSession([FakeResponse(200, body)])
+    cfg, err = make_client(s).get_configuration()
+    assert err == "" and cfg["time_zone"]["utc_offset"] == "+02:00", body
+
+# A single visit reports its status, so "gone" is distinguishable.
+s = FakeSession([FakeResponse(404, None, text="not found")])
+visit, err, status = make_client(s).get_scheduled_visit(55)
+assert visit is None and status == 404 and s.calls[0][1].endswith("/55")
+s = FakeSession([FakeResponse(200, {"data": [{"id": 55}]})])
+visit, err, status = make_client(s).get_scheduled_visit(55)
+assert visit == {"id": 55} and status == 200
+
 client = SkynamoClient("acme", "secret-key")
 assert client.session.headers["X-API-CLIENT"] == "acme"
 assert client.session.headers["X-API-KEY"] == "secret-key"

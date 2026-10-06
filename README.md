@@ -405,6 +405,59 @@ for removals: `product_code, matched_product, filename, file_guid, status, notes
 
 ---
 
+## 6b. Route planning
+
+The **Route Planning** page works out which customers each rep is due to visit,
+splits them into day routes for a week, and puts each day in a sensible order.
+
+**Who is due** comes from Skynamo's visit frequencies ("once every 2 weeks")
+and each customer's visit history. "Twice a week" means *fewer than two visits
+in the last seven days*, not "every 3.5 days", and months are calendar months.
+Customers not due this week are not listed.
+
+**How to use it**
+
+1. **Setup**: connect (instance + API key, never saved). The first time, this
+   reads the whole visit history — the API offers no way to ask for less — and
+   shows how many requests that is before it starts. Later runs the same day
+   reuse a local cache.
+2. Set the week, working days, holidays and limits: hours per day, stops per
+   day, minutes on site, average speed and a road-winding factor.
+3. Give each rep a **start address** (their home or office) — or type `lat,lng`
+   to be exact. It is used as the start and end of every day, remembered on this
+   PC, and only ever sent to OpenStreetMap to look it up.
+4. **Plan routes** switches to **Results**: every visit with its day, order,
+   arrival and departure time — and every customer that couldn't be planned,
+   with the reason.
+5. **Save map & itinerary** writes one HTML page per plan — a route map for each
+   rep and day, a printable timetable, and Google Maps / Waze links. **Save CSV**
+   writes the same as a spreadsheet.
+
+**Why a customer might not be planned**
+
+| Status | Meaning |
+|---|---|
+| `over-capacity` | Due, but the week is full; the least overdue are left out first |
+| `out-of-range` | Over 300 km from the rep's start, or too far for a day trip — usually a bad pin |
+| `no-location` | No coordinates — fix it in Customer Geolocation |
+| `already-scheduled` | An open scheduled visit already covers it this week |
+| `customer-not-found` | Inactive, deleted, or not visible to this API key |
+| `invalid-frequency` | The visit-frequency record can't be planned from (e.g. 0 visits) |
+
+**Good to know**
+
+- Distances are **straight-line** estimates scaled for roads: free, offline,
+  and good for putting stops in the right order. They are not live traffic.
+- A pin marked approximate is planned but flagged, and its navigation links use
+  the customer's address instead of the pin.
+- Google Maps links hold up to nine stops each, so a long day becomes two or
+  three links that follow on from each other. Waze takes one stop per link.
+- **Writing the plan into Skynamo as scheduled visits is not built yet.** It
+  waits on `py diag_route_planning.py`, which measures how the API treats
+  scheduled-visit times and batches on a live instance first.
+
+---
+
 ## 7. The engine (skynamo_geo/engine.py)
 
 Two phases, so any UI can do **preview-then-commit**:
@@ -639,6 +692,25 @@ the whole store is empty, the tab tells you to run an extract first.
 ---
 
 ## 14. Change log
+
+- **v2.13.0** (2026-10-06) — **Route planning (read-only).** A new **Route
+  Planning** page plans a week of visits for several reps at once: who is due
+  (from visit frequencies and visit history), which day, in what order, and at
+  what time — with a printable map and itinerary, a CSV, and Google Maps / Waze
+  links. Nothing is written to Skynamo yet.
+  - Due dates follow how a frequency actually reads: "twice a week" is fewer
+    than two visits in the last seven days, not an interval; months are
+    calendar months.
+  - Each rep gets one tour that is then cut into days by an exact split, so a
+    rep starting from home off to one side still gets compact days rather than
+    long out-and-back wedges. Repeat visits to one customer are spaced apart.
+  - Every due customer is either planned or listed with the reason it isn't.
+  - New `diag_route_planning.py` measures what the API leaves undocumented —
+    the time-zone format, how scheduled-visit times are read, whether batch
+    writes are all-or-nothing, how big the visit history is — before any
+    scheduled visit is written.
+  - New `(value, error)` client reads with backoff on 429/503, since the visit
+    history can only be read by walking every page.
 
 - **v2.12.0** (2026-09-14) — **Reporting registry corrected against a live
   instance.** It had been written from a spec that declares the wrong response

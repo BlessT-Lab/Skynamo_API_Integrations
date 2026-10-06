@@ -35,6 +35,15 @@ try:
     assert app.tabview.tab("Manage Images") is not None
     assert app.tabview.tab("Reporting") is not None
     assert app.tabview.tab("Dashboards") is not None
+    assert app.tabview.tab("Route Planning") is not None
+    # Route Planning: nothing to plan or save until data is loaded
+    for btn in (app.route_plan_btn, app.route_map_btn, app.route_csv_btn,
+                app.route_open_btn, app.route_cancel_btn):
+        assert btn.cget("state") == "disabled"
+    assert app.route_connect_btn.cget("state") == "normal"
+    # the default week starts on a Monday
+    from datetime import date as _date
+    assert _date.fromisoformat(app.route_start_entry.get()).weekday() == 0
     # Geolocation tab: key widgets exist and start disabled
     assert app.preview_btn.cget("state") == "disabled"
     assert app.write_btn.cget("state") == "disabled"
@@ -95,12 +104,23 @@ try:
         "instance_name": "acme",
         "image_replace_existing": True,
         "image_move_processed": True,
+        "route_options": {"n_days": "4", "max_stops": "9",
+                          "weekdays": [0, 1, 2, 3, 5],
+                          "holidays": "2026-12-25", "count_any_rep": True},
     }
     app._load_saved_settings()
     app.update_idletasks()
     assert app.img_replace_var.get() is True
     assert app.img_move_var.get() is True
     assert app.img_instance_entry.get() == "acme"
+    assert app.route_days_entry.get() == "4"
+    assert app.route_stops_entry.get() == "9"
+    assert [v.get() for v in app.route_weekday_vars] ==         [True, True, True, True, False, True, False]
+    assert app.route_holidays_entry.get() == "2026-12-25"
+    assert app.route_anyrep_var.get() is True
+    # the form reads back into valid options
+    options, err = app._route_options()
+    assert err == "" and options.n_days == 4 and options.max_stops == 9
 
     app.destroy()
 finally:

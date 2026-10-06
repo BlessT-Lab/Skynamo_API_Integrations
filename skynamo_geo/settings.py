@@ -23,6 +23,17 @@ def _config_dir():
     return os.path.join(base, APP_NAME)
 
 
+def app_data_dir(*parts):
+    """A folder under the app's data directory, created if missing.
+
+    For things the app keeps between sessions that are not settings - route
+    plan records, the visit-history cache. Never credentials.
+    """
+    path = os.path.join(_config_dir(), *parts)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _config_path():
     return os.path.join(_config_dir(), "config.json")
 

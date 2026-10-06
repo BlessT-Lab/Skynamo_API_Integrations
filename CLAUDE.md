@@ -15,8 +15,12 @@ distinction matters constantly:
 3. **Reporting** — extracts business data (activities, customers, users, products, invoices) into a
    local SQLite store using bookmark deltas. *(Reporting API)*
 4. **Dashboards** — renders a self-contained HTML dashboard from that store. *(local only)*
+5. **Route planning** — works out which customers each rep is due to visit (from Skynamo's visit
+   frequencies and visit history), splits them into day routes for a week, orders each day, and
+   exports a map + itinerary, CSV and Google Maps/Waze links. *(Public API, read-only so far —
+   writing scheduled visits back is phase 2 and waits on `diag_route_planning.py`)*
 
-Ships as a CustomTkinter desktop GUI (five tabs) plus an interactive CLI. The CLI covers
+Ships as a CustomTkinter desktop GUI (six pages) plus an interactive CLI. The CLI covers
 geolocation, image import and image management (`geo`/`images`/`manage`, chosen by a menu or an
 argv shortcut); Reporting and Dashboards are GUI-only. See [README.md](README.md) for the full
 user-facing walkthrough and API reference.
@@ -51,7 +55,12 @@ py test_report_store.py                                      # SQLite schema/ups
 py test_report_engine.py                                     # extract plan/run (fake client, offline)
 py test_dashboard.py                                         # HTML dashboard render + escaping (offline)
 py test_diag_redaction.py                                    # asserts the auth diagnostic leaks no secrets (offline)
-py test_gui_smoke.py                                         # builds the GUI (all five tabs) and tears it down
+py test_visit_due.py                                         # when a customer is due, calendar maths, time zones (offline)
+py test_routing.py                                           # haversine, 2-opt, the day split vs brute force (offline)
+py test_route_engine.py                                      # load + plan a synthetic week (fake client, offline)
+py test_route_map.py                                         # nav links + the route map HTML (offline)
+py test_gui_smoke.py                                         # builds the GUI (all six pages) and tears it down
+py diag_route_planning.py                                     # route planning facts from a live instance (read-only, then asks before writing)
 py diag_image_upload.py                                       # diagnose a product-image upload failure (3 phases, asks before writing)
 py diag_reporting_auth.py                                    # diagnose a Reporting API auth failure (read-only, needs creds)
 py live_check_reporting.py                                   # verify entity payloads vs the registry (read-only, needs creds)
@@ -110,6 +119,28 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
 - `skynamo_geo/reports.py` — shared `summarize(items)` and `write_report(rows, path, fieldnames)`.
   All three engines re-export these; don't re-implement a CSV writer.
 
+### Route planning
+- `skynamo_geo/visit_due.py` — pure date logic: `occurrences()` (the visits a (customer, rep) pair
+  needs inside a window), `next_due`, `add_months`, `working_days`, and tolerant parsing of the
+  instance's `utc_offset` and of API datetimes.
+- `skynamo_geo/routing.py` — pure, stdlib-`math` route construction on index matrices:
+  `haversine_km`, `matrices`, `nearest_neighbour`, `two_opt`, `split_tour` (the day split),
+  `cheapest_insertion`, `assign_to_dates`. Knows nothing about customers or the API.
+- `skynamo_geo/route_engine.py` — `load_planning_data(client, ...)` (network, cancellable, **no
+  writes**: users, frequencies, customers, configuration, open scheduled visits, visit history) →
+  `build_route_plan(data, reps, options)` (**pure — no network at all**). Keeping the planner pure
+  is why changing a setting re-plans instantly, and why it is testable with no fake client.
+  `resolve_place` turns a typed start point ("lat,lng" or an address) into coordinates.
+  `RouteStop`/`RouteDay`/`RoutePlan` are the outputs; `RouteStop.error` is a stop's cause with no
+  per-stop specifics, like `ImagePlan.error`.
+- `skynamo_geo/route_map.py` — `build_route_html` (one self-contained page, inline SVG, no external
+  requests — same rule as the dashboard), `gmaps_links`, `waze_link`, `stop_link`. Must not import
+  `route_engine`; the engine imports it.
+- `SkynamoClient` gained `(value, error)` reads that never raise — `_fetch_all` (paging, de-dup by
+  id, backoff on 429/503 honouring `Retry-After`), `fetch_users`, `fetch_visit_frequencies`,
+  `fetch_scheduled_visits(created_since)`, `fetch_interactions_page`, `get_configuration`,
+  `get_scheduled_visit` — and the module-level `create_date_filter`.
+
 ### Reporting side (the second API)
 - `skynamo_geo/reporting_config.py` — **the single declaration of the Reporting API surface**:
   endpoints, the 21 reporting periods, `RATE_LIMIT_BY_PERIOD`, `STATUS_RPT_*`, and
@@ -161,6 +192,7 @@ state/queues/workers, distinguished by attribute prefix:
 | Tab | Prefix | Shares |
 |---|---|---|
 | Customer Geolocation | *(plain names)* | own `SkynamoClient` |
+| Route Planning | `route_*` / `_route_*` | own `SkynamoClient` + `PlanningData` |
 | Product Images | `img_*` / `_img_*` | `img_client` + `products` |
 | Manage Images | `mgmt_*` / `_mgmt_*` | reuses Product Images' client/products |
 | Reporting | `rpt_*` / `_rpt_*` | own `ReportingClient` + `ReportStore` |
@@ -295,6 +327,51 @@ never gets a stray database.
   minus the removed GUIDs — it detaches the file from the product; the underlying file object may
   still exist server-side. `GET /files/{guid}` (`client.get_file`) resolves a GUID to a filename for
   display, since a product's `files` array is only ever bare GUID strings.
+
+### Route planning rules
+- **"f visits every c periods" is a count-in-a-window rule, not an interval.** With W = c periods,
+  a customer is due on day d when fewer than f visits fall in (d − W, d]; with visits newest first
+  that is `next_due = v_f + W`. "Twice a week" is therefore *not* "every 3.5 days" — that books a
+  customer seen Monday and Tuesday last week. Months and years are calendar months (`add_months`
+  clamps 31 Jan → 28/29 Feb). The window is **rolling**, not calendar-bucketed — a decided
+  assumption; if Skynamo's own compliance reports bucket by calendar month, `visit_due` is the one
+  place to change.
+- **A repeat visit cannot go through the tour.** A "twice a week" customer contributes two stops at
+  the *same coordinates*, so a tour puts them side by side and the split books both visits the same
+  day. First visits go tour → split; later ones are inserted afterwards into a day at least
+  W/(2f) days from the customer's other visits.
+- **Split a tour; don't sweep.** One tour per rep (nearest neighbour + 2-opt), then `split_tour`
+  cuts it into days by dynamic programming. A polar sweep around the start only works when the
+  start is in the middle of the territory; a rep starting from home off to one side gets long thin
+  wedges and drives out and back every day. The split also enforces hour and stop limits exactly,
+  and a quadratic balance term stops a 9-hour day sitting next to a 2-hour one.
+  `test_routing` checks the split against brute force and 2-opt across 200 seeded cases — there is
+  no live oracle for "the best route", so the properties are the test.
+- **When the week is full, drop the least urgent — and prove it.** Priority is days overdue; every
+  first visit left unplanned has priority ≤ every first visit planned (asserted).
+- **Distances are straight-line × road factor ÷ speed.** Free, offline, and close enough to get the
+  *order* right; drive times are labelled as estimates everywhere they appear.
+- **`GET /interactions` takes no filter at all**, so last-visit-per-customer means walking the whole
+  history. Page 1 reports `total_item_count`, so the cost is shown before the walk; a same-day
+  re-run with an unchanged total uses the cache under `%APPDATA%/SkynamoGeo/route_history/`; there
+  is a hard request cap. Whether the walk can go backwards and stop early depends on id ordering,
+  which `diag_route_planning.py` measures — not assumed.
+- **Existing scheduled visits are only seen within a look-back.** `GET /scheduledvisits` filters on
+  `create_date`, never on due date, rep or customer, so a visit created more than
+  `ROUTE_SCHEDULED_LOOKBACK_DAYS` ago for a date inside the plan is invisible to the duplicate
+  check. Load keeps every open visit; the plan window is applied at build time, so changing the
+  week after connecting needs no refetch.
+- **An approximate pin navigates by address.** `is_approximate` or accuracy > 500 m flags the stop,
+  draws a dashed ring, and its Google Maps / Waze links use the address text (rebuilt from the
+  Geolocation tab's saved field roles) — coordinates would drive the rep to a suburb centroid.
+- **A rep's start address is personal data** — often their home. It is stored only in local
+  `config.json` (`route_reps`), sent only to OpenStreetMap to look it up, and never printed: maps
+  label it "Start".
+- **Phase 2 (writing scheduled visits) is not built yet, deliberately.** The datetime format the
+  API wants, whether a batch POST is all-or-nothing, whether the response echoes `comment`, and
+  whether reps get a notification per visit are all undocumented. `diag_route_planning.py` measures
+  them against a live instance; record its findings here before trusting the write path, as with
+  `content_hash`.
 
 ### Reporting API rules (all learned the hard way from the spec)
 - **Rate limits are the dominant design constraint**, and they scale *inversely* with how much data

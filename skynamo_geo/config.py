@@ -3,6 +3,11 @@
 API_BASE = "https://api.skynamo.me/v1"
 PAGE_SIZE = 200  # API maximum
 REQUEST_TIMEOUT = 30
+# The Public API documents no rate limit, but route planning walks the whole
+# interaction history (GET /interactions takes no filter at all), which can be
+# thousands of requests. Back off on 429/503 rather than fail the run.
+PUBLIC_API_MAX_RETRIES = 3
+PUBLIC_API_BACKOFF_SECONDS = 2.0
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Nominatim usage policy: identify your app and stay at/below 1 request/second.
@@ -145,4 +150,46 @@ IMAGE_REPORT_FIELDNAMES = [
 # Attached-image (manage/remove) report CSV column order
 ATTACHED_IMAGE_REPORT_FIELDNAMES = [
     "product_code", "matched_product", "filename", "file_guid", "status", "notes",
+]
+
+# --- Route planning --------------------------------------------------------
+# Distances are straight-line (haversine) x a road-winding factor at an
+# average speed: free, offline, and close enough to put stops in the right
+# ORDER. Drive times are estimates and are labelled as such.
+ROUTE_DEFAULT_DAYS = 5
+ROUTE_DEFAULT_WEEKDAYS = (0, 1, 2, 3, 4)      # Monday=0
+ROUTE_DEFAULT_DAY_START = "08:00"
+ROUTE_DEFAULT_MAX_HOURS = 9.0                  # travel + time on site
+ROUTE_DEFAULT_MAX_STOPS = 12
+ROUTE_DEFAULT_SERVICE_MINUTES = 30
+ROUTE_DEFAULT_ROAD_FACTOR = 1.3
+ROUTE_DEFAULT_SPEED_KMH = 50
+ROUTE_MIN_LEG_MINUTES = 3                      # two shops in one mall are not 0 min apart
+ROUTE_BALANCE_WEIGHT = 0.5                     # evens out long and short days
+ROUTE_MAX_RADIUS_KM = 300                      # a pin further than this from the start
+                                               # is almost always a bad coordinate
+ROUTE_FAR_START_KM = 100                       # warn: start is far from every customer
+ROUTE_APPROX_ACCURACY_M = 500                  # coarser than this = "approximate pin"
+
+# How far back to look for scheduled visits that already cover a customer.
+# GET /scheduledvisits filters on create_date only, never on due date, so a
+# visit created longer ago than this for a date inside the plan is not seen.
+ROUTE_SCHEDULED_LOOKBACK_DAYS = 180
+# Hard cap on /interactions requests in one history walk (it has no filter).
+ROUTE_MAX_HISTORY_REQUESTS = 2000
+
+# Route stop statuses
+STATUS_RT_PLANNED = "planned"
+STATUS_RT_ALREADY = "already-scheduled"        # an open visit already covers it
+STATUS_RT_NO_LOCATION = "no-location"          # customer has no coordinates
+STATUS_RT_OUT_OF_RANGE = "out-of-range"        # too far from the rep's start
+STATUS_RT_OVER_CAPACITY = "over-capacity"      # due, but the week is full
+STATUS_RT_INVALID_FREQ = "invalid-frequency"   # cannot plan from the record
+STATUS_RT_NOT_FOUND = "customer-not-found"     # inactive, deleted or not visible
+
+ROUTE_REPORT_FIELDNAMES = [
+    "rep", "user_id", "day", "sequence", "customer_id", "code", "name",
+    "status", "arrive", "depart", "leg_km", "leg_minutes", "due_date",
+    "overdue_days", "last_visit", "frequency", "latitude", "longitude",
+    "approximate", "google_maps", "waze", "notes",
 ]

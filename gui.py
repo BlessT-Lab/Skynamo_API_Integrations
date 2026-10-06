@@ -17,9 +17,10 @@ ever touched on the main thread (via each tab's queue-poll loop).
 
 import os
 import queue
+import re
 import threading
 import webbrowser
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from tkinter import ttk, filedialog
 
 import customtkinter as ctk
@@ -37,6 +38,10 @@ from skynamo_geo.reporting_config import (
     STATUS_RPT_PENDING, STATUS_RPT_SKIPPED,
 )
 from skynamo_geo.config import (
+    ROUTE_DEFAULT_DAY_START, ROUTE_DEFAULT_DAYS, ROUTE_DEFAULT_MAX_HOURS,
+    ROUTE_DEFAULT_MAX_STOPS, ROUTE_DEFAULT_ROAD_FACTOR,
+    ROUTE_DEFAULT_SERVICE_MINUTES, ROUTE_DEFAULT_SPEED_KMH,
+    STATUS_RT_OUT_OF_RANGE, STATUS_RT_OVER_CAPACITY, STATUS_RT_PLANNED,
     IMAGE_FOLDER_FAILED, IMAGE_FOLDER_SUCCESS,
     STATUS_UPDATED, STATUS_UPDATED_LOW_CONF, STATUS_SKIPPED_HAS_COORDS,
     STATUS_SKIPPED_NO_ADDRESS, STATUS_GEOCODE_FAILED, STATUS_UPDATE_FAILED,
@@ -49,6 +54,12 @@ from skynamo_geo.config import (
 from skynamo_geo.customers import build_query, collect_custom_field_names
 from skynamo_geo.products import product_code as product_code_of
 from skynamo_geo.geocoder import NominatimGeocoder, GeocodeError
+from skynamo_geo.route_engine import (
+    RepInput, RouteOptions, build_route_plan, load_planning_data,
+    resolve_place, write_report as write_route_report,
+)
+from skynamo_geo.route_map import build_route_html
+from skynamo_geo.visit_due import parse_holidays, parse_utc_offset
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -271,6 +282,18 @@ class App(ctk.CTk):
         self.cancel_event = threading.Event()
         self.worker = None
 
+        # ----- Route Planning tab state -----
+        self.route_client = None
+        self.route_instance = ""
+        self.route_data = None          # PlanningData from the last connect
+        self.route_plan = None          # RoutePlan from the last Plan
+        self.route_map_path = None
+        self.route_rep_rows = {}        # user id -> {name, var, entry, status}
+        self.route_rep_points = {}      # user id -> {address, point, note}
+        self.route_queue = queue.Queue()
+        self.route_cancel_event = threading.Event()
+        self.route_worker = None
+
         # ----- Product Images tab state -----
         self.img_client = None
         self.products = []
@@ -321,6 +344,7 @@ class App(ctk.CTk):
         self.tabview = SidebarNav(self, footer=f"v{__version__}")
         self.tabview.grid(row=0, column=0, sticky="nsew")
         self._build_geo_tab(self.tabview.add("Customer Geolocation"))
+        self._build_route_tab(self.tabview.add("Route Planning"))
         self._build_image_tab(self.tabview.add("Product Images"))
         self._build_manage_tab(self.tabview.add("Manage Images"))
         self._build_reporting_tab(self.tabview.add("Reporting"))
@@ -661,6 +685,7 @@ class App(ctk.CTk):
         if saved_entities:
             for name, var in self.rpt_entity_vars.items():
                 var.set(name in saved_entities)
+        self._load_route_settings(cfg)
         # API keys are never remembered; purge any an older version stored.
         settings.purge_saved_credentials(cfg.get("instance_name"))
 
@@ -1015,6 +1040,702 @@ class App(ctk.CTk):
     # ====================================================================
     # Product Images tab
     # ====================================================================
+
+    # =====================================================================
+    # Route Planning
+    # =====================================================================
+
+    def _build_route_tab(self, parent):
+        # Setup and Results are two views of one page, not one tall stack: the
+        # stack left the results table zero rows tall at the minimum window
+        # size, and results are what the page is for.
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+
+        header = ctk.CTkFrame(parent, fg_color="transparent")
+        header.grid(row=0, column=0, padx=16, pady=(14, 4), sticky="ew")
+        ctk.CTkLabel(header, text="Route Planning",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     text_color=TEXT).pack(side="left")
+        ctk.CTkLabel(header,
+                     text="who is due · which day · in what order",
+                     font=ctk.CTkFont(size=12),
+                     text_color=TEXT_MUTED).pack(side="left", padx=(12, 0),
+                                                 pady=(4, 0))
+        self.route_view = ctk.CTkSegmentedButton(
+            header, values=["Setup", "Results"], command=self._route_show,
+            fg_color=FIELD, selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER, unselected_color=FIELD,
+            unselected_hover_color=BORDER, text_color=TEXT,
+            font=ctk.CTkFont(size=12, weight="bold"))
+        self.route_view.pack(side="right")
+
+        body = ctk.CTkFrame(parent, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew")
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        # ================= Setup view =================
+        setup = ctk.CTkFrame(body, fg_color="transparent")
+        setup.grid(row=0, column=0, sticky="nsew")
+        setup.grid_columnconfigure(0, weight=1)
+        setup.grid_rowconfigure(1, weight=1)
+        self.route_setup_view = setup
+
+        top = ctk.CTkFrame(setup, fg_color="transparent")
+        top.grid(row=0, column=0, padx=16, pady=(6, 6), sticky="ew")
+        top.grid_columnconfigure(0, weight=1)
+        top.grid_columnconfigure(1, weight=2)
+
+        conn = self._card(top)
+        conn.grid(row=0, column=0, padx=(0, 8), sticky="nsew")
+        conn.grid_columnconfigure(0, weight=1)
+        self._section_title(conn, "Connection").grid(
+            row=0, column=0, padx=14, pady=(12, 6), sticky="w")
+        for r, (text, attr, show) in enumerate((
+                ("Instance name", "route_instance_entry", None),
+                ("Skynamo API key", "route_key_entry", "*")), start=1):
+            box = ctk.CTkFrame(conn, fg_color="transparent")
+            box.grid(row=r, column=0, padx=14, pady=(0, 6), sticky="ew")
+            box.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(box, text=text, anchor="w", text_color=TEXT_MUTED,
+                         font=ctk.CTkFont(size=12)).grid(row=0, column=0,
+                                                         sticky="w")
+            entry = ctk.CTkEntry(box, show=show, height=30, corner_radius=8,
+                                 fg_color=FIELD, border_color=BORDER,
+                                 border_width=1, text_color=TEXT)
+            entry.grid(row=1, column=0, sticky="ew")
+            setattr(self, attr, entry)
+        self.route_connect_btn = self._button(
+            conn, "Connect", self.on_route_connect)
+        self.route_connect_btn.grid(row=3, column=0, padx=14, pady=(6, 14),
+                                    sticky="ew")
+
+        week = self._card(top)
+        week.grid(row=0, column=1, padx=(8, 0), sticky="nsew")
+        for col in range(4):
+            week.grid_columnconfigure(col, weight=1, uniform="wk")
+        self._section_title(week, "Week and limits").grid(
+            row=0, column=0, columnspan=4, padx=14, pady=(12, 4), sticky="w")
+        fields = [
+            ("Week of", "route_start_entry"),
+            ("Working days", "route_days_entry"),
+            ("Day starts", "route_daystart_entry"),
+            ("Max hours", "route_hours_entry"),
+            ("Max stops", "route_stops_entry"),
+            ("Minutes on site", "route_service_entry"),
+            ("Speed km/h", "route_speed_entry"),
+            ("Road factor", "route_road_entry"),
+        ]
+        for i, (text, attr) in enumerate(fields):
+            box = ctk.CTkFrame(week, fg_color="transparent")
+            box.grid(row=1 + i // 4, column=i % 4,
+                     padx=(14 if i % 4 == 0 else 4, 14 if i % 4 == 3 else 4),
+                     pady=(0, 6), sticky="ew")
+            box.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(box, text=text, anchor="w", text_color=TEXT_MUTED,
+                         font=ctk.CTkFont(size=12)).grid(row=0, column=0,
+                                                         sticky="w")
+            entry = ctk.CTkEntry(box, height=30, corner_radius=8,
+                                 fg_color=FIELD, border_color=BORDER,
+                                 border_width=1, text_color=TEXT)
+            entry.grid(row=1, column=0, sticky="ew")
+            setattr(self, attr, entry)
+
+        days_row = ctk.CTkFrame(week, fg_color="transparent")
+        days_row.grid(row=3, column=0, columnspan=4, padx=14, pady=(2, 2),
+                      sticky="w")
+        self.route_weekday_vars = []
+        for i, name in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
+                                  "Sun")):
+            var = ctk.BooleanVar(value=i < 5)
+            ctk.CTkCheckBox(days_row, text=name, variable=var, width=54,
+                            checkbox_width=16, checkbox_height=16,
+                            corner_radius=4, border_color=BORDER,
+                            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                            text_color=TEXT,
+                            font=ctk.CTkFont(size=12)).pack(side="left")
+            self.route_weekday_vars.append(var)
+
+        hol = ctk.CTkFrame(week, fg_color="transparent")
+        hol.grid(row=4, column=0, columnspan=4, padx=14, pady=(4, 2),
+                 sticky="ew")
+        hol.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(hol, text="Holidays", text_color=TEXT_MUTED,
+                     font=ctk.CTkFont(size=12)).grid(row=0, column=0,
+                                                     padx=(0, 8), sticky="w")
+        self.route_holidays_entry = ctk.CTkEntry(
+            hol, height=28, corner_radius=8, fg_color=FIELD,
+            border_color=BORDER, border_width=1, text_color=TEXT,
+            placeholder_text="2026-12-25, 2026-12-26")
+        self.route_holidays_entry.grid(row=0, column=1, sticky="ew")
+
+        self.route_anyrep_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            week, text="A visit by any rep counts towards the frequency",
+            variable=self.route_anyrep_var, checkbox_width=16,
+            checkbox_height=16, corner_radius=4, border_color=BORDER,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=TEXT,
+            font=ctk.CTkFont(size=12)).grid(
+            row=5, column=0, columnspan=4, padx=14, pady=(4, 12), sticky="w")
+
+        # defaults; saved settings overwrite them in _load_saved_settings
+        self.route_start_entry.insert(0, self._next_monday().isoformat())
+        for entry, value in (
+                (self.route_days_entry, ROUTE_DEFAULT_DAYS),
+                (self.route_daystart_entry, ROUTE_DEFAULT_DAY_START),
+                (self.route_hours_entry, ROUTE_DEFAULT_MAX_HOURS),
+                (self.route_stops_entry, ROUTE_DEFAULT_MAX_STOPS),
+                (self.route_service_entry, ROUTE_DEFAULT_SERVICE_MINUTES),
+                (self.route_speed_entry, ROUTE_DEFAULT_SPEED_KMH),
+                (self.route_road_entry, ROUTE_DEFAULT_ROAD_FACTOR)):
+            entry.insert(0, str(value))
+
+        reps = self._card(setup)
+        reps.grid(row=1, column=0, padx=16, pady=6, sticky="nsew")
+        reps.grid_columnconfigure(0, weight=1)
+        reps.grid_rowconfigure(1, weight=1)
+        title_row = ctk.CTkFrame(reps, fg_color="transparent")
+        title_row.grid(row=0, column=0, padx=14, pady=(12, 4), sticky="ew")
+        self._section_title(title_row, "Reps and where their day starts").pack(
+            side="left")
+        ctk.CTkLabel(title_row,
+                     text="an address, or lat,lng · used as start and end",
+                     text_color=TEXT_MUTED, font=ctk.CTkFont(size=12)).pack(
+            side="left", padx=(10, 0))
+        # Fixed height: a scrollable frame's natural size would otherwise force
+        # the page tall (the same fix as the Geolocation field list).
+        holder = ctk.CTkFrame(reps, fg_color="transparent", height=150)
+        holder.grid(row=1, column=0, padx=14, pady=(0, 12), sticky="new")
+        holder.grid_propagate(False)
+        holder.grid_rowconfigure(0, weight=1)
+        holder.grid_columnconfigure(0, weight=1)
+        self.route_reps_frame = ctk.CTkScrollableFrame(
+            holder, fg_color=FIELD, corner_radius=10)
+        self.route_reps_frame.grid(row=0, column=0, sticky="nsew")
+        self.route_reps_frame.grid_columnconfigure(2, weight=1)
+        self._route_reps_placeholder()
+
+        # ================= Results view =================
+        results = self._card(body)
+        results.grid(row=0, column=0, padx=16, pady=6, sticky="nsew")
+        results.grid_rowconfigure(0, weight=1)
+        results.grid_columnconfigure(0, weight=1)
+        self.route_results_view = results
+        columns = ("rep", "day", "seq", "customer", "arrive", "leave", "km",
+                   "status", "notes")
+        self.route_tree = ttk.Treeview(results, columns=columns,
+                                       show="headings", style="Dark.Treeview")
+        for col, (text, width) in {
+                "rep": ("Rep", 110), "day": ("Day", 90), "seq": ("#", 34),
+                "customer": ("Customer", 170), "arrive": ("Arrive", 56),
+                "leave": ("Leave", 56), "km": ("km", 46),
+                "status": ("Status", 104), "notes": ("Notes", 200)}.items():
+            self.route_tree.heading(col, text=text)
+            self.route_tree.column(
+                col, width=width, minwidth=34,
+                anchor="center" if col in ("seq", "arrive", "leave", "km")
+                else "w")
+        self.route_tree.tag_configure("low", background=ROW_WARN_BG,
+                                      foreground=ROW_WARN_FG)
+        self.route_tree.tag_configure("skip", foreground=ROW_MUTED_FG)
+        self.route_tree.grid(row=0, column=0, padx=(10, 0), pady=10,
+                             sticky="nsew")
+        yscroll = ttk.Scrollbar(results, orient="vertical",
+                                command=self.route_tree.yview,
+                                style="Dark.Vertical.TScrollbar")
+        self.route_tree.configure(yscrollcommand=yscroll.set)
+        yscroll.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="ns")
+        results.grid_remove()
+
+        # ================= Shared: actions + status =================
+        actions = self._card(parent)
+        actions.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
+        self.route_plan_btn = self._button(
+            actions, "Plan routes", self.on_route_plan, state="disabled",
+            fg_color=GREEN, hover_color=GREEN_HOVER)
+        self.route_plan_btn.pack(side="left", padx=(12, 6), pady=10)
+        self.route_cancel_btn = self._button(
+            actions, "Cancel", self.on_route_cancel, state="disabled",
+            fg_color=RED, width=90)
+        self.route_cancel_btn.pack(side="left", padx=6, pady=10)
+        self.route_map_btn = self._button(
+            actions, "Save map & itinerary", self.on_route_save_map,
+            state="disabled", fg_color=FIELD, hover_color=BORDER)
+        self.route_map_btn.pack(side="left", padx=6, pady=10)
+        self.route_csv_btn = self._button(
+            actions, "Save CSV", self.on_route_save_csv, state="disabled",
+            fg_color=FIELD, hover_color=BORDER, width=100)
+        self.route_csv_btn.pack(side="left", padx=6, pady=10)
+        self.route_open_btn = self._button(
+            actions, "Open map", self.on_route_open_map, state="disabled",
+            fg_color=FIELD, hover_color=BORDER, width=100)
+        self.route_open_btn.pack(side="right", padx=(6, 12), pady=10)
+
+        bottom = self._card(parent)
+        bottom.grid(row=3, column=0, padx=16, pady=(6, 14), sticky="ew")
+        bottom.grid_columnconfigure(0, weight=1)
+        self.route_progress = ctk.CTkProgressBar(
+            bottom, progress_color=ACCENT, fg_color=FIELD, height=8,
+            corner_radius=4)
+        self.route_progress.set(0)
+        self.route_progress.grid(row=0, column=0, padx=14, pady=(12, 4),
+                                 sticky="ew")
+        self.route_status_label = self._wrap_to_width(ctk.CTkLabel(
+            bottom, text="Connect to load reps, visit frequencies and history.",
+            anchor="w", wraplength=980, justify="left", text_color=TEXT))
+        self.route_status_label.grid(row=1, column=0, padx=14, pady=2,
+                                     sticky="ew")
+        self.route_log = LogPanel(bottom)
+        self.route_log.grid(row=2, column=0, padx=14, pady=(2, 12), sticky="ew")
+
+        self.route_view.set("Setup")
+
+    def _route_show(self, view):
+        """Switch between the Setup and Results views."""
+        show, hide = ((self.route_results_view, self.route_setup_view)
+                      if view == "Results"
+                      else (self.route_setup_view, self.route_results_view))
+        hide.grid_remove()
+        show.grid()
+        self.route_view.set(view)
+
+    @staticmethod
+    def _next_monday(today=None):
+        today = today or datetime.now().date()
+        return today + timedelta(days=(7 - today.weekday()) % 7 or 7)
+
+    def _route_reps_placeholder(self):
+        for child in self.route_reps_frame.winfo_children():
+            child.destroy()
+        ctk.CTkLabel(self.route_reps_frame,
+                     text="Connect to list the reps who have visit frequencies.",
+                     text_color=TEXT_MUTED).grid(row=0, column=0, padx=10,
+                                                 pady=10, sticky="w")
+
+    # -- Route logging / status / plumbing --------------------------------
+
+    def route_log_line(self, text):
+        self.route_log.insert("end", text + "\n")
+        self.route_log.see("end")
+
+    def route_set_status(self, text):
+        self.route_status_label.configure(text=text)
+
+    def _route_start_worker(self, target):
+        self.route_cancel_event.clear()
+        self._route_set_busy(True)
+        self.route_worker = threading.Thread(target=target, daemon=True)
+        self.route_worker.start()
+        self.after(100, self._route_poll_queue)
+
+    def _route_poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.route_queue.get_nowait()
+                if kind == "progress":
+                    self._route_on_progress(payload)
+                elif kind == "log":
+                    self.route_log_line(payload)
+                elif kind == "status":
+                    self.route_set_status(payload)
+                elif kind == "done":
+                    payload()
+                    self._route_set_busy(False)
+                    return
+                elif kind == "error":
+                    self.route_log.alert(f"ERROR: {payload}")
+                    self.route_set_status("Error - see log.")
+                    self._route_set_busy(False)
+                    return
+        except queue.Empty:
+            pass
+        self.after(100, self._route_poll_queue)
+
+    def _route_on_progress(self, ev):
+        if ev.get("total"):
+            self.route_progress.set(min(1.0, ev["index"] / ev["total"]))
+        if ev.get("message"):
+            self.route_set_status(ev["message"])
+            if ev.get("status") in ("estimate", "cached") or ev["phase"] == "plan":
+                self.route_log_line(ev["message"])
+        elif ev.get("total"):
+            self.route_set_status(f"{ev['phase'].title()} "
+                                  f"{ev['index']}/{ev['total']}")
+
+    def _route_set_busy(self, busy):
+        buttons = (self.route_connect_btn, self.route_plan_btn,
+                   self.route_map_btn, self.route_csv_btn, self.route_open_btn)
+        self.route_cancel_btn.configure(state="normal" if busy else "disabled")
+        if busy:
+            for btn in buttons:
+                btn.configure(state="disabled")
+            return
+        self.route_connect_btn.configure(state="normal")
+        if self.route_data is not None:
+            self.route_plan_btn.configure(state="normal")
+        if self.route_plan is not None:
+            self.route_map_btn.configure(state="normal")
+            self.route_csv_btn.configure(state="normal")
+        if self.route_map_path:
+            self.route_open_btn.configure(state="normal")
+
+    def on_route_cancel(self):
+        self.route_cancel_event.set()
+        self.route_set_status("Cancelling...")
+        self.route_log_line("Cancel requested - stopping after the current step.")
+
+    # -- Reading the form (main thread only) -------------------------------
+
+    def _route_options(self, tz=None):
+        """RouteOptions from the form, or (None, reason)."""
+        try:
+            start = date.fromisoformat(self.route_start_entry.get().strip())
+        except ValueError:
+            return None, "Week starting must be a date like 2026-10-12."
+        try:
+            n_days = int(self.route_days_entry.get())
+            max_hours = float(self.route_hours_entry.get())
+            max_stops = int(self.route_stops_entry.get())
+            service = float(self.route_service_entry.get())
+            speed = float(self.route_speed_entry.get())
+            road = float(self.route_road_entry.get())
+        except ValueError:
+            return None, "Days, hours, stops, minutes, speed and road factor " \
+                         "must be numbers."
+        if not (1 <= n_days <= 31 and 0 < max_hours <= 24 and max_stops >= 1
+                and service >= 0 and speed > 0 and road >= 1):
+            return None, "One of the limits is out of range."
+        weekdays = [i for i, v in enumerate(self.route_weekday_vars) if v.get()]
+        if not weekdays:
+            return None, "Tick at least one working day."
+        holidays, bad = parse_holidays(self.route_holidays_entry.get())
+        if bad:
+            return None, f"Not a date: {', '.join(bad)}"
+        cfg = settings.load_config()
+        roles = [(name, (cfg.get("field_roles") or {}).get(name, DEFAULT_ROLE))
+                 for name in cfg.get("address_fields") or []]
+        return RouteOptions(
+            start, n_days=n_days, weekdays=weekdays, holidays=holidays,
+            day_start=self.route_daystart_entry.get(), max_hours=max_hours,
+            max_stops=max_stops, service_minutes=service, road_factor=road,
+            speed_kmh=speed, count_any_rep=self.route_anyrep_var.get(), tz=tz,
+            address_roles=roles), ""
+
+    def _route_rep_inputs(self):
+        """[(user_id, name, include, address_text)] - snapshot of the form."""
+        return [(uid, row["name"], row["var"].get(), row["entry"].get().strip())
+                for uid, row in self.route_rep_rows.items()]
+
+    # -- Step 1: connect and load ------------------------------------------
+
+    def on_route_connect(self):
+        instance = self.route_instance_entry.get().strip()
+        key = self.route_key_entry.get().strip()
+        if not (instance and key):
+            self.route_set_status("Enter the instance name and API key first.")
+            return
+        options, error = self._route_options()
+        if options is None:
+            self.route_set_status(error)
+            return
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", instance) or "instance"
+        cache = os.path.join(settings.app_data_dir("route_history"),
+                             f"{safe}.json")
+        self.route_log_line(f"Connecting to '{instance}'...")
+        self.route_progress.set(0)
+
+        def work():
+            try:
+                client = SkynamoClient(instance, key)
+                ok, message = client.test_connection()
+                if not ok:
+                    self.route_queue.put(("error", message))
+                    return
+                data, err = load_planning_data(
+                    client, options, cache_path=cache,
+                    on_progress=lambda ev: self.route_queue.put(("progress", ev)),
+                    should_cancel=self.route_cancel_event.is_set)
+                if err:
+                    self.route_queue.put(("error", err))
+                    return
+
+                def finish():
+                    self.route_client = client
+                    self.route_instance = instance
+                    self.route_data = data
+                    self._route_populate_reps(data, instance)
+                    reps = len(self.route_rep_rows)
+                    self.route_log_line(data.history_note)
+                    self.route_set_status(
+                        f"Loaded {len(data.frequencies)} visit frequencies for "
+                        f"{reps} rep(s). Fill in start addresses, then Plan.")
+                    self._persist_route_settings()
+                self.route_queue.put(("done", finish))
+            except Exception as exc:
+                self.route_queue.put(("error", str(exc)))
+
+        self._route_start_worker(work)
+
+    def _route_populate_reps(self, data, instance):
+        for child in self.route_reps_frame.winfo_children():
+            child.destroy()
+        self.route_rep_rows = {}
+        names = {u.get("id"): (u.get("display_name") or u.get("user_name")
+                               or f"User {u.get('id')}")
+                 for u in data.users}
+        counts = {}
+        for rec in data.frequencies:
+            counts[rec.get("user_id")] = counts.get(rec.get("user_id"), 0) + 1
+        saved = (settings.load_config().get("route_reps") or {}).get(instance, {})
+        if not counts:
+            ctk.CTkLabel(self.route_reps_frame,
+                         text="No visit frequencies on this instance - there "
+                              "is nothing due to plan.",
+                         text_color=TEXT_MUTED).grid(row=0, column=0, padx=10,
+                                                     pady=10, sticky="w")
+            return
+        ordered = sorted(counts, key=lambda uid: str(names.get(uid, uid)))
+        for r, uid in enumerate(ordered):
+            remembered = saved.get(str(uid)) or {}
+            var = ctk.BooleanVar(value=remembered.get("include", True))
+            ctk.CTkCheckBox(self.route_reps_frame, text="", variable=var,
+                            width=24, checkbox_width=16, checkbox_height=16,
+                            corner_radius=4, border_color=BORDER,
+                            fg_color=ACCENT, hover_color=ACCENT_HOVER).grid(
+                row=r, column=0, padx=(8, 2), pady=3, sticky="w")
+            ctk.CTkLabel(self.route_reps_frame,
+                         text=f"{names.get(uid, uid)} ({counts[uid]})",
+                         anchor="w", width=170, text_color=TEXT).grid(
+                row=r, column=1, padx=(0, 8), pady=3, sticky="w")
+            entry = ctk.CTkEntry(self.route_reps_frame, height=28,
+                                 corner_radius=8, fg_color=CARD,
+                                 border_color=BORDER, border_width=1,
+                                 text_color=TEXT,
+                                 placeholder_text="start address or lat,lng")
+            if remembered.get("address"):
+                entry.insert(0, remembered["address"])
+            entry.grid(row=r, column=2, padx=(0, 8), pady=3, sticky="ew")
+            status = ctk.CTkLabel(self.route_reps_frame, text="", anchor="w",
+                                  width=150, text_color=TEXT_MUTED,
+                                  font=ctk.CTkFont(size=12))
+            status.grid(row=r, column=3, padx=(0, 8), pady=3, sticky="w")
+            self.route_rep_rows[uid] = {"name": names.get(uid, str(uid)),
+                                        "var": var, "entry": entry,
+                                        "status": status}
+            if remembered.get("lat") is not None and remembered.get("address"):
+                self.route_rep_points[uid] = {
+                    "address": remembered["address"],
+                    "point": (remembered["lat"], remembered["lng"]),
+                    "note": "remembered"}
+                status.configure(text="remembered")
+
+    # -- Step 2: plan --------------------------------------------------------
+
+    def on_route_plan(self):
+        if self.route_data is None:
+            self.route_set_status("Connect and load data first.")
+            return
+        tz = parse_utc_offset(((self.route_data.configuration or {})
+                               .get("time_zone") or {}).get("utc_offset"))
+        options, error = self._route_options(tz=tz)
+        if options is None:
+            self.route_set_status(error)
+            return
+        inputs = self._route_rep_inputs()          # snapshot, main thread
+        known = {uid: dict(v) for uid, v in self.route_rep_points.items()}
+        data = self.route_data
+        instance = self.route_instance
+        self.route_log_line(
+            f"Planning {options.n_days} day(s) from {options.start_date} "
+            f"({'instance time zone' if tz else 'this PC’s time zone'}).")
+
+        def work():
+            try:
+                geocoder = None
+                points, notes, reps = {}, {}, []
+                for i, (uid, name, include, text) in enumerate(inputs, 1):
+                    if not include:
+                        continue
+                    have = known.get(uid)
+                    if have and have["address"] == text and have.get("point"):
+                        point, note, err = have["point"], have["note"], ""
+                    else:
+                        if text and not resolve_place(text)[0] and geocoder is None:
+                            geocoder = NominatimGeocoder()
+                        point, note, err = resolve_place(text, geocoder)
+                        self.route_queue.put(("progress", {
+                            "phase": "geocode", "index": i, "total": len(inputs),
+                            "name": name, "status": "", "message": ""}))
+                    if self.route_cancel_event.is_set():
+                        self.route_queue.put(("error", "Cancelled"))
+                        return
+                    points[uid] = {"address": text, "point": point,
+                                   "note": note or err}
+                    notes[uid] = note or err
+                    reps.append(RepInput(uid, name, point))
+                plan = build_route_plan(
+                    data, reps, options, instance=instance,
+                    on_progress=lambda ev: self.route_queue.put(("progress", ev)),
+                    should_cancel=self.route_cancel_event.is_set)
+
+                def finish():
+                    for uid, info in points.items():
+                        self.route_rep_points[uid] = info
+                        row = self.route_rep_rows.get(uid)
+                        if row:
+                            row["status"].configure(
+                                text=(notes.get(uid) or "")[:40],
+                                text_color=TEXT_MUTED if info["point"] else RED)
+                    self.route_plan = plan
+                    self.route_map_path = None
+                    self._route_populate_tree(plan)
+                    self._route_show("Results")
+                    self._route_report(plan)
+                    self._persist_route_settings()
+                self.route_queue.put(("done", finish))
+            except GeocodeError as exc:
+                self.route_queue.put(("error", f"Address lookup blocked: {exc}"))
+            except Exception as exc:
+                self.route_queue.put(("error", str(exc)))
+
+        self._route_start_worker(work)
+
+    def _route_populate_tree(self, plan):
+        self.route_tree.delete(*self.route_tree.get_children())
+        for s in plan.stops:
+            if s.status == STATUS_RT_PLANNED:
+                tag = ""
+            elif s.status in (STATUS_RT_OVER_CAPACITY, STATUS_RT_OUT_OF_RANGE):
+                tag = "low"
+            else:
+                tag = "skip"
+            self.route_tree.insert("", "end", tags=(tag,) if tag else (), values=(
+                s.rep_name, s.day.strftime("%a %d %b") if s.day else "",
+                s.sequence or "", s.name,
+                s.arrive.strftime("%H:%M") if s.arrive else "",
+                s.depart.strftime("%H:%M") if s.depart else "",
+                f"{s.leg_km:.1f}" if s.day else "", s.status, s.notes))
+
+    def _route_report(self, plan):
+        """Summarise the plan on the status line; reasons go to the log."""
+        planned = plan.planned()
+        unplanned = [s for s in plan.stops if s.status != STATUS_RT_PLANNED]
+        reps = len({d.user_id for d in plan.days})
+        km = sum(d.km for d in plan.days)
+        headline = (f"Planned {len(planned)} visit(s) for {reps} rep(s) over "
+                    f"{len(plan.days)} rep-day(s), about {km:,.0f} km.")
+        if unplanned:
+            headline += f" {len(unplanned)} not planned - see the log."
+        self.route_set_status(headline)
+        self.route_log_line(headline)
+        causes = {}
+        for s in unplanned:
+            causes[s.error or s.status] = causes.get(s.error or s.status, 0) + 1
+        for cause, n in sorted(causes.items(), key=lambda kv: -kv[1]):
+            self.route_log_line(f"  - {n} x {cause}")
+        for warning in plan.warnings:
+            self.route_log_line(f"  ! {warning}")
+        # Warnings are things to act on (a far-off start, no address), so the
+        # log opens for them; an over-full week is an expected outcome.
+        if any(not w.startswith("Visits already scheduled") for w in plan.warnings):
+            self.route_log.expand()
+
+    # -- Step 3: outputs -------------------------------------------------------
+
+    def on_route_save_map(self):
+        if self.route_plan is None:
+            return
+        start = self.route_plan.dates[0] if self.route_plan.dates else date.today()
+        path = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            initialfile=f"route_plan_{start:%Y%m%d}.html",
+            filetypes=[("Web page", "*.html"), ("All files", "*.*")])
+        if not path:
+            return
+        build_route_html(self.route_plan, path,
+                         title=f"Route plan - week of {start:%d %b %Y}")
+        self.route_map_path = path
+        self.route_open_btn.configure(state="normal")
+        self.route_log_line(f"Map and itinerary saved to: {path}")
+        self.route_set_status(f"Saved {path}")
+
+    def on_route_open_map(self):
+        if self.route_map_path:
+            webbrowser.open("file:///" + os.path.abspath(self.route_map_path))
+
+    def on_route_save_csv(self):
+        if self.route_plan is None:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile=f"route_plan_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        write_route_report([s.to_report_row() for s in self.route_plan.stops],
+                           path)
+        self.route_log_line(f"CSV saved to: {path}")
+        self.route_set_status(f"Saved {path}")
+
+    def _persist_route_settings(self):
+        """Plan settings and each rep's start point - never the API key.
+
+        A rep's start address is often their home, so it stays here on this PC
+        in config.json; it is only ever sent to OpenStreetMap to look it up.
+        """
+        if not self.remember_var.get():
+            return
+        cfg = settings.load_config()
+        cfg["instance_name"] = self.route_instance_entry.get().strip()
+        cfg["route_options"] = {
+            "n_days": self.route_days_entry.get().strip(),
+            "day_start": self.route_daystart_entry.get().strip(),
+            "max_hours": self.route_hours_entry.get().strip(),
+            "max_stops": self.route_stops_entry.get().strip(),
+            "service_minutes": self.route_service_entry.get().strip(),
+            "speed_kmh": self.route_speed_entry.get().strip(),
+            "road_factor": self.route_road_entry.get().strip(),
+            "weekdays": [i for i, v in enumerate(self.route_weekday_vars)
+                         if v.get()],
+            "holidays": self.route_holidays_entry.get().strip(),
+            "count_any_rep": self.route_anyrep_var.get(),
+        }
+        if self.route_instance and self.route_rep_rows:
+            per = (cfg.get("route_reps") or {})
+            mine = {}
+            for uid, row in self.route_rep_rows.items():
+                info = self.route_rep_points.get(uid) or {}
+                point = info.get("point")
+                text = row["entry"].get().strip()
+                mine[str(uid)] = {
+                    "address": text, "include": row["var"].get(),
+                    "lat": point[0] if point and info.get("address") == text else None,
+                    "lng": point[1] if point and info.get("address") == text else None,
+                }
+            per[self.route_instance] = mine
+            cfg["route_reps"] = per
+        settings.save_config(cfg)
+
+    def _load_route_settings(self, cfg):
+        saved = cfg.get("route_options") or {}
+        for key, entry in (("n_days", self.route_days_entry),
+                           ("day_start", self.route_daystart_entry),
+                           ("max_hours", self.route_hours_entry),
+                           ("max_stops", self.route_stops_entry),
+                           ("service_minutes", self.route_service_entry),
+                           ("speed_kmh", self.route_speed_entry),
+                           ("road_factor", self.route_road_entry),
+                           ("holidays", self.route_holidays_entry)):
+            if saved.get(key) not in (None, ""):
+                entry.delete(0, "end")
+                entry.insert(0, str(saved[key]))
+        if isinstance(saved.get("weekdays"), list):
+            for i, var in enumerate(self.route_weekday_vars):
+                var.set(i in saved["weekdays"])
+        self.route_anyrep_var.set(bool(saved.get("count_any_rep", False)))
+        if cfg.get("instance_name"):
+            self.route_instance_entry.insert(0, cfg["instance_name"])
 
     def _build_image_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
