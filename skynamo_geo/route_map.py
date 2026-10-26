@@ -9,8 +9,11 @@ see the shape of their day.
 
 Google Maps directions links are free to generate (no key, no billing) but
 take at most nine waypoints each, so a long day becomes several links that
-share their endpoints. Waze links take a single destination, so they are per
-stop. A stop whose pin is approximate navigates by its ADDRESS, not its
+share their endpoints. They hold the CUSTOMERS only: the first link has no
+origin, so Google starts from wherever the phone is, and none ends at the
+rep's start point - which is often their home, and a link is the part of this
+page most likely to be forwarded. Waze links take a single destination, so
+they are per stop. A stop whose pin is approximate navigates by its ADDRESS, not its
 coordinates - otherwise the rep is driven to a suburb centroid.
 
 This module must not import route_engine (the engine imports it for its CSV
@@ -63,15 +66,16 @@ def waze_link(lat, lng, address=None, approximate=False):
     return WAZE_URL + "?" + urlencode(params)
 
 
-def gmaps_links(path, max_waypoints=GMAPS_MAX_WAYPOINTS):
-    """Google Maps directions links for a whole day, chunked.
+def gmaps_links(stops, max_waypoints=GMAPS_MAX_WAYPOINTS):
+    """Google Maps directions links for a day's stops, chunked.
 
-    path: the day in order, start first and end last, as (lat, lng, address,
-    approximate) tuples. Each link holds an origin, up to `max_waypoints`
-    stops and a destination; consecutive links share an endpoint, so following
-    them one after another covers the day exactly once.
+    stops: the day's customers in order, as (lat, lng, address, approximate)
+    tuples - never the rep's start or end point. The first link has no origin
+    (Google uses the phone's location); each holds up to `max_waypoints`
+    stops and a destination, and consecutive links share an endpoint, so
+    following them one after another covers the day exactly once.
     """
-    places = [_where(*p) for p in path]
+    places = [None] + [_where(*p) for p in stops]   # None: "from here"
     if len(places) < 2:
         return []
     span = max_waypoints + 1
@@ -79,8 +83,9 @@ def gmaps_links(path, max_waypoints=GMAPS_MAX_WAYPOINTS):
     i = 0
     while i < len(places) - 1:
         chunk = places[i:i + span + 1]
-        params = {"api": 1, "origin": chunk[0], "destination": chunk[-1],
-                  "travelmode": "driving"}
+        params = {"api": 1, "destination": chunk[-1], "travelmode": "driving"}
+        if chunk[0] is not None:
+            params["origin"] = chunk[0]
         if len(chunk) > 2:
             params["waypoints"] = "|".join(chunk[1:-1])
         links.append(GMAPS_DIR_URL + "?" + urlencode(params, quote_via=quote))
@@ -187,10 +192,8 @@ def _kpi(label, value):
 
 
 def _day_section(day, colour):
-    path = ([(day.start[0], day.start[1], None, False)]
-            + [(s.lat, s.lng, s.address, s.approximate) for s in day.stops]
-            + [(day.end[0], day.end[1], None, False)])
-    links = gmaps_links(path)
+    links = gmaps_links([(s.lat, s.lng, s.address, s.approximate)
+                         for s in day.stops])
     rows = []
     for s in day.stops:
         nav = (f'<a href="{_esc(stop_link(s.lat, s.lng, s.address, s.approximate))}">map</a> '

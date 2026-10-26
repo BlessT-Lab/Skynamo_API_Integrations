@@ -19,17 +19,13 @@ from .reporting_config import (
     STATUS_RPT_PENDING, STATUS_RPT_SKIPPED,
 )
 from .reports import summarize  # re-exported: callers use report_engine.summarize
+from .reports import (  # shared; see reports.py
+    append_note as _append_note, never_cancel as _never_cancel,
+    noop as _noop,
+)
 
 MODE_FULL = "full"
 MODE_DELTA = "delta"
-
-
-def _noop(*_args, **_kwargs):
-    return None
-
-
-def _never_cancel():
-    return False
 
 
 class ExtractPlan:
@@ -211,10 +207,6 @@ def run_extract(client, store, plans, on_progress=_noop,
         })
 
     return [p.to_report_row() for p in plans]
-
-
-def _append_note(notes, extra):
-    return (notes + "; " if notes else "") + extra
 
 
 def write_report(report_rows, path, fieldnames=REPORTING_REPORT_FIELDNAMES):

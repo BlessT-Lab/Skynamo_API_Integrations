@@ -145,7 +145,7 @@ class FakeClient:
         return [v for v in scheduled
                 if date.fromisoformat(v["create_date"][:10]) >= created_since], ""
 
-    def fetch_interactions_page(self, page_number):
+    def fetch_interactions_page(self, page_number, should_cancel=None):
         assert page_number >= 1
         self.calls.append(("interactions", page_number))
         lo = (page_number - 1) * PAGE_SIZE
@@ -174,7 +174,7 @@ try:
     # --- load: reads everything, writes nothing, walks the history ---------
     client = FakeClient()
     events = []
-    data, err = load_planning_data(client, opts, cache_path=cache, today=TODAY,
+    data, err = load_planning_data(client, cache_path=cache, today=TODAY,
                                    on_progress=events.append)
     assert err == "", err
     pages = [c for c in client.calls if isinstance(c, tuple)]
@@ -190,7 +190,7 @@ try:
 
     # the same day again reads one page (for the total) and uses the cache
     client2 = FakeClient()
-    data2, err = load_planning_data(client2, opts, cache_path=cache, today=TODAY)
+    data2, err = load_planning_data(client2, cache_path=cache, today=TODAY)
     assert err == ""
     assert [c for c in client2.calls if isinstance(c, tuple)] == [("interactions", 1)]
     assert data2.visits == data.visits
@@ -201,7 +201,7 @@ try:
         if ev["phase"] == "history":
             walking["on"] = True
     walker = FakeClient()
-    _d, err = load_planning_data(walker, opts, today=TODAY,
+    _d, err = load_planning_data(walker, today=TODAY,
                                  on_progress=note_history,
                                  should_cancel=lambda: walking["on"])
     assert err == "Cancelled", err
@@ -349,7 +349,145 @@ try:
     with open(out, encoding="utf-8-sig") as f:
         header = next(csv.reader(f))
     assert header == ROUTE_REPORT_FIELDNAMES
+
+    # ===========================================================================
+    # Code review regressions
+    # ===========================================================================
+    from datetime import timezone
+    
+    from skynamo_geo.route_engine import (
+        PlanningData, RouteStop, _route_rep, RoutePlan,
+    )
+    from skynamo_geo.visit_due import min_gap_days
+    
+    
+    def assert_consistent(p):
+        """A stop marked planned always has a day; nothing planned is dayless."""
+        for s in p.stops:
+            if s.status == STATUS_RT_PLANNED:
+                assert s.day is not None, ("planned with no day", s.rep_name, s.name)
+    
+    
+    assert_consistent(plan)
+    
+    # --- 1. a cancelled build must not report un-routed reps as planned --------
+    calls = {"n": 0}
+    def cancel_after_first_rep():
+        calls["n"] += 1
+        return calls["n"] > 1                     # rep 1 routes, then cancel
+    partial = build_route_plan(data, reps(), opts,
+                               should_cancel=cancel_after_first_rep)
+    assert partial.cancelled, "a cancelled build must say so"
+    assert_consistent(partial)
+    assert any("cancelled" in w.lower() for w in partial.warnings), partial.warnings
+    assert plan.cancelled is False
+    
+    # --- 2. a repeat visit is never booked without the visit before it ---------
+    twice = {"id": 501, "code": "T501", "name": "Twice", "assigned_users": [REP_A],
+             "location": {"latitude": -26.09, "longitude": 28.03, "accuracy": 25}}
+    once = {"id": 502, "code": "O502", "name": "Once", "assigned_users": [REP_A],
+            "location": {"latitude": -26.11, "longitude": 28.06, "accuracy": 25}}
+    first = RouteStop(REP_A, "Anna", twice)
+    first.occurrence, first.earliest, first.due = 1, MONDAY, MONDAY
+    first.mark(STATUS_RT_OVER_CAPACITY, "the week is full")    # dropped upstream
+    second = RouteStop(REP_A, "Anna", twice)
+    second.occurrence = 2
+    second.earliest = second.due = MONDAY + timedelta(days=3)
+    second.min_gap_days = 2
+    other = RouteStop(REP_A, "Anna", once)
+    other.occurrence, other.earliest, other.due = 1, MONDAY, MONDAY
+    rp = RoutePlan("acme", opts, opts.dates())
+    _route_rep(RepInput(REP_A, "Anna", (-26.10, 28.05)), [first, second, other],
+               opts, opts.dates(), rp, lambda ev: None)
+    assert other.status == STATUS_RT_PLANNED
+    assert second.status != STATUS_RT_PLANNED, \
+        "second visit booked although the first was not"
+    assert second.day is None and "first" in second.notes.lower(), second.notes
+    
+    # --- 3 + 4. dates are read in the INSTANCE's time zone, both ways ----------
+    # +10:00 is far from this PC's own zone, so using the PC's would show.
+    TEN = timezone(timedelta(hours=10))
+    
+    
+    class ZonedClient(FakeClient):
+        def get_configuration(self):
+            self.calls.append("configuration")
+            return {"time_zone": {"utc_offset": "+10:00"}}, ""
+    
+        def fetch_interactions_page(self, page_number, should_cancel=None):
+            self.calls.append(("interactions", page_number))
+            # 20:00 UTC on the 1st is 06:00 on the 2nd at +10:00
+            return ([{"id": 1, "customer_id": 1, "user_id": REP_A,
+                      "is_visit": True, "date": "2026-10-01T20:00:00Z"}],
+                    {"total_item_count": 1}, "")
+    
+    
+    zoned, err = load_planning_data(ZonedClient(), today=TODAY)
+    assert err == "", err
+    assert zoned.tz == TEN, zoned.tz
+    assert zoned.visits[(1, REP_A)] == [date(2026, 10, 2)], \
+        f"history dated in the wrong zone: {zoned.visits[(1, REP_A)]}"
+    
+    # An open visit due 00:30 Monday at +10:00 is 14:30Z on the Sunday. Reading
+    # the naive date would put it outside the week and plan a duplicate.
+    zoned.open_visits = [{"id": 77, "customer_id": 1, "assigned_user_id": REP_A,
+                          "due_date": f"{MONDAY - timedelta(days=1)}T14:30:00Z"}]
+    zp = build_route_plan(zoned, [RepInput(REP_A, "Anna", (-26.10, 28.05))],
+                          RouteOptions(MONDAY, n_days=5))
+    one_c = [s for s in zp.stops if s.customer_id == 1]
+    assert one_c and one_c[0].status == STATUS_RT_ALREADY, \
+        [(s.status, s.notes) for s in one_c]
+    # ...and the day's clock runs in the instance's zone too
+    for day in zp.days:
+        assert day.leave.utcoffset() == timedelta(hours=10), day.leave
+    
+    # --- 9. the history cache only matches what it was built for ---------------
+    tmp2 = tempfile.mkdtemp(prefix="route_cache_")
+    try:
+        cache2 = os.path.join(tmp2, "h.json")
+        load_planning_data(FakeClient(), cache_path=cache2, today=TODAY)
+        # The fixture's busiest customer is twice a week, so the cache keeps
+        # two visits per pair. Someone raises a customer to three a week the
+        # same morning: two kept dates cannot answer that.
+        frequencies.append(freq(2, REP_A, f=3))
+        try:
+            again_client = FakeClient()
+            more, err = load_planning_data(again_client, cache_path=cache2,
+                                           today=TODAY)
+            walked = [c for c in again_client.calls if isinstance(c, tuple)]
+            assert len(walked) > 1, "cache trimmed to 1 visit per pair was reused"
+        finally:
+            frequencies.pop()
+        # A different time zone is a different set of dates. Same history,
+        # same total - only the zone differs, so nothing else can miss.
+        class TwoHoursClient(ZonedClient):
+            def get_configuration(self):
+                return {"time_zone": {"utc_offset": "+02:00"}}, ""
+        at_two, _e = load_planning_data(TwoHoursClient(), cache_path=cache2,
+                                        today=TODAY)
+        assert at_two.visits[(1, REP_A)] == [date(2026, 10, 1)]  # 22:00 the 1st
+        at_ten, _e = load_planning_data(ZonedClient(), cache_path=cache2,
+                                        today=TODAY)
+        assert at_ten.visits[(1, REP_A)] == [date(2026, 10, 2)], \
+            "a cache dated in another time zone was reused"
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
+    
+    # --- 10. one definition of the spacing between repeat visits ---------------
+    assert min_gap_days(2, 1, "week") == 2
+    assert min_gap_days(1, 1, "week") == 4
+    for st in plan.stops:
+        if st.frequency_label == "twice a week":
+            assert st.min_gap_days == min_gap_days(2, 1, "week")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
+
+# The live probe's clean-up: only a 404 proves a deleted visit is gone. A
+# timeout or a 500 reads back no visit too, and must not be reported as gone.
+from diag_route_planning import deletion_state
+assert deletion_state(None, 404) == "gone"
+assert deletion_state({"id": 1}, 200) == "still there"
+for status in (None, 429, 500, 503):
+    assert deletion_state(None, status) == "unknown", status
 
 print("All route engine tests passed")

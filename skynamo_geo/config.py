@@ -8,6 +8,12 @@ REQUEST_TIMEOUT = 30
 # thousands of requests. Back off on 429/503 rather than fail the run.
 PUBLIC_API_MAX_RETRIES = 3
 PUBLIC_API_BACKOFF_SECONDS = 2.0
+# Longest Retry-After we will sit through. A server asking for more is
+# answered with an error instead: retrying early only earns another 429, and an
+# unbounded wait is a frozen run nobody can cancel.
+PUBLIC_API_MAX_RETRY_WAIT = 60.0
+# How often a backoff wait checks should_cancel.
+PUBLIC_API_WAIT_SLICE = 0.5
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 # Nominatim usage policy: identify your app and stay at/below 1 request/second.
@@ -186,6 +192,7 @@ STATUS_RT_OUT_OF_RANGE = "out-of-range"        # too far from the rep's start
 STATUS_RT_OVER_CAPACITY = "over-capacity"      # due, but the week is full
 STATUS_RT_INVALID_FREQ = "invalid-frequency"   # cannot plan from the record
 STATUS_RT_NOT_FOUND = "customer-not-found"     # inactive, deleted or not visible
+STATUS_RT_NOT_ROUTED = "not-routed"            # planning was cancelled first
 
 ROUTE_REPORT_FIELDNAMES = [
     "rep", "user_id", "day", "sequence", "customer_id", "code", "name",

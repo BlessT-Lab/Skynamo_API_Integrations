@@ -19,14 +19,9 @@ from .config import (
 from .customers import build_query, has_coordinates
 from .geocoder import GeocodeError
 from .reports import summarize  # re-exported: callers use engine.summarize
-
-
-def _noop(*_args, **_kwargs):
-    return None
-
-
-def _never_cancel():
-    return False
+from .reports import (  # shared; see reports.py
+    never_cancel as _never_cancel, noop as _noop,
+)
 
 
 def _normalise_postcode(value):

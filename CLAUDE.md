@@ -59,6 +59,7 @@ py test_visit_due.py                                         # when a customer i
 py test_routing.py                                           # haversine, 2-opt, the day split vs brute force (offline)
 py test_route_engine.py                                      # load + plan a synthetic week (fake client, offline)
 py test_route_map.py                                         # nav links + the route map HTML (offline)
+py test_settings.py                                          # the instance name never reaches disk; legacy scrub (offline)
 py test_gui_smoke.py                                         # builds the GUI (all six pages) and tears it down
 py diag_route_planning.py                                     # route planning facts from a live instance (read-only, then asks before writing)
 py diag_image_upload.py                                       # diagnose a product-image upload failure (3 phases, asks before writing)
@@ -112,12 +113,20 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
 - `skynamo_geo/customers.py` — address helpers. `build_query(customer, field_roles)` returns an
   `AddressQuery` (`.text` single-line + `.structured` dict) from an ordered `(field_name, role)`
   list; `clean_value` drops junk; `has_coordinates` treats zero/`"0"`/null as missing.
-- `skynamo_geo/settings.py` — non-secret config in `%APPDATA%/SkynamoGeo/config.json`. API keys and
-  Reporting API client credentials are **never persisted** (re-entered each session);
-  `purge_saved_credentials()` clears any keys older versions stored in the OS keyring, called on GUI
-  startup. Both `_persist_*` helpers read-modify-write so the tabs don't clobber each other's keys.
-- `skynamo_geo/reports.py` — shared `summarize(items)` and `write_report(rows, path, fieldnames)`.
-  All three engines re-export these; don't re-implement a CSV writer.
+- `skynamo_geo/settings.py` — non-secret config in `%APPDATA%/SkynamoGeo/config.json`. API keys,
+  Reporting API client credentials **and the instance name** are **never persisted** (re-entered
+  each session). What must stay separate per instance (`route_reps`, the `route_history/` cache
+  file) is keyed by `instance_key(name, config)` — a salted SHA-256 fingerprint (`i-` + 16 hex),
+  salt in `install_salt`; `saved_instance_key` when the key names something outside config.json, so
+  the salt is saved. It is a fingerprint, not secrecy (a name is guessable): it keeps the name off
+  the disk, which is the requirement. `scrub_instance_names()` runs first on GUI startup: drops a
+  legacy `instance_name`, re-keys `route_reps` to the fingerprint, deletes instance-named cache
+  files, and returns the old name once so `purge_saved_credentials()` can clear a keyring entry
+  stored under it. Both `_persist_*` helpers read-modify-write so the tabs don't clobber each
+  other's keys; none of them may write the instance name (`test_gui_smoke` Part 4 checks all three).
+- `skynamo_geo/reports.py` — shared `summarize(items)` and `write_report(rows, path, fieldnames)`,
+  plus the `noop` / `never_cancel` callback defaults and `append_note`. Every engine imports these
+  (under their old `_`-names); don't re-implement any of them in an engine.
 
 ### Route planning
 - `skynamo_geo/visit_due.py` — pure date logic: `occurrences()` (the visits a (customer, rep) pair
@@ -126,18 +135,21 @@ behaviour stays identical across GUI and CLI — this is the main invariant to p
 - `skynamo_geo/routing.py` — pure, stdlib-`math` route construction on index matrices:
   `haversine_km`, `matrices`, `nearest_neighbour`, `two_opt`, `split_tour` (the day split),
   `cheapest_insertion`, `assign_to_dates`. Knows nothing about customers or the API.
-- `skynamo_geo/route_engine.py` — `load_planning_data(client, ...)` (network, cancellable, **no
-  writes**: users, frequencies, customers, configuration, open scheduled visits, visit history) →
+- `skynamo_geo/route_engine.py` — `load_planning_data(client, cache_path, ...)` (network,
+  cancellable, **no writes**, and **no plan options** — what is loaded must not depend on the week:
+  configuration *first*, then users, frequencies, customers, open scheduled visits, visit history) →
   `build_route_plan(data, reps, options)` (**pure — no network at all**). Keeping the planner pure
   is why changing a setting re-plans instantly, and why it is testable with no fake client.
   `resolve_place` turns a typed start point ("lat,lng" or an address) into coordinates.
   `RouteStop`/`RouteDay`/`RoutePlan` are the outputs; `RouteStop.error` is a stop's cause with no
-  per-stop specifics, like `ImagePlan.error`.
+  per-stop specifics, like `ImagePlan.error`. A build cancelled part-way sets `plan.cancelled` and
+  marks every rep it never routed `not-routed`; the GUI shows no results for such a plan.
 - `skynamo_geo/route_map.py` — `build_route_html` (one self-contained page, inline SVG, no external
   requests — same rule as the dashboard), `gmaps_links`, `waze_link`, `stop_link`. Must not import
   `route_engine`; the engine imports it.
 - `SkynamoClient` gained `(value, error)` reads that never raise — `_fetch_all` (paging, de-dup by
-  id, backoff on 429/503 honouring `Retry-After`), `fetch_users`, `fetch_visit_frequencies`,
+  id, backoff on 429/503 honouring `Retry-After` up to `PUBLIC_API_MAX_RETRY_WAIT` — longer is
+  returned as an error — in `PUBLIC_API_WAIT_SLICE` slices that check `should_cancel`), `fetch_users`, `fetch_visit_frequencies`,
   `fetch_scheduled_visits(created_since)`, `fetch_interactions_page`, `get_configuration`,
   `get_scheduled_visit` — and the module-level `create_date_filter`.
 
@@ -354,7 +366,9 @@ never gets a stray database.
 - **`GET /interactions` takes no filter at all**, so last-visit-per-customer means walking the whole
   history. Page 1 reports `total_item_count`, so the cost is shown before the walk; a same-day
   re-run with an unchanged total uses the cache under `%APPDATA%/SkynamoGeo/route_history/`; there
-  is a hard request cap. Whether the walk can go backwards and stop early depends on id ordering,
+  is a hard request cap. The cache is keyed on **everything that shaped it**: day, total, visits kept
+  per pair (`keep` — raise a frequency and a list trimmed to fewer visits makes customers look
+  never visited) and the time zone the dates were read in. Whether the walk can go backwards and stop early depends on id ordering,
   which `diag_route_planning.py` measures — not assumed.
 - **Existing scheduled visits are only seen within a look-back.** `GET /scheduledvisits` filters on
   `create_date`, never on due date, rep or customer, so a visit created more than
@@ -366,7 +380,16 @@ never gets a stray database.
   Geolocation tab's saved field roles) — coordinates would drive the rep to a suburb centroid.
 - **A rep's start address is personal data** — often their home. It is stored only in local
   `config.json` (`route_reps`), sent only to OpenStreetMap to look it up, and never printed: maps
-  label it "Start".
+  label it "Start". Google Maps directions links hold **customers only**: the first has no origin
+  (Google starts from the phone) and none returns to the start — a link is the part of the page
+  most likely to be forwarded. (The SVG still draws "Start" in its true position relative to the
+  stops; that is the point of the map.)
+- **One time zone — the instance's — for every date.** `PlanningData.tz` comes from
+  `/configurations` (read first); visit history, open visits' due dates and the day's clock are all
+  read in it, and when it cannot be parsed they all use the PC's zone instead, never a mixture.
+  A naive `.date()` on an API datetime is a bug: "Sun 22:30Z" is Monday at +02:00.
+- **A repeat visit needs its first.** A pair's occurrence 2+ is only booked if its occurrence 1
+  was; otherwise "twice a week" can come out as one visit on the "second" slot.
 - **Phase 2 (writing scheduled visits) is not built yet, deliberately.** The datetime format the
   API wants, whether a batch POST is all-or-nothing, whether the response echoes `comment`, and
   whether reps get a notification per visit are all undocumented. `diag_route_planning.py` measures

@@ -17,7 +17,6 @@ ever touched on the main thread (via each tab's queue-poll loop).
 
 import os
 import queue
-import re
 import threading
 import webbrowser
 from datetime import date, datetime, timedelta
@@ -59,7 +58,7 @@ from skynamo_geo.route_engine import (
     resolve_place, write_report as write_route_report,
 )
 from skynamo_geo.route_map import build_route_html
-from skynamo_geo.visit_due import parse_holidays, parse_utc_offset
+from skynamo_geo.visit_due import parse_holidays
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -285,6 +284,7 @@ class App(ctk.CTk):
         # ----- Route Planning tab state -----
         self.route_client = None
         self.route_instance = ""
+        self.route_instance_key = ""
         self.route_data = None          # PlanningData from the last connect
         self.route_plan = None          # RoutePlan from the last Plan
         self.route_map_path = None
@@ -666,10 +666,10 @@ class App(ctk.CTk):
     # -- Settings persistence --------------------------------------------
 
     def _load_saved_settings(self):
+        # The instance name is never remembered - like the keys, it is typed
+        # each session. Remove any an older version saved, first.
+        legacy_instance = settings.scrub_instance_names()
         cfg = settings.load_config()
-        if cfg.get("instance_name"):
-            self.instance_entry.insert(0, cfg["instance_name"])
-            self.img_instance_entry.insert(0, cfg["instance_name"])
         if cfg.get("country"):
             self.country_entry.insert(0, cfg["country"])
         self.replace_var.set(bool(cfg.get("replace_existing", False)))
@@ -687,23 +687,21 @@ class App(ctk.CTk):
                 var.set(name in saved_entities)
         self._load_route_settings(cfg)
         # API keys are never remembered; purge any an older version stored.
-        settings.purge_saved_credentials(cfg.get("instance_name"))
+        settings.purge_saved_credentials(legacy_instance)
 
     def _persist_settings(self):
         if not self.remember_var.get():
             return
-        instance = self.instance_entry.get().strip()
         field_roles = self._field_roles()
         cfg = settings.load_config()  # merge, so image-tab keys aren't clobbered
         cfg.update({
-            "instance_name": instance,
             "country": self.country_entry.get().strip().upper(),
             "replace_existing": self.replace_var.get(),
             "address_fields": [name for name, _role in field_roles],
             "field_roles": {name: role for name, role in field_roles},
         })
         settings.save_config(cfg)
-        # API keys are deliberately not persisted.
+        # API keys and the instance name are deliberately not persisted.
 
     # -- Worker plumbing --------------------------------------------------
 
@@ -1387,7 +1385,7 @@ class App(ctk.CTk):
 
     # -- Reading the form (main thread only) -------------------------------
 
-    def _route_options(self, tz=None):
+    def _route_options(self):
         """RouteOptions from the form, or (None, reason)."""
         try:
             start = date.fromisoformat(self.route_start_entry.get().strip())
@@ -1419,7 +1417,7 @@ class App(ctk.CTk):
             start, n_days=n_days, weekdays=weekdays, holidays=holidays,
             day_start=self.route_daystart_entry.get(), max_hours=max_hours,
             max_stops=max_stops, service_minutes=service, road_factor=road,
-            speed_kmh=speed, count_any_rep=self.route_anyrep_var.get(), tz=tz,
+            speed_kmh=speed, count_any_rep=self.route_anyrep_var.get(),
             address_roles=roles), ""
 
     def _route_rep_inputs(self):
@@ -1435,13 +1433,10 @@ class App(ctk.CTk):
         if not (instance and key):
             self.route_set_status("Enter the instance name and API key first.")
             return
-        options, error = self._route_options()
-        if options is None:
-            self.route_set_status(error)
-            return
-        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", instance) or "instance"
+        # Named by fingerprint: the instance name is never written to disk.
+        instance_key = settings.saved_instance_key(instance)
         cache = os.path.join(settings.app_data_dir("route_history"),
-                             f"{safe}.json")
+                             f"{instance_key}.json")
         self.route_log_line(f"Connecting to '{instance}'...")
         self.route_progress.set(0)
 
@@ -1453,7 +1448,7 @@ class App(ctk.CTk):
                     self.route_queue.put(("error", message))
                     return
                 data, err = load_planning_data(
-                    client, options, cache_path=cache,
+                    client, cache_path=cache,
                     on_progress=lambda ev: self.route_queue.put(("progress", ev)),
                     should_cancel=self.route_cancel_event.is_set)
                 if err:
@@ -1463,8 +1458,9 @@ class App(ctk.CTk):
                 def finish():
                     self.route_client = client
                     self.route_instance = instance
+                    self.route_instance_key = instance_key
                     self.route_data = data
-                    self._route_populate_reps(data, instance)
+                    self._route_populate_reps(data, instance_key)
                     reps = len(self.route_rep_rows)
                     self.route_log_line(data.history_note)
                     self.route_set_status(
@@ -1477,7 +1473,7 @@ class App(ctk.CTk):
 
         self._route_start_worker(work)
 
-    def _route_populate_reps(self, data, instance):
+    def _route_populate_reps(self, data, instance_key):
         for child in self.route_reps_frame.winfo_children():
             child.destroy()
         self.route_rep_rows = {}
@@ -1487,7 +1483,8 @@ class App(ctk.CTk):
         counts = {}
         for rec in data.frequencies:
             counts[rec.get("user_id")] = counts.get(rec.get("user_id"), 0) + 1
-        saved = (settings.load_config().get("route_reps") or {}).get(instance, {})
+        saved = ((settings.load_config().get("route_reps") or {})
+                 .get(instance_key, {}))
         if not counts:
             ctk.CTkLabel(self.route_reps_frame,
                          text="No visit frequencies on this instance - there "
@@ -1536,9 +1533,7 @@ class App(ctk.CTk):
         if self.route_data is None:
             self.route_set_status("Connect and load data first.")
             return
-        tz = parse_utc_offset(((self.route_data.configuration or {})
-                               .get("time_zone") or {}).get("utc_offset"))
-        options, error = self._route_options(tz=tz)
+        options, error = self._route_options()
         if options is None:
             self.route_set_status(error)
             return
@@ -1546,9 +1541,10 @@ class App(ctk.CTk):
         known = {uid: dict(v) for uid, v in self.route_rep_points.items()}
         data = self.route_data
         instance = self.route_instance
+        zone = "instance time zone" if data.tz else "this PC’s time zone"
         self.route_log_line(
             f"Planning {options.n_days} day(s) from {options.start_date} "
-            f"({'instance time zone' if tz else 'this PC’s time zone'}).")
+            f"({zone}).")
 
         def work():
             try:
@@ -1578,6 +1574,11 @@ class App(ctk.CTk):
                     data, reps, options, instance=instance,
                     on_progress=lambda ev: self.route_queue.put(("progress", ev)),
                     should_cancel=self.route_cancel_event.is_set)
+                if plan.cancelled:
+                    # Some reps were never routed: showing it would pass off
+                    # half a week as the plan.
+                    self.route_queue.put(("error", "Cancelled"))
+                    return
 
                 def finish():
                     for uid, info in points.items():
@@ -1653,8 +1654,12 @@ class App(ctk.CTk):
             filetypes=[("Web page", "*.html"), ("All files", "*.*")])
         if not path:
             return
-        build_route_html(self.route_plan, path,
-                         title=f"Route plan - week of {start:%d %b %Y}")
+        try:
+            build_route_html(self.route_plan, path,
+                             title=f"Route plan - week of {start:%d %b %Y}")
+        except Exception as exc:     # a locked file, a full disk, a bad path
+            self._route_save_failed("map", path, exc)
+            return
         self.route_map_path = path
         self.route_open_btn.configure(state="normal")
         self.route_log_line(f"Map and itinerary saved to: {path}")
@@ -1673,10 +1678,19 @@ class App(ctk.CTk):
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
         if not path:
             return
-        write_route_report([s.to_report_row() for s in self.route_plan.stops],
-                           path)
+        try:
+            write_route_report([s.to_report_row() for s in self.route_plan.stops],
+                               path)
+        except Exception as exc:     # e.g. the CSV is open in Excel
+            self._route_save_failed("CSV", path, exc)
+            return
         self.route_log_line(f"CSV saved to: {path}")
         self.route_set_status(f"Saved {path}")
+
+    def _route_save_failed(self, what, path, exc):
+        """A save that failed must say so - the status line alone scrolls away."""
+        self.route_set_status(f"Could not save the {what} - see the log.")
+        self.route_log.alert(f"ERROR: could not save the {what} to {path}: {exc}")
 
     def _persist_route_settings(self):
         """Plan settings and each rep's start point - never the API key.
@@ -1687,7 +1701,6 @@ class App(ctk.CTk):
         if not self.remember_var.get():
             return
         cfg = settings.load_config()
-        cfg["instance_name"] = self.route_instance_entry.get().strip()
         cfg["route_options"] = {
             "n_days": self.route_days_entry.get().strip(),
             "day_start": self.route_daystart_entry.get().strip(),
@@ -1713,7 +1726,8 @@ class App(ctk.CTk):
                     "lat": point[0] if point and info.get("address") == text else None,
                     "lng": point[1] if point and info.get("address") == text else None,
                 }
-            per[self.route_instance] = mine
+            # Keyed by fingerprint, never by name (see settings.instance_key).
+            per[settings.instance_key(self.route_instance, cfg)] = mine
             cfg["route_reps"] = per
         settings.save_config(cfg)
 
@@ -1734,8 +1748,6 @@ class App(ctk.CTk):
             for i, var in enumerate(self.route_weekday_vars):
                 var.set(i in saved["weekdays"])
         self.route_anyrep_var.set(bool(saved.get("count_any_rep", False)))
-        if cfg.get("instance_name"):
-            self.route_instance_entry.insert(0, cfg["instance_name"])
 
     def _build_image_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -1902,10 +1914,9 @@ class App(ctk.CTk):
         if not self.remember_var.get():
             return
         cfg = settings.load_config()
-        cfg["instance_name"] = self.img_instance_entry.get().strip()
         cfg["image_replace_existing"] = self.img_replace_var.get()
         cfg["image_move_processed"] = self.img_move_var.get()
-        settings.save_config(cfg)  # merge; never persists API keys
+        settings.save_config(cfg)  # merge; never the API key or instance name
 
     # -- Image worker plumbing --------------------------------------------
 

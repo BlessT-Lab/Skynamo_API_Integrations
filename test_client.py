@@ -20,7 +20,8 @@ from skynamo_geo.client import (
     SkynamoClient, content_hash_b64, create_date_filter,
 )
 from skynamo_geo.config import (
-    API_BASE, FILE_HASH_ALGORITHM, PAGE_SIZE, PUBLIC_API_MAX_RETRIES,
+    API_BASE, FILE_HASH_ALGORITHM, PAGE_SIZE, PUBLIC_API_BACKOFF_SECONDS,
+    PUBLIC_API_MAX_RETRIES, PUBLIC_API_WAIT_SLICE,
 )
 
 
@@ -305,14 +306,36 @@ s = FakeSession([FakeResponse(429, None, text="slow down",
                               headers={"Retry-After": "7"}),
                  page(short)])
 items, err = make_client(s).fetch_users(sleep=slept.append)
-assert err == "" and len(items) == 5 and slept == [7.0], (err, slept)
+assert err == "" and len(items) == 5 and sum(slept) == 7.0, (err, slept)
+# ...in slices, so a cancel is noticed while waiting.
+assert max(slept) <= PUBLIC_API_WAIT_SLICE, slept
 
 # ...and gives up after the retry cap rather than looping forever.
 slept = []
 s = FakeSession([FakeResponse(503, None, text="busy")
                  for _ in range(PUBLIC_API_MAX_RETRIES + 1)])
 items, err = make_client(s).fetch_users(sleep=slept.append)
-assert "503" in err and len(slept) == PUBLIC_API_MAX_RETRIES, (err, slept)
+assert "503" in err and len(s.calls) == PUBLIC_API_MAX_RETRIES + 1, (err, s.calls)
+assert sum(slept) == sum(PUBLIC_API_BACKOFF_SECONDS * 2 ** i
+                         for i in range(PUBLIC_API_MAX_RETRIES)), slept
+
+# A Retry-After beyond the cap is reported, not slept through: an hour's wait
+# would freeze the run and its Cancel button.
+slept = []
+s = FakeSession([FakeResponse(429, None, text="later",
+                              headers={"Retry-After": "3600"}), page(short)])
+items, err = make_client(s).fetch_users(sleep=slept.append)
+assert slept == [] and len(s.calls) == 1, slept
+assert "429" in err and "3600" in err, err
+
+# Cancel during a backoff wait stops it - and the walk - promptly.
+slept = []
+s = FakeSession([FakeResponse(429, None, text="slow down",
+                              headers={"Retry-After": "30"}), page(short)])
+items, info, err = make_client(s).fetch_interactions_page(
+    1, sleep=slept.append, should_cancel=lambda: len(slept) >= 2)
+assert err == "Cancelled" and len(s.calls) == 1, (err, s.calls)
+assert sum(slept) <= 2 * PUBLIC_API_WAIT_SLICE, slept
 
 # Network errors are returned, not raised.
 s = FakeSession(raise_on={"get"})

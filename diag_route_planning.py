@@ -71,6 +71,18 @@ def ask(message, default=False):
     return default if not raw else raw in ("y", "yes")
 
 
+def deletion_state(visit, status):
+    """'gone', 'still there' or 'unknown' for a read-back after DELETE.
+
+    Only a 404 proves a visit is gone. A timeout, a 429 or a 500 also comes
+    back with no visit, and calling that "gone" would tell the user there is
+    nothing to clean up by hand when there may be.
+    """
+    if visit is not None:
+        return "still there"
+    return "gone" if status == 404 else "unknown"
+
+
 def heading(text):
     print("\n" + "-" * 70)
     print(f" {text}")
@@ -368,14 +380,17 @@ def write_probe(client, users, freqs, customers_by_id):
                 print(f"    request failed: {exc}")
             left = []
             for visit_id in created:
-                visit, _error, status = client.get_scheduled_visit(visit_id)
-                gone = visit is None
-                print(f"    id={visit_id}: {'gone' if gone else 'STILL THERE'} "
-                      f"(HTTP {status})")
-                if not gone:
+                visit, error, status = client.get_scheduled_visit(visit_id)
+                state = deletion_state(visit, status)
+                detail = f"HTTP {status}" if status else redact(error)
+                print(f"    id={visit_id}: "
+                      f"{'gone' if state == 'gone' else state.upper()} "
+                      f"({detail})")
+                if state != "gone":
                     left.append(visit_id)
             if left:
-                print(f"\n  !! Remove these by hand in Skynamo: {left}")
+                print(f"\n  !! Check these by hand in Skynamo and remove any "
+                      f"that are still there: {left}")
         else:
             print("\n  Nothing was created, so nothing to delete.")
 

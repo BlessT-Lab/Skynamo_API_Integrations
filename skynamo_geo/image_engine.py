@@ -25,6 +25,10 @@ import shutil
 
 from . import reports
 from .reports import summarize  # re-exported: callers use image_engine.summarize
+from .reports import (  # shared; see reports.py
+    append_note as _append_note, never_cancel as _never_cancel,
+    noop as _noop,
+)
 from .config import (
     ATTACHED_IMAGE_REPORT_FIELDNAMES, IMAGE_FAILURE_STATUSES,
     IMAGE_FOLDER_BY_STATUS,
@@ -38,14 +42,6 @@ from .products import (
     parse_image_stem, product_code, sequence_sort_key, sniff_image_format,
     unique_destination,
 )
-
-
-def _noop(*_args, **_kwargs):
-    return None
-
-
-def _never_cancel():
-    return False
 
 
 def _product_key(product):
@@ -304,10 +300,6 @@ def _upload_one(client, plan, transaction_id=None):
         return None, f"Could not read file: {exc}"
     return client.upload_file(plan.filename, content,
                               transaction_id=transaction_id)
-
-
-def _append_note(notes, extra):
-    return (notes + "; " if notes else "") + extra
 
 
 # Anything the API quoted back at us - a file guid, a code - is per-item, so it

@@ -155,11 +155,15 @@ Produces `dist\SkynamoGeo.exe` (single, double-clickable, no console window).
 - **Skynamo API key** — Skynamo Insights → Settings → Integration Tokens →
   *Add access token*.
 
-**API keys are never stored.** You re-enter the Skynamo key every time you
-launch the app. The GUI's **"Remember settings"** checkbox only persists
-**non-secret settings** (instance name, country, replace flag, selected
-address fields) to `%APPDATA%\SkynamoGeo\config.json`. Any API keys that an
-earlier version saved to the Windows Credential Manager are purged on startup.
+**API keys and the instance name are never stored.** You re-enter both every
+time you launch the app. The GUI's **"Remember settings"** checkbox only
+persists **non-secret settings** (country, replace flag, selected address
+fields, route planning limits) to `%APPDATA%\SkynamoGeo\config.json`. Things
+that must stay separate per instance — each rep's remembered start point and
+the visit-history cache — are filed under a one-way fingerprint of the
+instance name, never the name itself. On startup the app removes any instance
+name an earlier version saved, and purges any API keys an earlier version
+saved to the Windows Credential Manager.
 
 ---
 
@@ -451,7 +455,12 @@ Customers not due this week are not listed.
 - A pin marked approximate is planned but flagged, and its navigation links use
   the customer's address instead of the pin.
 - Google Maps links hold up to nine stops each, so a long day becomes two or
-  three links that follow on from each other. Waze takes one stop per link.
+  three links that follow on from each other. They start from wherever the
+  phone is and hold only customers: a rep's start point is often their home,
+  and a link is the part of the page most likely to be forwarded. Waze takes
+  one stop per link.
+- Cancelling a plan part-way shows nothing: a week planned for only some of the
+  reps is not a plan.
 - **Writing the plan into Skynamo as scheduled visits is not built yet.** It
   waits on `py diag_route_planning.py`, which measures how the API treats
   scheduled-visit times and batches on a live instance first.
@@ -509,7 +518,12 @@ py test_report_store.py      # schema from registry, idempotent upsert, period-s
 py test_report_engine.py     # plan makes no calls; bookmark advances only after a commit
 py test_dashboard.py         # renders from a seeded store; self-contained; escapes instance text
 py test_diag_redaction.py    # the auth diagnostic never prints a token, secret or row value
-py test_gui_smoke.py     # GUI (all five tabs) builds and tears down cleanly
+py test_visit_due.py     # who is due when: windows, calendar months, time zones
+py test_routing.py       # haversine, 2-opt, the day split checked against brute force
+py test_route_engine.py  # load + plan a synthetic week; cancel, repeat visits, cache keys
+py test_route_map.py     # navigation links + the route map page; no start point leaks
+py test_settings.py      # the instance name is never kept on disk; old copies scrubbed
+py test_gui_smoke.py     # GUI (all six pages) builds and tears down cleanly
 ```
 
 If a Reporting API connection fails, `py diag_reporting_auth.py` shows the token
@@ -693,6 +707,20 @@ the whole store is empty, the tab tells you to run an extract first.
 
 ## 14. Change log
 
+- **v2.13.1** (2026-10-26) — **Route planning fixes, and the instance name is
+  no longer saved.** The instance name is now typed each session like the API
+  key; per-instance data is filed under a fingerprint, and a name saved by an
+  earlier version is removed on startup (remembered rep start points are kept).
+  Route planning: a cancelled plan is no longer shown as if complete; a
+  customer's second visit in a week is no longer booked when the first could
+  not be; every date (visit history, open visits, the day's clock) is read in
+  the instance's time zone, so an evening visit near midnight lands on the
+  right day; the history cache is rebuilt when visit frequencies or the time
+  zone change; Google Maps links no longer carry a rep's start point; a failed
+  Save map / Save CSV is reported instead of silently doing nothing; a long
+  "slow down" from the server is reported rather than waited out, and Cancel
+  works during a wait. The live probe now only calls a deleted test visit
+  "gone" when the server says so.
 - **v2.13.0** (2026-10-06) — **Route planning (read-only).** A new **Route
   Planning** page plans a week of visits for several reps at once: who is due
   (from visit frequencies and visit history), which day, in what order, and at

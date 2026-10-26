@@ -25,6 +25,10 @@ from datetime import date, datetime, time, timedelta
 
 from . import reports
 from .reports import summarize  # re-exported, like the other engines
+from .reports import (  # shared; see reports.py
+    append_note as _append_note, never_cancel as _never_cancel,
+    noop as _noop,
+)
 from .config import (
     PAGE_SIZE, ROUTE_APPROX_ACCURACY_M, ROUTE_BALANCE_WEIGHT,
     ROUTE_DEFAULT_DAY_START, ROUTE_DEFAULT_DAYS, ROUTE_DEFAULT_MAX_HOURS,
@@ -33,7 +37,8 @@ from .config import (
     ROUTE_DEFAULT_WEEKDAYS, ROUTE_FAR_START_KM, ROUTE_MAX_HISTORY_REQUESTS,
     ROUTE_MAX_RADIUS_KM, ROUTE_MIN_LEG_MINUTES, ROUTE_REPORT_FIELDNAMES,
     ROUTE_SCHEDULED_LOOKBACK_DAYS, STATUS_RT_ALREADY, STATUS_RT_INVALID_FREQ,
-    STATUS_RT_NO_LOCATION, STATUS_RT_NOT_FOUND, STATUS_RT_OUT_OF_RANGE,
+    STATUS_RT_NO_LOCATION, STATUS_RT_NOT_FOUND, STATUS_RT_NOT_ROUTED,
+    STATUS_RT_OUT_OF_RANGE,
     STATUS_RT_OVER_CAPACITY, STATUS_RT_PLANNED,
 )
 from .customers import build_query, has_coordinates
@@ -43,12 +48,13 @@ from .routing import (
     nearest_neighbour, split_tour, two_opt,
 )
 from .visit_due import (
-    MAX_OCCURRENCES, FrequencyError, label, localize, occurrences,
-    parse_api_datetime, parse_frequency, window_days, working_days,
+    MAX_OCCURRENCES, FrequencyError, label, localize, min_gap_days, occurrences,
+    parse_api_datetime, parse_frequency, parse_utc_offset, window_days,
+    working_days,
 )
 
 UNPLANNED = (STATUS_RT_ALREADY, STATUS_RT_INVALID_FREQ, STATUS_RT_NO_LOCATION,
-             STATUS_RT_NOT_FOUND, STATUS_RT_OUT_OF_RANGE,
+             STATUS_RT_NOT_FOUND, STATUS_RT_NOT_ROUTED, STATUS_RT_OUT_OF_RANGE,
              STATUS_RT_OVER_CAPACITY)
 
 # Day-to-date scoring. Visiting before a stop's earliest allowed day breaks
@@ -57,18 +63,6 @@ UNPLANNED = (STATUS_RT_ALREADY, STATUS_RT_INVALID_FREQ, STATUS_RT_NO_LOCATION,
 _PENALTY_BEFORE_EARLIEST = 1000
 _PENALTY_LATE_PER_DAY = 10
 _PENALTY_EARLY_PER_DAY = 1
-
-
-def _noop(*_args, **_kwargs):
-    return None
-
-
-def _never_cancel():
-    return False
-
-
-def _append_note(notes, extra):
-    return (notes + "; " if notes else "") + extra
 
 
 def _parse_clock(text, default=ROUTE_DEFAULT_DAY_START):
@@ -97,7 +91,7 @@ class RouteOptions:
                  speed_kmh=ROUTE_DEFAULT_SPEED_KMH,
                  min_leg_minutes=ROUTE_MIN_LEG_MINUTES,
                  max_radius_km=ROUTE_MAX_RADIUS_KM,
-                 balance=ROUTE_BALANCE_WEIGHT, count_any_rep=False, tz=None,
+                 balance=ROUTE_BALANCE_WEIGHT, count_any_rep=False,
                  address_roles=()):
         self.start_date = start_date
         self.n_days = int(n_days)
@@ -113,8 +107,6 @@ class RouteOptions:
         self.max_radius_km = float(max_radius_km)
         self.balance = float(balance)
         self.count_any_rep = bool(count_any_rep)
-        # None = this PC's time zone (daylight saving from the OS's rules).
-        self.tz = tz
         # Ordered (field, role) pairs - the Geolocation tab's address mapping,
         # used to give approximate pins an address to navigate to.
         self.address_roles = list(address_roles)
@@ -150,6 +142,10 @@ class PlanningData:
         self.visits_any = {}         # customer_id -> [dates newest first]
         self.open_visits = []        # open scheduled visits due inside the window
         self.configuration = {}
+        # The instance's time zone: every date - visit history, open visits,
+        # the day's clock - is read in it. None means it could not be read, and
+        # this PC's zone is used for all of them instead (never a mixture).
+        self.tz = None
         self.warnings = []
         self.history_note = ""
 
@@ -262,6 +258,9 @@ class RoutePlan:
         self.stops = []
         self.warnings = []
         self.created_at = datetime.now()
+        # True when planning stopped before every rep was routed: the plan is
+        # a partial result and must not be presented as the week.
+        self.cancelled = False
 
     def planned(self):
         return [s for s in self.stops if s.status == STATUS_RT_PLANNED]
@@ -326,9 +325,24 @@ def _keep_newest(bucket, key, d, keep):
     del dates[keep:]
 
 
-def _cache_matches(cache, total, today):
-    return (cache and cache.get("fetched_on") == today.isoformat()
-            and cache.get("total") == total)
+def _tz_key(tz):
+    """A stable name for a time zone, for the cache key."""
+    return "local" if tz is None else tz.tzname(None)
+
+
+def _cache_matches(cache, total, today, keep, tz):
+    """Whether a cache can stand in for walking the history again.
+
+    The dates in it depend on more than the day and the interaction count:
+    how many visits were kept per pair (raise a customer to "twice a week"
+    and a list trimmed to one visit makes them look never visited) and which
+    time zone they were dated in.
+    """
+    return bool(cache
+                and cache.get("fetched_on") == today.isoformat()
+                and cache.get("total") == total
+                and int(cache.get("keep") or 0) >= keep
+                and cache.get("tz") == _tz_key(tz))
 
 
 def _read_cache(path):
@@ -341,11 +355,12 @@ def _read_cache(path):
         return None
 
 
-def _write_cache(path, data, total, today):
+def _write_cache(path, data, total, today, keep):
     if not path:
         return
     payload = {
-        "fetched_on": today.isoformat(), "total": total,
+        "fetched_on": today.isoformat(), "total": total, "keep": keep,
+        "tz": _tz_key(data.tz),
         "pairs": {f"{c}|{u}": [d.isoformat() for d in ds]
                   for (c, u), ds in data.visits.items()},
         "any": {str(c): [d.isoformat() for d in ds]
@@ -374,21 +389,22 @@ def _load_cache_into(data, cache):
         data.visits_any[key_of(c)] = [date.fromisoformat(x) for x in ds]
 
 
-def _load_history(client, data, keep, tz, cache_path, today, on_progress,
+def _load_history(client, data, keep, cache_path, today, on_progress,
                   should_cancel):
     """Each pair's newest visits, by walking /interactions (it has no filter).
 
     Page 1 gives the total, so the cost is known - and reported - before the
     walk. A same-day re-run with an unchanged total reuses the cache instead.
     """
-    items, info, error = client.fetch_interactions_page(1)
+    items, info, error = client.fetch_interactions_page(
+        1, should_cancel=should_cancel)
     if error:
         return f"Could not read the visit history: {error}"
     total = int(info.get("total_item_count") or 0)
     pages = max(1, math.ceil(total / PAGE_SIZE)) if total else 1
 
     cache = _read_cache(cache_path)
-    if _cache_matches(cache, total, today):
+    if _cache_matches(cache, total, today, keep, data.tz):
         _load_cache_into(data, cache)
         data.history_note = (f"Visit history from today's cache "
                              f"({total:,} interactions).")
@@ -409,7 +425,7 @@ def _load_history(client, data, keep, tz, cache_path, today, on_progress,
         for item in items:
             if not item.get("is_visit"):
                 continue
-            d = _visit_date(item.get("date"), tz)
+            d = _visit_date(item.get("date"), data.tz)
             cid, uid = item.get("customer_id"), item.get("user_id")
             if d is None or cid is None:
                 continue
@@ -423,25 +439,41 @@ def _load_history(client, data, keep, tz, cache_path, today, on_progress,
         if should_cancel():
             return "Cancelled"
         page_number += 1
-        items, _info, error = client.fetch_interactions_page(page_number)
+        items, _info, error = client.fetch_interactions_page(
+            page_number, should_cancel=should_cancel)
         if error:
             return f"Visit history stopped at page {page_number}: {error}"
         if not items:
             break
     data.history_note = f"Visit history read: {total:,} interactions."
-    _write_cache(cache_path, data, total, today)
+    _write_cache(cache_path, data, total, today, keep)
     return ""
 
 
-def load_planning_data(client, options, cache_path=None, today=None,
+def load_planning_data(client, cache_path=None, today=None,
                        on_progress=_noop, should_cancel=_never_cancel):
-    """Fetch everything a plan needs. Returns (PlanningData, error). NO writes."""
+    """Fetch everything a plan needs. Returns (PlanningData, error). NO writes.
+
+    Takes no plan settings on purpose: what is loaded must not depend on the
+    week being planned, or changing the week would need a refetch - and the
+    time zone, which it once took from them, belongs to the instance.
+    """
     today = today or date.today()
     data = PlanningData()
 
     def step(phase, message):
         on_progress({"phase": phase, "index": 0, "total": 0, "name": "",
                      "status": "", "message": message})
+
+    # First: every date read below is interpreted in this zone.
+    step("configuration", "Reading the instance time zone...")
+    data.configuration, _error = client.get_configuration()
+    offset = ((data.configuration or {}).get("time_zone") or {}).get("utc_offset")
+    data.tz = parse_utc_offset(offset)
+    if data.tz is None:
+        data.warnings.append(
+            f"Could not read the instance's time zone ({offset!r}) - dates and "
+            f"times use this PC's time zone instead.")
 
     step("users", "Reading users...")
     data.users, error = client.fetch_users()
@@ -468,9 +500,6 @@ def load_planning_data(client, options, cache_path=None, today=None,
     if should_cancel():
         return data, "Cancelled"
 
-    step("configuration", "Reading the instance time zone...")
-    data.configuration, _error = client.get_configuration()
-
     step("scheduled", "Reading scheduled visits...")
     # Anchored to today, not the plan window: the week can change after
     # loading, and build_route_plan applies the window itself.
@@ -494,7 +523,7 @@ def load_planning_data(client, options, cache_path=None, today=None,
         except FrequencyError:
             pass
     keep = min(keep, MAX_OCCURRENCES)
-    error = _load_history(client, data, keep, options.tz, cache_path, today,
+    error = _load_history(client, data, keep, cache_path, today,
                           on_progress, should_cancel)
     if error:
         return data, error
@@ -532,8 +561,11 @@ def _due_stops(data, reps, options, dates, plan):
     window_start, window_end = dates[0], dates[-1]
     open_count = {}
     for v in data.open_visits:
-        due = parse_api_datetime(v.get("due_date"))
-        if due is None or not window_start <= due.date() <= window_end:
+        # Its local date in the instance's zone - a naive .date() of
+        # "Sun 22:30Z" is Sunday even where it is already Monday, which put a
+        # covering visit outside the week and planned a duplicate.
+        due = _visit_date(v.get("due_date"), data.tz)
+        if due is None or not window_start <= due <= window_end:
             continue
         pair = (v.get("customer_id"), v.get("assigned_user_id"))
         open_count[pair] = open_count.get(pair, 0) + 1
@@ -581,7 +613,7 @@ def _due_stops(data, reps, options, dates, plan):
         if not occ:
             continue                       # not due: counted, not listed
         covered = open_count.get((cid, uid), 0)
-        gap = max(1, math.ceil(window_days(cycle, period) / (2 * frequency)))
+        gap = min_gap_days(frequency, cycle, period)
         for k, (earliest, due, overdue) in enumerate(occ, 1):
             stop = RouteStop(uid, rep.name, customer)
             stop.frequency_label = label(frequency, cycle, period)
@@ -632,7 +664,7 @@ def _drop_one(order, prio, mins, start, end, keys):
     return min(order, key=lambda n: (prio[n], -detour[n], keys[n]))
 
 
-def _route_rep(rep, stops, options, dates, plan, on_progress):
+def _route_rep(rep, stops, options, dates, plan, on_progress, tz=None):
     """Plan one rep's week. Mutates stops; appends RouteDays to the plan."""
     start, end = rep.start, rep.end or rep.start
     live = [s for s in stops if s.status == STATUS_RT_PLANNED]
@@ -710,7 +742,27 @@ def _route_rep(rep, stops, options, dates, plan, on_progress):
     # Second and later visits to the same customer go in afterwards, on a day
     # far enough from its other visits - a tour would put the two (identical)
     # coordinates side by side and book both on the same day.
-    for s in sorted(later, key=lambda s: (-s.priority, s.key)):
+    #
+    # Each needs the visit before it: an earlier visit is satisfied when it is
+    # placed in a day OR already covered by an open scheduled visit. Without
+    # this, a customer whose first visit was dropped for capacity got its
+    # second booked anyway - insertion is not bound by the split - taking a
+    # slot from a more urgent first visit.
+    satisfied = {}
+    for x in stops:
+        if x.status == STATUS_RT_ALREADY:
+            satisfied[x.customer_id] = satisfied.get(x.customer_id, 0) + 1
+    for day in days.values():
+        for x in day.stops:
+            satisfied[x.customer_id] = satisfied.get(x.customer_id, 0) + 1
+    for s in sorted(later, key=lambda s: (s.occurrence, -s.priority, s.key)):
+        if satisfied.get(s.customer_id, 0) < s.occurrence - 1:
+            which = ("the customer's first visit" if s.occurrence == 2
+                     else f"visit {s.occurrence - 1} to this customer")
+            s.mark(STATUS_RT_OVER_CAPACITY,
+                   f"not booked: {which} this week was not planned",
+                   "An earlier visit to this customer was not planned")
+            continue
         n = node[id(s)]
         best = None
         for d in dates:
@@ -742,19 +794,23 @@ def _route_rep(rep, stops, options, dates, plan, on_progress):
         if d not in days:
             days[d] = RouteDay(rep.user_id, rep.name, d, start, end)
         days[d].stops.insert(pos, s)
+        satisfied[s.customer_id] = satisfied.get(s.customer_id, 0) + 1
 
     for d in sorted(days):
         day = days[d]
         seq = [node[id(x)] for x in day.stops]
         seq = two_opt(seq, mins, S, E)
         day.stops = [stop_at[n] for n in seq]
-        _time_day(day, km, mins, node, options, S, E)
+        _time_day(day, km, mins, node, options, S, E, tz)
         plan.days.append(day)
 
 
-def _time_day(day, km, mins, node, options, S, E):
-    """Arrival and departure for each stop, from the day's start time."""
-    t = localize(day.date, options.day_start, options.tz)
+def _time_day(day, km, mins, node, options, S, E, tz=None):
+    """Arrival and departure for each stop, from the day's start time.
+
+    tz: the instance's zone (None = this PC's).
+    """
+    t = localize(day.date, options.day_start, tz)
     day.leave = t
     here = S
     for i, s in enumerate(day.stops, 1):
@@ -793,13 +849,27 @@ def build_route_plan(data, reps, options, instance="", on_progress=_noop,
     routable = [r for r in included if r.start]
 
     stops = _due_stops(data, routable, options, dates, plan)
+    routed = set()
     for i, rep in enumerate(routable, 1):
         if should_cancel():
+            plan.cancelled = True
             break
         mine = [s for s in stops if s.user_id == rep.user_id]
-        _route_rep(rep, mine, options, dates, plan, on_progress)
+        _route_rep(rep, mine, options, dates, plan, on_progress, tz=data.tz)
+        routed.add(rep.user_id)
         on_progress({"phase": "plan", "index": i, "total": len(routable),
                      "name": rep.name, "status": "", "message": ""})
+    if plan.cancelled:
+        # Their stops are still at the initial "planned" with no day; leaving
+        # them so would count them as planned and print them in the itinerary.
+        for s in stops:
+            if s.user_id not in routed and s.status == STATUS_RT_PLANNED:
+                s.mark(STATUS_RT_NOT_ROUTED,
+                       "planning was cancelled before this rep was routed",
+                       "Planning was cancelled")
+        plan.warnings.append(
+            f"Planning was cancelled after {len(routed)} of {len(routable)} "
+            f"rep(s) - this plan is incomplete.")
     plan.stops.extend(stops)
 
     # A customer two reps both visit on the same day is worth knowing about.

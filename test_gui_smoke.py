@@ -8,6 +8,7 @@ preferences. Asserting a widget's default against whatever the developer last
 ticked would fail on their machine and pass in CI, or the reverse.
 """
 
+import json
 import os
 import shutil
 import tempfile
@@ -19,11 +20,23 @@ from skynamo_geo.reporting_config import REPORTING_ENTITIES
 tmp = tempfile.mkdtemp(prefix="skynamo_gui_smoke_")
 real_default_store_path = gui.default_store_path
 real_load_config = gui.settings.load_config
+real_save_config = gui.settings.save_config
+real_config_dir = gui.settings._config_dir
+# A config that round-trips like the real file, held in memory.
+disk = {"cfg": {}}
+def fake_load():
+    return json.loads(json.dumps(disk["cfg"]))
+def fake_save(cfg):
+    disk["cfg"] = json.loads(json.dumps(cfg))
+    return "config.json"
 try:
+    # The startup scrub looks in the data folder; keep it out of %APPDATA%.
+    gui.settings._config_dir = lambda: os.path.join(tmp, "appdata")
+    gui.settings.save_config = fake_save
     # ---- Part 1: no store, no saved config ------------------------------
     missing = os.path.join(tmp, "does_not_exist", "reporting.db")
     gui.default_store_path = lambda: missing
-    gui.settings.load_config = lambda: {}
+    gui.settings.load_config = fake_load
 
     app = gui.App()
     app.update_idletasks()
@@ -100,8 +113,12 @@ try:
         app.rpt_store_label.cget("text")
     # ---- Part 3: a saved config is honoured -----------------------------
     # Reload settings into the same app; a second Tk root is needlessly fragile.
-    gui.settings.load_config = lambda: {
+    # It was saved by an older version, so it carries the instance name in the
+    # clear - as a setting, and as the key of the remembered start points.
+    disk["cfg"] = {
         "instance_name": "acme",
+        "route_reps": {"acme": {"7": {"address": "1 Main Rd", "include": True,
+                                      "lat": -26.1, "lng": 28.0}}},
         "image_replace_existing": True,
         "image_move_processed": True,
         "route_options": {"n_days": "4", "max_stops": "9",
@@ -112,7 +129,16 @@ try:
     app.update_idletasks()
     assert app.img_replace_var.get() is True
     assert app.img_move_var.get() is True
-    assert app.img_instance_entry.get() == "acme"
+    # The instance name is never loaded back...
+    for entry in (app.instance_entry, app.img_instance_entry,
+                  app.route_instance_entry):
+        assert entry.get() == "", entry.get()
+    # ...and the startup scrub took it off the disk, keeping the start points
+    # under a fingerprint that the same name finds again.
+    assert "acme" not in json.dumps(disk["cfg"]), disk["cfg"]
+    key = gui.settings.instance_key("ACME ", disk["cfg"])
+    assert disk["cfg"]["route_reps"][key]["7"]["address"] == "1 Main Rd"
+    assert gui.settings.is_instance_key(key)
     assert app.route_days_entry.get() == "4"
     assert app.route_stops_entry.get() == "9"
     assert [v.get() for v in app.route_weekday_vars] ==         [True, True, True, True, False, True, False]
@@ -122,10 +148,29 @@ try:
     options, err = app._route_options()
     assert err == "" and options.n_days == 4 and options.max_stops == 9
 
+    # ---- Part 4: saving never writes the instance name -------------------
+    app.remember_var.set(True)
+    for entry in (app.instance_entry, app.img_instance_entry,
+                  app.route_instance_entry):
+        entry.insert(0, "acme")
+    app.route_instance = "acme"
+    rep_entry = gui.ctk.CTkEntry(app)
+    rep_entry.insert(0, "2 Side Rd")
+    app.route_rep_rows = {7: {"name": "Rep", "var": gui.ctk.BooleanVar(value=True),
+                              "entry": rep_entry, "status": None}}
+    app._persist_settings()
+    app._persist_image_settings()
+    app._persist_route_settings()
+    assert "acme" not in json.dumps(disk["cfg"]).lower(), disk["cfg"]
+    # the start point is still remembered, under the same fingerprint
+    assert disk["cfg"]["route_reps"][key]["7"]["address"] == "2 Side Rd"
+
     app.destroy()
 finally:
     gui.default_store_path = real_default_store_path
     gui.settings.load_config = real_load_config
+    gui.settings.save_config = real_save_config
+    gui.settings._config_dir = real_config_dir
     shutil.rmtree(tmp, ignore_errors=True)
 
 print("GUI smoke test passed")

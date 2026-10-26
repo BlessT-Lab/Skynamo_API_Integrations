@@ -9,7 +9,8 @@ import requests
 
 from .config import (
     API_BASE, DEFAULT_ACCURACY, FILE_HASH_ALGORITHM, PAGE_SIZE,
-    PUBLIC_API_BACKOFF_SECONDS, PUBLIC_API_MAX_RETRIES, REQUEST_TIMEOUT,
+    PUBLIC_API_BACKOFF_SECONDS, PUBLIC_API_MAX_RETRIES,
+    PUBLIC_API_MAX_RETRY_WAIT, PUBLIC_API_WAIT_SLICE, REQUEST_TIMEOUT,
 )
 
 
@@ -34,6 +35,18 @@ def create_date_filter(since):
     this sends none; diag_route_planning.py checks both against a live API.
     """
     return json.dumps([f"greater_than_equals(create_date,{since.isoformat()})"])
+
+
+def _wait(seconds, sleep, should_cancel):
+    """Sleep `seconds` in slices. False if should_cancel fired meanwhile."""
+    remaining = seconds
+    while remaining > 0:
+        if should_cancel and should_cancel():
+            return False
+        step = min(PUBLIC_API_WAIT_SLICE, remaining)
+        sleep(step)
+        remaining -= step
+    return not (should_cancel and should_cancel())
 
 
 def _envelope_items(body):
@@ -123,8 +136,13 @@ class SkynamoClient:
     # fetch_all_customers/fetch_all_products: a route plan reads five
     # endpoints, and one failing must be reportable rather than fatal.
 
-    def _get(self, path, params=None, sleep=time.sleep):
-        """GET with backoff on 429/503. Returns (body, error, status)."""
+    def _get(self, path, params=None, sleep=time.sleep, should_cancel=None):
+        """GET with backoff on 429/503. Returns (body, error, status).
+
+        The wait is bounded by PUBLIC_API_MAX_RETRY_WAIT and is sliced so
+        should_cancel is honoured while waiting - a Retry-After of an hour
+        must not hold the run, or the Cancel button, hostage.
+        """
         attempt = 0
         while True:
             try:
@@ -138,7 +156,13 @@ class SkynamoClient:
                     wait = float(resp.headers.get("Retry-After", ""))
                 except (TypeError, ValueError):
                     wait = PUBLIC_API_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                sleep(max(0.0, wait))
+                if wait > PUBLIC_API_MAX_RETRY_WAIT:
+                    return (None,
+                            f"HTTP {resp.status_code}: the server asked to wait "
+                            f"{wait:.0f} seconds before retrying - try again later",
+                            resp.status_code)
+                if not _wait(max(0.0, wait), sleep, should_cancel):
+                    return None, "Cancelled", None
                 continue
             if not resp.ok:
                 return (None, f"HTTP {resp.status_code}: {resp.text[:500]}",
@@ -166,7 +190,8 @@ class SkynamoClient:
             params = {"page_number": page_number, "page_size": PAGE_SIZE}
             if filters:
                 params["filters"] = filters
-            body, error, _status = self._get(path, params, sleep=sleep)
+            body, error, _status = self._get(path, params, sleep=sleep,
+                                             should_cancel=should_cancel)
             if error:
                 return items, error
             page_items = _envelope_items(body)
@@ -217,7 +242,8 @@ class SkynamoClient:
                                on_page=on_page, should_cancel=should_cancel,
                                sleep=sleep)
 
-    def fetch_interactions_page(self, page_number, sleep=time.sleep):
+    def fetch_interactions_page(self, page_number, sleep=time.sleep,
+                                should_cancel=None):
         """One page of /interactions. Returns (items, page_info, error).
 
         GET /interactions accepts no filter whatsoever, so the last visit per
@@ -226,7 +252,8 @@ class SkynamoClient:
         """
         body, error, _status = self._get(
             "/interactions",
-            {"page_number": page_number, "page_size": PAGE_SIZE}, sleep=sleep)
+            {"page_number": page_number, "page_size": PAGE_SIZE}, sleep=sleep,
+            should_cancel=should_cancel)
         if error:
             return [], {}, error
         page = body.get("page") if isinstance(body, dict) else None

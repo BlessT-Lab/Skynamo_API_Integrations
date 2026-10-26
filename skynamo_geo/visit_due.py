@@ -84,6 +84,16 @@ def window_days(cycle, period):
     return round(cycle * (365.25 if period == "year" else 30.44))
 
 
+def min_gap_days(frequency, cycle, period):
+    """Fewest days between two visits to one customer inside one window.
+
+    Half the even spacing (window / frequency), at least a day - so "twice a
+    week" is never Monday and Tuesday. The one definition: the planner places
+    repeat visits by it, and occurrences() spaces them by it.
+    """
+    return max(1, math.ceil(window_days(cycle, period) / (2 * frequency)))
+
+
 def label(frequency, cycle, period):
     """'once every 2 weeks', 'twice a month', '3 times every 6 months'."""
     times = {1: "once", 2: "twice"}.get(frequency, f"{frequency} times")
@@ -114,7 +124,7 @@ def occurrences(visits_desc, frequency, cycle, period, window_start, window_end)
     Tuesday.
     """
     history = sorted(visits_desc, reverse=True)
-    gap = max(1, math.ceil(window_days(cycle, period) / (2 * frequency)))
+    gap = min_gap_days(frequency, cycle, period)
     out = []
     previous = None
     while len(out) < MAX_OCCURRENCES:

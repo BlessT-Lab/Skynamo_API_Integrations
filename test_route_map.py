@@ -20,26 +20,31 @@ from skynamo_geo.route_map import (
 )
 
 # --- links ---------------------------------------------------------------
-path = [(-26.0 + i * 0.01, 28.0, f"{i} Main Rd", False) for i in range(27)]
-links = gmaps_links(path)                      # start + 25 stops + end
+path = [(-26.0 + i * 0.01, 28.0, f"{i} Main Rd", False) for i in range(25)]
+links = gmaps_links(path)                      # 25 stops
 assert len(links) == 3, len(links)
 parts = [parse_qs(urlparse(u).query) for u in links]
 for p in parts:
     assert len(p.get("waypoints", [""])[0].split("|")) <= GMAPS_MAX_WAYPOINTS
     assert p["travelmode"] == ["driving"] and p["api"] == ["1"]
-# consecutive links share an endpoint, and together cover the whole day once
+# the first link starts from wherever the phone is: no origin at all, so a
+# rep's start point (often their home) is never written into a link
+assert "origin" not in parts[0], parts[0]
+# consecutive links share an endpoint, and together cover the day once
 for a, b in zip(parts, parts[1:]):
     assert a["destination"] == b["origin"]
-assert parts[0]["origin"][0].startswith("-26.000000")
-assert parts[-1]["destination"][0].startswith("-25.740000")
+assert parts[0]["waypoints"][0].startswith("-26.000000")
+assert parts[-1]["destination"][0].startswith("-25.760000")
 covered = []
-for p in parts:
-    covered += [p["origin"][0]] + (p.get("waypoints", [""])[0].split("|")
-                                   if "waypoints" in p else [])
+for i, p in enumerate(parts):
+    covered += ([p["origin"][0]] if i else []) + (
+        p["waypoints"][0].split("|") if "waypoints" in p else [])
 covered.append(parts[-1]["destination"][0])
-assert len(covered) == len(path), "every point visited exactly once"
-assert gmaps_links(path[:1]) == []
-assert len(gmaps_links(path[:2])) == 1          # start straight to end
+assert covered == [f"{lat:.6f},{lng:.6f}" for lat, lng, _a, _x in path], \
+    "every stop visited exactly once, in order"
+assert gmaps_links([]) == []
+one = parse_qs(urlparse(gmaps_links(path[:1])[0]).query)
+assert "origin" not in one and "waypoints" not in one   # straight to it
 
 # an approximate pin navigates by its address, an exact one by coordinates
 assert "q=12+Main+Rd" in waze_link(-26.1, 28.0, "12 Main Rd", approximate=True)
@@ -51,8 +56,8 @@ assert "query=-26.100000%2C28.000000" in stop_link(-26.1, 28.0, None, True)
 monday = date(2026, 10, 12)
 opts = RouteOptions(monday, n_days=2)
 plan = RoutePlan("acme", opts, [monday, monday + timedelta(days=1)])
-day = RouteDay(11, "Anna <script>alert(1)</script>", monday,
-               (-26.10, 28.05), (-26.10, 28.05))
+HOME = (-26.123457, 28.987654)                 # a rep's start: their home
+day = RouteDay(11, "Anna <script>alert(1)</script>", monday, HOME, HOME)
 day.leave = datetime.combine(monday, time(8, 0))
 for i in range(3):
     s = RouteStop(11, day.rep_name, {
@@ -95,8 +100,11 @@ try:
     # instance text is escaped, never live markup
     assert "&lt;script&gt;" in html_out and "&lt;img" in html_out
 
-    # the rep's start is labelled, not addressed
+    # the rep's start is labelled, not addressed - and its coordinates are
+    # in no link (nor anywhere else on the page), in any precision
     assert ">Start<" in html_out
+    for text in ("26.12345", "28.98765", "26.1235", "28.9877"):
+        assert text not in html_out, f"start coordinates leaked: {text}"
     # ...and the approximate pin is drawn with a dashed ring
     assert "stroke-dasharray" in html_out
 
